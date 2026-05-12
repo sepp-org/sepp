@@ -29,7 +29,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("cargo:rerun-if-changed=buf.lock");
     println!("cargo:rerun-if-changed=buf.yaml");
-    println!("cargo:rerun-if-changed=proto");
 
     let remote_dir_str = remote_dir.to_str().ok_or("non-utf8 OUT_DIR")?.to_string();
     let includes = &["proto", remote_dir_str.as_str()];
