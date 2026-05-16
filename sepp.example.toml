@@ -1,0 +1,43 @@
+# sepp server configuration.
+#
+# Copy to `sepp.toml` (loaded automatically from the working directory) or
+# point at it with `--config <path>` or the SEPP_CONFIG env var. Every value
+# below is the built-in default, so an absent file — or an absent field — is
+# fine; the file only overrides what it sets.
+#
+# Any field can also be overridden by an environment variable: prefix `SEPP_`,
+# uppercase, and join the section and field with `__`. For example,
+# `SEPP_SERVER__LISTEN_ADDR=0.0.0.0:6000`. Env vars win over the file.
+
+[server]
+# host:port the gRPC server binds to.
+listen_addr = "0.0.0.0:50051"
+# Directory for the fjall database.
+db_path = "./sepp-data"
+
+[limits]
+# Upper bound a reserve lease is clamped to.
+max_lease_duration_ms = 300000
+# max_attempts used for an enqueue that does not set one.
+default_max_attempts = 3
+# Largest batch a single reserve call may claim (max_jobs is clamped to this).
+max_reserve_batch = 256
+
+[storage]
+# Group-commit fsync durability. "sync_all" is correct on every filesystem;
+# "sync_data" is faster but only safe on some — change with care.
+persist_mode = "sync_all"
+# How often the timer sweep runs. Also the worst-case lateness of a scheduled
+# promotion or a lease expiry.
+sweep_interval_ms = 1000
+# Upper bound on timers processed in a single sweep.
+sweep_limit = 10000
+# How long an idempotency_key keeps deduplicating (24h).
+dedup_window_ms = 86400000
+
+[logging]
+# Log filter: a level (trace/debug/info/warn/error) or a full directive like
+# "info,sepp=debug". The RUST_LOG env var overrides this when set.
+level = "info"
+# Output format: "text" (human-readable) or "json" (for log aggregators).
+format = "text"

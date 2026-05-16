@@ -6,7 +6,7 @@ pub static DESCRIPTOR_POOL: LazyLock<DescriptorPool> = LazyLock::new(|| {
     DescriptorPool::decode(
         include_bytes!(concat!(env!("OUT_DIR"), "/file_descriptor_set.bin")).as_ref(),
     )
-        .expect("failed to decode sepp file descriptor set")
+    .expect("failed to decode sepp file descriptor set")
 });
 
 pub mod sepp {
