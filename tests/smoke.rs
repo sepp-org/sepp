@@ -180,6 +180,50 @@ async fn smoke() {
     assert_eq!(retried.ctx.attempt, 2);
     client.ack(&retried.ctx).await.expect("ack retry");
 
+    enqueue_one(&client, enqueue_req("smoke-delay")).await;
+    let job = reserve(
+        &client,
+        "smoke-delay",
+        Duration::from_secs(30),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("delay job reservable");
+    assert_eq!(job.ctx.attempt, 1);
+    let dead = client
+        .nack(
+            &job.ctx,
+            RetryDirective::After(Duration::from_secs(3)),
+            "retry later",
+        )
+        .await
+        .expect("nack with delay");
+    assert!(!dead, "a delayed nack retries, it does not dead-letter");
+    let too_early = reserve(
+        &client,
+        "smoke-delay",
+        Duration::from_secs(30),
+        Duration::from_millis(200),
+    )
+    .await;
+    assert!(
+        too_early.is_none(),
+        "a delayed-retry job is not reservable before its delay elapses"
+    );
+    let retried = reserve(
+        &client,
+        "smoke-delay",
+        Duration::from_secs(30),
+        Duration::from_secs(15),
+    )
+    .await
+    .expect("a delayed-retry job becomes reservable after its delay");
+    assert_eq!(
+        retried.ctx.attempt, 2,
+        "the delayed retry still increments the attempt"
+    );
+    client.ack(&retried.ctx).await.expect("ack delayed retry");
+
     let scheduled_for = SystemTime::now() + Duration::from_secs(3);
     enqueue_one(
         &client,

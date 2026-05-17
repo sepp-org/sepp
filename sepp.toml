@@ -22,8 +22,6 @@ max_lease_duration_ms = 300000
 default_max_attempts = 3
 # Largest batch a single reserve call may claim (max_jobs is clamped to this).
 max_reserve_batch = 256
-# Upper bound a reserve wait_timeout_ms is clamped to.
-max_wait_timeout_ms = 300000
 
 [storage]
 # Group-commit fsync durability. "sync_all" is correct on every filesystem;
@@ -36,13 +34,10 @@ sweep_interval_ms = 1000
 sweep_limit = 10000
 # How long an idempotency_key keeps deduplicating (24h).
 dedup_window_ms = 86400000
-# Capacity of the channel feeding the storage committer. RPC handlers await
-# space here once it is full, applying backpressure.
-command_queue_capacity = 1024
 # fjall block-cache capacity in bytes. Absent = fjall's default. The fjall
 # docs recommend ~20-25% of available memory; a larger cache keeps more hot
 # blocks resident, which helps `reserve` (it reads the oldest, coldest jobs).
-#cache_size_bytes = 268435456              # 256 MiB
+cache_size_bytes = 2147483648
 # fjall journal (WAL) size ceiling in bytes. Absent = fjall's default of
 # 512 MiB; must be >= 64 MiB. Raising it pushes out the point at which a
 # large backlog forces heavy flushing.
@@ -58,7 +53,7 @@ format = "text"
 [tracing]
 # Export spans over OTLP for distributed tracing. When false, the server still
 # logs but installs no OpenTelemetry layer and contacts no collector.
-enabled = false
+enabled = true
 # OTLP/gRPC collector endpoint (e.g. an OpenTelemetry Collector or Jaeger).
 otlp_endpoint = "http://localhost:4317"
 # `service.name` resource attribute reported to the collector.

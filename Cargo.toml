@@ -17,6 +17,11 @@ serde = { version = "1", features = ["derive"] }
 figment = { version = "0.10", features = ["toml", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+opentelemetry = { version = "0.31", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.31", default-features = false, features = ["grpc-tonic", "trace"] }
+tracing-opentelemetry = "0.32.1"
+opentelemetry-semantic-conventions = "0.31"
 
 
 [dev-dependencies]

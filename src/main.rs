@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use tonic::transport::Server;
 
-use crate::config::{Config, LogFormat, LoggingConfig};
+use crate::config::Config;
 use crate::pb::sepp::v1::queue_service_server::QueueServiceServer;
 use crate::queue_server::QueueServer;
 use tracing::info;
@@ -11,6 +11,7 @@ mod config;
 mod pb;
 mod queue_server;
 mod storage;
+mod telemetry;
 
 fn config_path_arg() -> Option<String> {
     let mut args = std::env::args();
@@ -25,21 +26,10 @@ fn config_path_arg() -> Option<String> {
     std::env::var("SEPP_CONFIG").ok()
 }
 
-fn init_tracing(cfg: &LoggingConfig) -> Result<(), Box<dyn std::error::Error>> {
-    use tracing_subscriber::EnvFilter;
-    let filter = EnvFilter::try_from_default_env().or_else(|_| EnvFilter::try_new(&cfg.level))?;
-    let builder = tracing_subscriber::fmt().with_env_filter(filter);
-    match cfg.format {
-        LogFormat::Text => builder.init(),
-        LogFormat::Json => builder.json().init(),
-    }
-    Ok(())
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load(config_path_arg().as_deref())?;
-    init_tracing(&config.logging)?;
+    let _telemetry = telemetry::init(&config.logging, &config.tracing)?;
     let addr = config.server.listen_addr.parse()?;
     let svc = QueueServer::new(&config)?;
     info!(%addr, db_path = %config.server.db_path, "queue server listening");
@@ -47,7 +37,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .http2_keepalive_interval(Some(Duration::from_secs(30)))
         .http2_keepalive_timeout(Some(Duration::from_secs(10)))
         .add_service(QueueServiceServer::new(svc))
-        .serve(addr)
+        .serve_with_shutdown(addr, shutdown_signal())
         .await?;
+    info!("queue server stopped");
     Ok(())
+}
+
+/// Resolves when the process receives a Ctrl+C, or a SIGTERM on Unix. tonic's
+/// graceful shutdown then stops accepting connections and waits for in-flight
+/// requests to finish before `serve_with_shutdown` returns.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+    info!("shutdown signal received");
 }

@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     future::Future,
     pin::Pin,
     sync::{Arc, Mutex},
@@ -11,7 +11,7 @@ use fjall::{Database, Keyspace, KeyspaceCreateOptions, OwnedWriteBatch, PersistM
 use prost::Message;
 use tokio::sync::{Notify, futures::Notified, mpsc, oneshot};
 use tonic::Status;
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 use crate::config::Config;
@@ -36,7 +36,8 @@ struct StorageParams {
 
 struct Store {
     db: Database,
-    jobs: Keyspace,
+    payloads: Keyspace,
+    inflight: Keyspace,
     dead_letters: Keyspace,
     ready: Keyspace,
     dedup: Keyspace,
@@ -44,6 +45,14 @@ struct Store {
     scheduled: Keyspace,
     leases: Keyspace,
     params: StorageParams,
+}
+
+fn read_u32(bytes: &[u8], at: usize) -> Option<u32> {
+    Some(u32::from_be_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
+}
+
+fn read_i64(bytes: &[u8], at: usize) -> Option<i64> {
+    Some(i64::from_be_bytes(bytes.get(at..at + 8)?.try_into().ok()?))
 }
 
 fn queue_prefix(queue: &str) -> Vec<u8> {
@@ -119,6 +128,46 @@ fn decode_job(bytes: &[u8]) -> Result<(String, Job), Status> {
     Ok((queue, job))
 }
 
+struct Inflight {
+    attempt: u32,
+    lease_expires_at: i64,
+    enqueued_at: i64,
+    priority: u32,
+    max_attempts: u32,
+    queue: String,
+}
+
+fn encode_inflight(s: &Inflight) -> Vec<u8> {
+    let mut v = Vec::with_capacity(28 + s.queue.len());
+    v.extend_from_slice(&s.attempt.to_be_bytes());
+    v.extend_from_slice(&s.lease_expires_at.to_be_bytes());
+    v.extend_from_slice(&s.enqueued_at.to_be_bytes());
+    v.extend_from_slice(&s.priority.to_be_bytes());
+    v.extend_from_slice(&s.max_attempts.to_be_bytes());
+    v.extend_from_slice(s.queue.as_bytes());
+    v
+}
+
+fn decode_inflight(bytes: &[u8]) -> Result<Inflight, Status> {
+    let corrupt = || Status::internal("corrupt inflight record");
+    let attempt = read_u32(bytes, 0).ok_or_else(corrupt)?;
+    let lease_expires_at = read_i64(bytes, 4).ok_or_else(corrupt)?;
+    let enqueued_at = read_i64(bytes, 12).ok_or_else(corrupt)?;
+    let priority = read_u32(bytes, 20).ok_or_else(corrupt)?;
+    let max_attempts = read_u32(bytes, 24).ok_or_else(corrupt)?;
+    let queue = std::str::from_utf8(bytes.get(28..).ok_or_else(corrupt)?)
+        .map_err(|_| corrupt())?
+        .to_owned();
+    Ok(Inflight {
+        attempt,
+        lease_expires_at,
+        enqueued_at,
+        priority,
+        max_attempts,
+        queue,
+    })
+}
+
 #[derive(Clone, Copy)]
 enum DeadLetterCause {
     Rejected = 0,
@@ -126,16 +175,10 @@ enum DeadLetterCause {
     LeaseExpired = 2,
 }
 
-fn encode_dead_letter(
-    dead_lettered_at: i64,
-    cause: DeadLetterCause,
-    queue: &str,
-    job: &Job,
-) -> Vec<u8> {
-    let mut v = Vec::with_capacity(9 + 2 + queue.len());
+fn encode_dead_letter(dead_lettered_at: i64, cause: DeadLetterCause) -> Vec<u8> {
+    let mut v = Vec::with_capacity(9);
     v.extend_from_slice(&dead_lettered_at.to_be_bytes());
     v.push(cause as u8);
-    v.extend_from_slice(&encode_job(queue, job));
     v
 }
 
@@ -153,39 +196,85 @@ fn status_to_error(s: &Status) -> ErrorDetails {
 
 #[derive(Default)]
 struct ReadyIndex {
-    keys: BTreeSet<Vec<u8>>,
+    keys: BTreeMap<Vec<u8>, u32>,
 }
 
 impl ReadyIndex {
-    fn insert(&mut self, ready_key: Vec<u8>) {
-        self.keys.insert(ready_key);
+    fn insert(&mut self, ready_key: Vec<u8>, attempt: u32) {
+        self.keys.insert(ready_key, attempt);
     }
 
-    fn pop_front(&mut self, queue_prefix: &[u8]) -> Option<Vec<u8>> {
+    fn pop_front(&mut self, queue_prefix: &[u8]) -> Option<(Vec<u8>, u32)> {
         let key = self
             .keys
             .range(queue_prefix.to_vec()..)
             .next()
-            .filter(|k| k.starts_with(queue_prefix))
-            .cloned()?;
+            .filter(|(k, _)| k.starts_with(queue_prefix))
+            .map(|(k, _)| k.clone())?;
+        let attempt = self.keys.remove(&key)?;
+        Some((key, attempt))
+    }
+}
+
+#[derive(Default)]
+struct TimerIndex {
+    keys: BTreeSet<Vec<u8>>,
+}
+
+impl TimerIndex {
+    fn insert(&mut self, key: Vec<u8>) {
+        self.keys.insert(key);
+    }
+
+    fn remove(&mut self, key: &[u8]) {
+        self.keys.remove(key);
+    }
+
+    fn pop_due(&mut self, now: i64) -> Option<Vec<u8>> {
+        let first = self.keys.iter().next()?;
+        if deadline_of(first) > now {
+            return None;
+        }
+        let key = first.clone();
         self.keys.remove(&key);
         Some(key)
     }
 }
 
-fn rebuild_ready_index(store: &Store) -> Result<ReadyIndex, fjall::Error> {
-    let mut index = ReadyIndex::default();
-    for guard in store.ready.iter() {
-        let (key, _value) = guard.into_inner()?;
-        index.insert(key.to_vec());
-    }
-    Ok(index)
+#[derive(Default)]
+struct Indexes {
+    ready: ReadyIndex,
+    scheduled: TimerIndex,
+    leases: TimerIndex,
+    dedup_timers: TimerIndex,
 }
 
-fn resync_ready_index(store: &Store, ready: &mut ReadyIndex) {
-    match rebuild_ready_index(store) {
-        Ok(fresh) => *ready = fresh,
-        Err(e) => error!(error = %e, "could not re-sync the ready index"),
+fn rebuild_indexes(store: &Store) -> Result<Indexes, fjall::Error> {
+    let mut indexes = Indexes::default();
+    for guard in store.ready.iter() {
+        let (key, value) = guard.into_inner()?;
+        let attempt = read_u32(&value, 0).unwrap_or(1);
+        indexes.ready.insert(key.to_vec(), attempt);
+    }
+    for guard in store.scheduled.iter() {
+        let (key, _) = guard.into_inner()?;
+        indexes.scheduled.insert(key.to_vec());
+    }
+    for guard in store.leases.iter() {
+        let (key, _) = guard.into_inner()?;
+        indexes.leases.insert(key.to_vec());
+    }
+    for guard in store.dedup_timers.iter() {
+        let (key, _) = guard.into_inner()?;
+        indexes.dedup_timers.insert(key.to_vec());
+    }
+    Ok(indexes)
+}
+
+fn resync(store: &Store, indexes: &mut Indexes) {
+    match rebuild_indexes(store) {
+        Ok(fresh) => *indexes = fresh,
+        Err(e) => error!(error = %e, "could not re-sync the in-memory indexes"),
     }
 }
 
@@ -256,8 +345,8 @@ struct Cycle {
 
 fn run_committer(
     store: Store,
-    mut ready: ReadyIndex,
-    mut rx: mpsc::UnboundedReceiver<Command>,
+    mut indexes: Indexes,
+    mut rx: mpsc::Receiver<Command>,
     notifiers: QueueNotifiers,
 ) {
     while let Some(first) = rx.blocking_recv() {
@@ -276,17 +365,17 @@ fn run_committer(
         });
 
         if !rpcs.is_empty() {
-            run_rpc_cycle(&store, &mut ready, &notifiers, rpcs);
+            run_rpc_cycle(&store, &mut indexes, &notifiers, rpcs);
         }
         if sweep_due {
-            run_sweep_cycle(&store, &mut ready, &notifiers);
+            run_sweep_cycle(&store, &mut indexes, &notifiers);
         }
     }
 }
 
 fn run_rpc_cycle(
     store: &Store,
-    ready: &mut ReadyIndex,
+    indexes: &mut Indexes,
     notifiers: &QueueNotifiers,
     rpcs: Vec<Command>,
 ) {
@@ -297,7 +386,7 @@ fn run_rpc_cycle(
     for cmd in rpcs {
         match cmd {
             Command::Enqueue { jobs, resp } => {
-                let per_jobs = apply_enqueue(store, ready, &mut batch, &mut cycle, jobs);
+                let per_jobs = apply_enqueue(store, indexes, &mut batch, &mut cycle, jobs);
                 responders.push(Box::new(move |o| {
                     let _ = resp.send(per_jobs.into_iter().map(|pj| pj.resolve(o)).collect());
                 }));
@@ -308,7 +397,7 @@ fn run_rpc_cycle(
                 max_jobs,
                 resp,
             } => match apply_reserve(
-                store, ready, &mut batch, &mut cycle, &queues, lease_ms, max_jobs,
+                store, indexes, &mut batch, &mut cycle, &queues, lease_ms, max_jobs,
             ) {
                 Ok(jobs) => responders.push(Box::new(move |o| {
                     let _ = resp.send(o.clone().map(|()| jobs));
@@ -321,7 +410,7 @@ fn run_rpc_cycle(
                 job_id,
                 attempt,
                 resp,
-            } => match apply_ack(store, &mut batch, &mut cycle, &job_id, attempt) {
+            } => match apply_ack(store, indexes, &mut batch, &mut cycle, &job_id, attempt) {
                 Ok(()) => responders.push(Box::new(move |o| {
                     let _ = resp.send(o.clone());
                 })),
@@ -330,7 +419,7 @@ fn run_rpc_cycle(
                 }
             },
             Command::Nack { req, resp } => {
-                match apply_nack(store, ready, &mut batch, &mut cycle, req) {
+                match apply_nack(store, indexes, &mut batch, &mut cycle, req) {
                     Ok(dead_lettered) => responders.push(Box::new(move |o| {
                         let _ = resp.send(o.clone().map(|()| dead_lettered));
                     })),
@@ -340,7 +429,7 @@ fn run_rpc_cycle(
                 }
             }
             Command::Extend { req, resp } => {
-                match apply_extend(store, &mut batch, &mut cycle, req) {
+                match apply_extend(store, indexes, &mut batch, &mut cycle, req) {
                     Ok(lease_expires_at) => responders.push(Box::new(move |o| {
                         let _ = resp.send(o.clone().map(|()| lease_expires_at));
                     })),
@@ -359,7 +448,7 @@ fn run_rpc_cycle(
         Ok(())
     };
     if outcome.is_err() {
-        resync_ready_index(store, ready);
+        resync(store, indexes);
     }
 
     for responder in responders {
@@ -372,26 +461,37 @@ fn run_rpc_cycle(
     }
 }
 
-fn run_sweep_cycle(store: &Store, ready: &mut ReadyIndex, notifiers: &QueueNotifiers) {
+fn run_sweep_cycle(store: &Store, indexes: &mut Indexes, notifiers: &QueueNotifiers) {
+    let started = std::time::Instant::now();
     let mut batch = store.db.batch();
     let mut cycle = Cycle::default();
 
-    if let Err(e) = apply_sweep(store, ready, &mut batch, &mut cycle) {
-        warn!(error = %e, "timer sweep aborted");
-        resync_ready_index(store, ready);
-        return;
-    }
+    let processed = match apply_sweep(store, indexes, &mut batch, &mut cycle) {
+        Ok(processed) => processed,
+        Err(e) => {
+            warn!(error = %e, "timer sweep aborted");
+            resync(store, indexes);
+            return;
+        }
+    };
     let outcome = if cycle.dirty {
         commit_and_persist(store, batch)
     } else {
         Ok(())
     };
     if outcome.is_err() {
-        resync_ready_index(store, ready);
+        resync(store, indexes);
         return;
     }
     for queue in &cycle.new_ready {
         notifiers.wake(queue);
+    }
+
+    let elapsed = started.elapsed();
+    if elapsed >= Duration::from_millis(100) {
+        warn!(?elapsed, processed, "slow timer sweep");
+    } else {
+        debug!(?elapsed, processed, "timer sweep");
     }
 }
 
@@ -410,7 +510,7 @@ fn commit_and_persist(store: &Store, batch: OwnedWriteBatch) -> Result<(), Statu
 
 fn apply_enqueue(
     store: &Store,
-    ready: &mut ReadyIndex,
+    indexes: &mut Indexes,
     batch: &mut OwnedWriteBatch,
     cycle: &mut Cycle,
     jobs: Vec<EnqueueRequest>,
@@ -473,35 +573,32 @@ fn apply_enqueue(
         };
 
         batch.insert(
-            &store.jobs,
+            &store.payloads,
             id.clone().into_bytes(),
             encode_job(&queue, &job),
         );
         match job.scheduled_at {
             Some(at) if at > now => {
-                batch.insert(
-                    &store.scheduled,
-                    timer_key(at, &id),
-                    id.clone().into_bytes(),
-                );
+                let tk = timer_key(at, &id);
+                batch.insert(&store.scheduled, tk.clone(), job.attempt.to_be_bytes().to_vec());
+                indexes.scheduled.insert(tk);
             }
             _ => {
                 let rk = ready_key(&queue, job.priority, job.enqueued_at, &id);
-                batch.insert(&store.ready, rk.clone(), Vec::new());
-                ready.insert(rk);
+                batch.insert(&store.ready, rk.clone(), job.attempt.to_be_bytes().to_vec());
+                indexes.ready.insert(rk, job.attempt);
                 cycle.new_ready.insert(queue.clone());
             }
         }
         if let Some(key) = &req.idempotency_key {
             let dkey = dedup_key(&queue, key);
             if let Some(old_timer) = stale_dedup_timer {
-                batch.remove(&store.dedup_timers, old_timer);
+                batch.remove(&store.dedup_timers, old_timer.clone());
+                indexes.dedup_timers.remove(&old_timer);
             }
-            batch.insert(
-                &store.dedup_timers,
-                dedup_timer_key(now + store.params.dedup_window_ms, &dkey),
-                Vec::new(),
-            );
+            let dtk = dedup_timer_key(now + store.params.dedup_window_ms, &dkey);
+            batch.insert(&store.dedup_timers, dtk.clone(), Vec::new());
+            indexes.dedup_timers.insert(dtk);
             batch.insert(&store.dedup, dkey, encode_dedup(now, &id));
             cycle.dedup_seen.insert((queue, key.clone()), id.clone());
         }
@@ -518,7 +615,7 @@ fn apply_enqueue(
 
 fn apply_reserve(
     store: &Store,
-    ready: &mut ReadyIndex,
+    indexes: &mut Indexes,
     batch: &mut OwnedWriteBatch,
     cycle: &mut Cycle,
     queues: &[String],
@@ -534,7 +631,7 @@ fn apply_reserve(
         let id_offset = ready_key_id_offset(queue);
 
         while jobs.len() < max_jobs {
-            let Some(ready_k) = ready.pop_front(&prefix) else {
+            let Some((ready_k, attempt)) = indexes.ready.pop_front(&prefix) else {
                 break;
             };
             let job_id: String = match ready_k.get(id_offset..).map(std::str::from_utf8) {
@@ -546,7 +643,7 @@ fn apply_reserve(
                 }
             };
 
-            let stored = match store.jobs.get(job_id.as_bytes()) {
+            let stored = match store.payloads.get(job_id.as_bytes()) {
                 Ok(Some(stored)) => stored,
                 Ok(None) => {
                     batch.remove(&store.ready, ready_k);
@@ -554,7 +651,7 @@ fn apply_reserve(
                     continue;
                 }
                 Err(e) => {
-                    ready.insert(ready_k);
+                    indexes.ready.insert(ready_k, attempt);
                     if jobs.is_empty() {
                         return Err(stg_err(e));
                     }
@@ -572,18 +669,27 @@ fn apply_reserve(
                 }
             };
 
-            job.lease_expires_at = now_ms() + lease_ms as i64;
+            let lease_expires_at = now_ms() + lease_ms as i64;
+            job.attempt = attempt;
+            job.lease_expires_at = lease_expires_at;
+
+            let inflight = Inflight {
+                attempt,
+                lease_expires_at,
+                enqueued_at: job.enqueued_at,
+                priority: job.priority,
+                max_attempts: job.max_attempts,
+                queue: job_queue,
+            };
             batch.remove(&store.ready, ready_k);
             batch.insert(
-                &store.jobs,
+                &store.inflight,
                 job.id.clone().into_bytes(),
-                encode_job(&job_queue, &job),
+                encode_inflight(&inflight),
             );
-            batch.insert(
-                &store.leases,
-                timer_key(job.lease_expires_at, &job.id),
-                job.id.clone().into_bytes(),
-            );
+            let lease_timer = timer_key(lease_expires_at, &job.id);
+            batch.insert(&store.leases, lease_timer.clone(), Vec::new());
+            indexes.leases.insert(lease_timer);
             cycle.dirty = true;
             jobs.push(job);
         }
@@ -594,49 +700,55 @@ fn apply_reserve(
 
 fn apply_ack(
     store: &Store,
+    indexes: &mut Indexes,
     batch: &mut OwnedWriteBatch,
     cycle: &mut Cycle,
     job_id: &str,
     attempt: u32,
 ) -> Result<(), Status> {
     let stored = store
-        .jobs
+        .inflight
         .get(job_id.as_bytes())
         .map_err(stg_err)?
         .ok_or_else(|| Status::not_found("job not found"))?;
-    let (_queue, job) = decode_job(&stored)?;
-    if job.attempt != attempt {
+    let inflight = decode_inflight(&stored)?;
+    if inflight.attempt != attempt {
         return Err(Status::failed_precondition("attempt mismatch"));
     }
-    batch.remove(&store.jobs, job_id.as_bytes().to_vec());
-    batch.remove(&store.leases, timer_key(job.lease_expires_at, job_id));
+    batch.remove(&store.payloads, job_id.as_bytes().to_vec());
+    batch.remove(&store.inflight, job_id.as_bytes().to_vec());
+    let lease_timer = timer_key(inflight.lease_expires_at, job_id);
+    batch.remove(&store.leases, lease_timer.clone());
+    indexes.leases.remove(&lease_timer);
     cycle.dirty = true;
     Ok(())
 }
 
 fn apply_nack(
     store: &Store,
-    ready: &mut ReadyIndex,
+    indexes: &mut Indexes,
     batch: &mut OwnedWriteBatch,
     cycle: &mut Cycle,
     req: NackRequest,
 ) -> Result<bool, Status> {
     let stored = store
-        .jobs
+        .inflight
         .get(req.job_id.as_bytes())
         .map_err(stg_err)?
         .ok_or_else(|| Status::not_found("job not found"))?;
-    let (queue, mut job) = decode_job(&stored)?;
-    if job.attempt != req.attempt {
+    let inflight = decode_inflight(&stored)?;
+    if inflight.attempt != req.attempt {
         return Err(Status::failed_precondition("attempt mismatch"));
     }
-    let lease_timer = timer_key(job.lease_expires_at, &req.job_id);
+    let lease_timer = timer_key(inflight.lease_expires_at, &req.job_id);
 
-    let force_dead_letter = matches!(
-        req.retry.as_ref().and_then(|r| r.strategy.as_ref()),
-        Some(nack_retry::Strategy::DeadLetter(_))
-    );
-    if force_dead_letter || job.attempt >= job.max_attempts {
+    let strategy = req.retry.as_ref().and_then(|r| r.strategy.as_ref());
+    let force_dead_letter = matches!(strategy, Some(nack_retry::Strategy::DeadLetter(_)));
+    let retry_delay_ms = match strategy {
+        Some(nack_retry::Strategy::DelayMs(ms)) => *ms,
+        _ => 0,
+    };
+    if force_dead_letter || inflight.attempt >= inflight.max_attempts {
         let cause = if force_dead_letter {
             DeadLetterCause::Rejected
         } else {
@@ -645,86 +757,104 @@ fn apply_nack(
         batch.insert(
             &store.dead_letters,
             req.job_id.clone().into_bytes(),
-            encode_dead_letter(now_ms(), cause, &queue, &job),
+            encode_dead_letter(now_ms(), cause),
         );
-        batch.remove(&store.jobs, req.job_id.into_bytes());
-        batch.remove(&store.leases, lease_timer);
+        batch.remove(&store.inflight, req.job_id.into_bytes());
+        batch.remove(&store.leases, lease_timer.clone());
+        indexes.leases.remove(&lease_timer);
         cycle.dirty = true;
         return Ok(true);
     }
 
-    job.attempt += 1;
-    job.lease_expires_at = 0;
-    let rk = ready_key(&queue, job.priority, job.enqueued_at, &req.job_id);
-    batch.insert(
-        &store.jobs,
-        req.job_id.clone().into_bytes(),
-        encode_job(&queue, &job),
-    );
-    batch.insert(&store.ready, rk.clone(), Vec::new());
-    ready.insert(rk);
-    batch.remove(&store.leases, lease_timer);
+    let attempt = inflight.attempt + 1;
+    if retry_delay_ms > 0 {
+        let deadline = now_ms().saturating_add(i64::try_from(retry_delay_ms).unwrap_or(i64::MAX));
+        let tk = timer_key(deadline, &req.job_id);
+        batch.insert(&store.scheduled, tk.clone(), attempt.to_be_bytes().to_vec());
+        indexes.scheduled.insert(tk);
+    } else {
+        let rk = ready_key(
+            &inflight.queue,
+            inflight.priority,
+            inflight.enqueued_at,
+            &req.job_id,
+        );
+        batch.insert(&store.ready, rk.clone(), attempt.to_be_bytes().to_vec());
+        indexes.ready.insert(rk, attempt);
+        cycle.new_ready.insert(inflight.queue);
+    }
+    batch.remove(&store.inflight, req.job_id.into_bytes());
+    batch.remove(&store.leases, lease_timer.clone());
+    indexes.leases.remove(&lease_timer);
     cycle.dirty = true;
-    cycle.new_ready.insert(queue);
     Ok(false)
 }
 
 fn apply_extend(
     store: &Store,
+    indexes: &mut Indexes,
     batch: &mut OwnedWriteBatch,
     cycle: &mut Cycle,
     req: ExtendRequest,
 ) -> Result<i64, Status> {
     let stored = store
-        .jobs
+        .inflight
         .get(req.job_id.as_bytes())
         .map_err(stg_err)?
         .ok_or_else(|| Status::not_found("job not found"))?;
-    let (queue, mut job) = decode_job(&stored)?;
-    if job.attempt != req.attempt {
+    let mut inflight = decode_inflight(&stored)?;
+    if inflight.attempt != req.attempt {
         return Err(Status::failed_precondition("attempt mismatch"));
     }
-    let old_timer = timer_key(job.lease_expires_at, &req.job_id);
+    let old_timer = timer_key(inflight.lease_expires_at, &req.job_id);
     let lease_expires_at = now_ms() + req.lease_duration_ms as i64;
-    job.lease_expires_at = lease_expires_at;
+    inflight.lease_expires_at = lease_expires_at;
 
     batch.insert(
-        &store.jobs,
+        &store.inflight,
         req.job_id.clone().into_bytes(),
-        encode_job(&queue, &job),
+        encode_inflight(&inflight),
     );
-    batch.remove(&store.leases, old_timer);
-    batch.insert(
-        &store.leases,
-        timer_key(lease_expires_at, &req.job_id),
-        req.job_id.into_bytes(),
-    );
+    batch.remove(&store.leases, old_timer.clone());
+    indexes.leases.remove(&old_timer);
+    let new_timer = timer_key(lease_expires_at, &req.job_id);
+    batch.insert(&store.leases, new_timer.clone(), Vec::new());
+    indexes.leases.insert(new_timer);
     cycle.dirty = true;
     Ok(lease_expires_at)
 }
 
 fn apply_sweep(
     store: &Store,
-    ready: &mut ReadyIndex,
+    indexes: &mut Indexes,
     batch: &mut OwnedWriteBatch,
     cycle: &mut Cycle,
-) -> Result<(), Status> {
+) -> Result<usize, Status> {
     let now = now_ms();
-    let mut budget = store.params.sweep_limit;
+    let mut processed = 0usize;
 
-    for guard in store.scheduled.iter() {
-        if budget == 0 {
+    // Each phase gets its own budget so a backlog of one timer kind cannot
+    // starve another — most importantly, scheduled promotions must not crowd
+    // out lease-expiry redelivery.
+    let mut budget = store.params.sweep_limit;
+    while budget > 0 {
+        let Some(timer_k) = indexes.scheduled.pop_due(now) else {
             break;
-        }
-        let (timer_k, job_id) = guard.into_inner().map_err(stg_err)?;
-        if deadline_of(&timer_k) > now {
-            break;
-        }
+        };
         budget -= 1;
-        batch.remove(&store.scheduled, timer_k.to_vec());
+        processed += 1;
+        let attempt_hint = store
+            .scheduled
+            .get(&timer_k)
+            .map_err(stg_err)?
+            .and_then(|v| read_u32(&v, 0));
+        batch.remove(&store.scheduled, timer_k.clone());
         cycle.dirty = true;
 
-        let Some(stored) = store.jobs.get(&job_id).map_err(stg_err)? else {
+        let Some(job_id) = timer_k.get(8..) else {
+            continue;
+        };
+        let Some(stored) = store.payloads.get(job_id).map_err(stg_err)? else {
             continue;
         };
         let (queue, job) = match decode_job(&stored) {
@@ -734,70 +864,77 @@ fn apply_sweep(
                 continue;
             }
         };
+        let attempt = attempt_hint.unwrap_or(job.attempt);
         let rk = ready_key(&queue, job.priority, job.enqueued_at, &job.id);
-        batch.insert(&store.ready, rk.clone(), Vec::new());
-        ready.insert(rk);
+        batch.insert(&store.ready, rk.clone(), attempt.to_be_bytes().to_vec());
+        indexes.ready.insert(rk, attempt);
         cycle.new_ready.insert(queue);
     }
 
-    for guard in store.leases.iter() {
-        if budget == 0 {
+    let mut budget = store.params.sweep_limit;
+    while budget > 0 {
+        let Some(timer_k) = indexes.leases.pop_due(now) else {
             break;
-        }
-        let (timer_k, job_id) = guard.into_inner().map_err(stg_err)?;
-        if deadline_of(&timer_k) > now {
-            break;
-        }
+        };
         budget -= 1;
-        batch.remove(&store.leases, timer_k.to_vec());
+        processed += 1;
+        batch.remove(&store.leases, timer_k.clone());
         cycle.dirty = true;
 
-        let Some(stored) = store.jobs.get(&job_id).map_err(stg_err)? else {
+        let Some(job_id) = timer_k.get(8..) else {
             continue;
         };
-        let (queue, mut job) = match decode_job(&stored) {
+        let Some(stored) = store.inflight.get(job_id).map_err(stg_err)? else {
+            continue;
+        };
+        let inflight = match decode_inflight(&stored) {
             Ok(decoded) => decoded,
             Err(e) => {
-                warn!(error = %e, "sweep skipping corrupt job");
+                warn!(error = %e, "sweep skipping corrupt inflight record");
                 continue;
             }
         };
 
-        if job.attempt >= job.max_attempts {
+        if inflight.attempt >= inflight.max_attempts {
             batch.insert(
                 &store.dead_letters,
                 job_id.to_vec(),
-                encode_dead_letter(now, DeadLetterCause::LeaseExpired, &queue, &job),
+                encode_dead_letter(now, DeadLetterCause::LeaseExpired),
             );
-            batch.remove(&store.jobs, job_id.to_vec());
+            batch.remove(&store.inflight, job_id.to_vec());
         } else {
-            job.attempt += 1;
-            job.lease_expires_at = 0;
-            batch.insert(&store.jobs, job_id.to_vec(), encode_job(&queue, &job));
-            let rk = ready_key(&queue, job.priority, job.enqueued_at, &job.id);
-            batch.insert(&store.ready, rk.clone(), Vec::new());
-            ready.insert(rk);
-            cycle.new_ready.insert(queue);
+            let Ok(job_id_str) = std::str::from_utf8(job_id) else {
+                continue;
+            };
+            let attempt = inflight.attempt + 1;
+            let rk = ready_key(
+                &inflight.queue,
+                inflight.priority,
+                inflight.enqueued_at,
+                job_id_str,
+            );
+            batch.insert(&store.ready, rk.clone(), attempt.to_be_bytes().to_vec());
+            indexes.ready.insert(rk, attempt);
+            batch.remove(&store.inflight, job_id.to_vec());
+            cycle.new_ready.insert(inflight.queue);
         }
     }
 
-    for guard in store.dedup_timers.iter() {
-        if budget == 0 {
+    let mut budget = store.params.sweep_limit;
+    while budget > 0 {
+        let Some(timer_k) = indexes.dedup_timers.pop_due(now) else {
             break;
-        }
-        let (timer_k, _) = guard.into_inner().map_err(stg_err)?;
-        if deadline_of(&timer_k) > now {
-            break;
-        }
+        };
         budget -= 1;
+        processed += 1;
         if let Some(dedup_k) = timer_k.get(8..) {
             batch.remove(&store.dedup, dedup_k.to_vec());
         }
-        batch.remove(&store.dedup_timers, timer_k.to_vec());
+        batch.remove(&store.dedup_timers, timer_k.clone());
         cycle.dirty = true;
     }
 
-    Ok(())
+    Ok(processed)
 }
 
 #[derive(Clone, Default)]
@@ -861,13 +998,20 @@ impl Future for Armed<'_> {
 
 #[derive(Clone)]
 pub struct Storage {
-    tx: mpsc::UnboundedSender<Command>,
+    tx: mpsc::Sender<Command>,
     notifiers: QueueNotifiers,
 }
 
 impl Storage {
     pub fn open(config: &Config) -> Result<Self, fjall::Error> {
-        let db = Database::builder(config.server.db_path.as_str()).open()?;
+        let mut builder = Database::builder(config.server.db_path.as_str());
+        if let Some(bytes) = config.storage.cache_size_bytes {
+            builder = builder.cache_size(bytes);
+        }
+        if let Some(bytes) = config.storage.max_journaling_size_bytes {
+            builder = builder.max_journaling_size(bytes);
+        }
+        let db = builder.open()?;
         let params = StorageParams {
             persist_mode: match config.storage.persist_mode {
                 crate::config::PersistMode::SyncAll => PersistMode::SyncAll,
@@ -878,7 +1022,8 @@ impl Storage {
             default_max_attempts: config.limits.default_max_attempts,
         };
         let store = Store {
-            jobs: db.keyspace("jobs", KeyspaceCreateOptions::default)?,
+            payloads: db.keyspace("payloads", KeyspaceCreateOptions::default)?,
+            inflight: db.keyspace("inflight", KeyspaceCreateOptions::default)?,
             dead_letters: db.keyspace("dead_letters", KeyspaceCreateOptions::default)?,
             ready: db.keyspace("ready", KeyspaceCreateOptions::default)?,
             dedup: db.keyspace("dedup", KeyspaceCreateOptions::default)?,
@@ -888,15 +1033,15 @@ impl Storage {
             db,
             params,
         };
-        let ready_index = rebuild_ready_index(&store)?;
+        let indexes = rebuild_indexes(&store)?;
 
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(config.storage.command_queue_capacity);
         let notifiers = QueueNotifiers::default();
         std::thread::Builder::new()
             .name("sepp-committer".to_string())
             .spawn({
                 let notifiers = notifiers.clone();
-                move || run_committer(store, ready_index, rx, notifiers)
+                move || run_committer(store, indexes, rx, notifiers)
             })
             .expect("failed to spawn committer thread");
 
@@ -908,8 +1053,12 @@ impl Storage {
                 move || {
                     loop {
                         std::thread::sleep(sweep_interval);
-                        if tx.send(Command::Sweep).is_err() {
-                            break;
+                        match tx.try_send(Command::Sweep) {
+                            Ok(()) => {}
+                            // Channel saturated — a cycle is already backed up,
+                            // and the next tick will retry.
+                            Err(mpsc::error::TrySendError::Full(_)) => {}
+                            Err(mpsc::error::TrySendError::Closed(_)) => break,
                         }
                     }
                 }
@@ -929,6 +1078,7 @@ impl Storage {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(make(resp_tx))
+            .await
             .map_err(|_| Status::internal("storage unavailable"))?;
         resp_rx
             .await
@@ -969,5 +1119,241 @@ impl Storage {
 
     pub async fn extend(&self, req: ExtendRequest) -> Result<i64, Status> {
         self.send(|resp| Command::Extend { req, resp }).await?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_job(id: &str) -> Job {
+        Job {
+            id: id.to_string(),
+            job_type: "unit-test".to_string(),
+            enqueued_at: 1_700_000_000_000,
+            priority: 5,
+            attempt: 1,
+            max_attempts: 3,
+            ..Default::default()
+        }
+    }
+
+    fn job_id_of<'a>(queue: &str, ready_k: &'a [u8]) -> &'a str {
+        std::str::from_utf8(&ready_k[ready_key_id_offset(queue)..]).unwrap()
+    }
+
+    #[test]
+    fn queue_prefix_is_length_prefixed() {
+        assert_eq!(queue_prefix("ab"), vec![0, 2, b'a', b'b']);
+        assert_eq!(queue_prefix(""), vec![0, 0]);
+    }
+
+    #[test]
+    fn ready_key_id_offset_locates_the_job_id() {
+        let key = ready_key("orders", 3, 55, "the-job-id");
+        assert_eq!(job_id_of("orders", &key), "the-job-id");
+    }
+
+    #[test]
+    fn ready_key_priority_clamps_above_nine() {
+        let prio_offset = 2 + "q".len();
+        let nine = ready_key("q", 9, 0, "j");
+        let huge = ready_key("q", 1000, 0, "j");
+        assert_eq!(nine[prio_offset], huge[prio_offset]);
+    }
+
+    #[test]
+    fn timer_key_round_trips_through_deadline_of() {
+        assert_eq!(deadline_of(&timer_key(12345, "x")), 12345);
+        assert_eq!(deadline_of(&timer_key(0, "x")), 0);
+    }
+
+    #[test]
+    fn dedup_timer_key_carries_deadline_and_key() {
+        let k = dedup_timer_key(777, b"the-dedup-key");
+        assert_eq!(deadline_of(&k), 777);
+        assert_eq!(&k[8..], b"the-dedup-key");
+    }
+
+    #[test]
+    fn dedup_encoding_round_trips() {
+        let bytes = encode_dedup(42, "job-7");
+        assert_eq!(decode_dedup(&bytes), Some((42, "job-7")));
+    }
+
+    #[test]
+    fn decode_dedup_rejects_short_and_invalid_input() {
+        assert_eq!(decode_dedup(&[]), None);
+        assert_eq!(decode_dedup(&[0, 0, 0, 1]), None);
+        let mut bad = 1i64.to_be_bytes().to_vec();
+        bad.extend_from_slice(&[0xff, 0xff]);
+        assert_eq!(decode_dedup(&bad), None);
+    }
+
+    #[test]
+    fn job_encoding_round_trips_with_queue() {
+        let job = sample_job("job-42");
+        let (queue, decoded) = decode_job(&encode_job("orders", &job)).expect("decodes");
+        assert_eq!(queue, "orders");
+        assert_eq!(decoded, job);
+    }
+
+    #[test]
+    fn decode_job_rejects_corrupt_input() {
+        assert!(decode_job(&[]).is_err());
+        assert!(decode_job(&[0]).is_err());
+        assert!(decode_job(&[0, 5, 1, 2]).is_err());
+    }
+
+    #[test]
+    fn inflight_encoding_round_trips() {
+        let s = Inflight {
+            attempt: 4,
+            lease_expires_at: 1_700_000_999_000,
+            enqueued_at: 1_700_000_000_000,
+            priority: 7,
+            max_attempts: 10,
+            queue: "my-queue".to_string(),
+        };
+        let d = decode_inflight(&encode_inflight(&s)).expect("decodes");
+        assert_eq!(d.attempt, s.attempt);
+        assert_eq!(d.lease_expires_at, s.lease_expires_at);
+        assert_eq!(d.enqueued_at, s.enqueued_at);
+        assert_eq!(d.priority, s.priority);
+        assert_eq!(d.max_attempts, s.max_attempts);
+        assert_eq!(d.queue, s.queue);
+    }
+
+    #[test]
+    fn decode_inflight_rejects_truncated_input() {
+        assert!(decode_inflight(&[]).is_err());
+        assert!(decode_inflight(&[0u8; 20]).is_err());
+    }
+
+    #[test]
+    fn decode_inflight_rejects_invalid_queue_utf8() {
+        let mut bytes = encode_inflight(&Inflight {
+            attempt: 1,
+            lease_expires_at: 0,
+            enqueued_at: 0,
+            priority: 0,
+            max_attempts: 1,
+            queue: String::new(),
+        });
+        bytes.extend_from_slice(&[0xff, 0xff]);
+        assert!(decode_inflight(&bytes).is_err());
+    }
+
+    #[test]
+    fn dead_letter_marker_carries_timestamp_and_cause() {
+        let v = encode_dead_letter(123_456, DeadLetterCause::LeaseExpired);
+        assert_eq!(v.len(), 9);
+        assert_eq!(i64::from_be_bytes(v[..8].try_into().unwrap()), 123_456);
+        assert_eq!(v[8], 2);
+        assert_eq!(encode_dead_letter(0, DeadLetterCause::Rejected)[8], 0);
+        assert_eq!(encode_dead_letter(0, DeadLetterCause::AttemptsExhausted)[8], 1);
+    }
+
+    #[test]
+    fn ready_index_pops_highest_priority_first() {
+        let mut idx = ReadyIndex::default();
+        idx.insert(ready_key("q", 0, 100, "low"), 1);
+        idx.insert(ready_key("q", 9, 100, "high"), 1);
+        idx.insert(ready_key("q", 5, 100, "mid"), 1);
+
+        let prefix = queue_prefix("q");
+        let (k, _) = idx.pop_front(&prefix).unwrap();
+        assert_eq!(job_id_of("q", &k), "high");
+        let (k, _) = idx.pop_front(&prefix).unwrap();
+        assert_eq!(job_id_of("q", &k), "mid");
+        let (k, _) = idx.pop_front(&prefix).unwrap();
+        assert_eq!(job_id_of("q", &k), "low");
+        assert!(idx.pop_front(&prefix).is_none());
+    }
+
+    #[test]
+    fn ready_index_is_fifo_within_a_priority() {
+        let mut idx = ReadyIndex::default();
+        idx.insert(ready_key("q", 5, 200, "second"), 1);
+        idx.insert(ready_key("q", 5, 100, "first"), 1);
+
+        let prefix = queue_prefix("q");
+        let (k, _) = idx.pop_front(&prefix).unwrap();
+        assert_eq!(job_id_of("q", &k), "first");
+        let (k, _) = idx.pop_front(&prefix).unwrap();
+        assert_eq!(job_id_of("q", &k), "second");
+    }
+
+    #[test]
+    fn ready_index_isolates_queues() {
+        let mut idx = ReadyIndex::default();
+        idx.insert(ready_key("qa", 5, 100, "a-job"), 1);
+        idx.insert(ready_key("qb", 5, 100, "b-job"), 1);
+
+        let (k, _) = idx.pop_front(&queue_prefix("qa")).unwrap();
+        assert_eq!(job_id_of("qa", &k), "a-job");
+        assert!(idx.pop_front(&queue_prefix("qa")).is_none());
+
+        let (k, _) = idx.pop_front(&queue_prefix("qb")).unwrap();
+        assert_eq!(job_id_of("qb", &k), "b-job");
+    }
+
+    #[test]
+    fn ready_index_does_not_leak_across_queue_name_prefixes() {
+        let mut idx = ReadyIndex::default();
+        idx.insert(ready_key("aa", 5, 100, "aa-job"), 1);
+
+        assert!(idx.pop_front(&queue_prefix("a")).is_none());
+        let (k, _) = idx.pop_front(&queue_prefix("aa")).unwrap();
+        assert_eq!(job_id_of("aa", &k), "aa-job");
+    }
+
+    #[test]
+    fn ready_index_preserves_the_attempt() {
+        let mut idx = ReadyIndex::default();
+        idx.insert(ready_key("q", 5, 100, "j"), 7);
+        let (_, attempt) = idx.pop_front(&queue_prefix("q")).unwrap();
+        assert_eq!(attempt, 7);
+    }
+
+    #[test]
+    fn timer_index_pops_in_deadline_order() {
+        let mut idx = TimerIndex::default();
+        idx.insert(timer_key(300, "c"));
+        idx.insert(timer_key(100, "a"));
+        idx.insert(timer_key(200, "b"));
+
+        assert_eq!(idx.pop_due(i64::MAX), Some(timer_key(100, "a")));
+        assert_eq!(idx.pop_due(i64::MAX), Some(timer_key(200, "b")));
+        assert_eq!(idx.pop_due(i64::MAX), Some(timer_key(300, "c")));
+        assert_eq!(idx.pop_due(i64::MAX), None);
+    }
+
+    #[test]
+    fn timer_index_pop_due_respects_the_now_boundary() {
+        let mut idx = TimerIndex::default();
+        idx.insert(timer_key(100, "a"));
+
+        assert_eq!(idx.pop_due(99), None);
+        assert_eq!(idx.pop_due(100), Some(timer_key(100, "a")));
+    }
+
+    #[test]
+    fn timer_index_only_yields_due_entries() {
+        let mut idx = TimerIndex::default();
+        idx.insert(timer_key(100, "a"));
+        idx.insert(timer_key(500, "b"));
+
+        assert_eq!(idx.pop_due(200), Some(timer_key(100, "a")));
+        assert_eq!(idx.pop_due(200), None);
+        assert_eq!(idx.pop_due(500), Some(timer_key(500, "b")));
+    }
+
+    #[test]
+    fn timer_index_remove_drops_the_entry() {
+        let mut idx = TimerIndex::default();
+        idx.insert(timer_key(100, "a"));
+        idx.remove(&timer_key(100, "a"));
+        assert_eq!(idx.pop_due(i64::MAX), None);
     }
 }
