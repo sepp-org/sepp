@@ -75,6 +75,15 @@ impl QueueServer {
                 l.max_payload_bytes
             ));
         }
+        if let Some(payload) = &job.payload
+            && let Some(allowed) = &l.allowed_encodings
+            && !allowed.iter().any(|e| e == &payload.encoding)
+        {
+            return Err(format!(
+                "payload encoding {:?} is not accepted by this server",
+                payload.encoding
+            ));
+        }
         if job.custom.len() as u64 > l.max_custom_entries as u64 {
             return Err(format!(
                 "custom map exceeds max_custom_entries ({})",
@@ -386,7 +395,8 @@ impl QueueService for QueueServer {
             server_version: env!("CARGO_PKG_VERSION").to_string(),
             supported_protocol_versions: vec!["1.0".to_string()],
             server_time_ms: now_ms(),
-            allowed_encodings: vec!["application/json".into(), "application/octet-stream".into()],
+            restricts_encodings: self.limits.allowed_encodings.is_some(),
+            allowed_encodings: self.limits.allowed_encodings.clone().unwrap_or_default(),
             max_payload_bytes: self.limits.max_payload_bytes,
             max_custom_entries: self.limits.max_custom_entries,
             max_custom_total_bytes: self.limits.max_custom_total_bytes,

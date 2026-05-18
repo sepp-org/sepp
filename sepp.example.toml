@@ -35,6 +35,10 @@ max_wait_timeout_ms = 300000
 max_enqueue_batch = 256
 # Largest job payload accepted, in bytes.
 max_payload_bytes = 1048576
+# Payload encodings the server accepts. Omit this key to accept any encoding;
+# set an explicit list to allow only those; set an empty list [] to reject
+# every payload. Jobs enqueued without a payload are unaffected.
+#allowed_encodings = ["application/json", "application/octet-stream"]
 # Hard ceiling on a decoded gRPC request, in bytes. Must be >= max_payload_bytes.
 max_message_bytes = 16777216
 # Per-job custom-map limits: entry count, total key+value bytes, and key bytes.

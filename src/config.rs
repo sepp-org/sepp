@@ -51,6 +51,8 @@ pub struct LimitsConfig {
     pub max_job_type_bytes: u32,
     pub max_idempotency_key_bytes: u32,
     pub max_schedule_horizon_ms: u64,
+    // None = unrestricted, Some(vec![]) = reject all, Some(vec!["a", "b"]) = accept only a and b
+    pub allowed_encodings: Option<Vec<String>>,
 }
 
 impl Default for LimitsConfig {
@@ -73,6 +75,7 @@ impl Default for LimitsConfig {
             max_job_type_bytes: 256,
             max_idempotency_key_bytes: 256,
             max_schedule_horizon_ms: 30 * 24 * 60 * 60 * 1000,
+            allowed_encodings: None,
         }
     }
 }
@@ -231,9 +234,7 @@ impl Config {
             return Err("limits.max_payload_bytes must be > 0".into());
         }
         if self.limits.max_message_bytes < self.limits.max_payload_bytes {
-            return Err(
-                "limits.max_message_bytes must be >= limits.max_payload_bytes".into(),
-            );
+            return Err("limits.max_message_bytes must be >= limits.max_payload_bytes".into());
         }
         if self.limits.max_custom_entries == 0 {
             return Err("limits.max_custom_entries must be > 0".into());
@@ -257,6 +258,11 @@ impl Config {
         }
         if self.limits.max_schedule_horizon_ms == 0 {
             return Err("limits.max_schedule_horizon_ms must be > 0".into());
+        }
+        if let Some(encodings) = &self.limits.allowed_encodings
+            && encodings.iter().any(|e| e.is_empty())
+        {
+            return Err("limits.allowed_encodings entries must not be empty".into());
         }
         if self.storage.sweep_interval_ms == 0 {
             return Err("storage.sweep_interval_ms must be > 0".into());

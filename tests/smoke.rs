@@ -229,10 +229,12 @@ async fn server_advertises_its_capabilities() {
         info.max_payload_bytes > 0,
         "server advertises a payload limit"
     );
+    // No `allowed_encodings` is configured, so the server restricts nothing.
     assert!(
-        !info.allowed_encodings.is_empty(),
-        "server advertises supported encodings"
+        !info.restricts_encodings,
+        "an unconfigured server does not restrict encodings"
     );
+    assert!(info.allowed_encodings.is_empty());
 }
 
 #[tokio::test]
