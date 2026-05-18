@@ -11,10 +11,11 @@ use fjall::{Database, Keyspace, KeyspaceCreateOptions, OwnedWriteBatch, PersistM
 use prost::Message;
 use tokio::sync::{Notify, futures::Notified, oneshot};
 use tonic::Status;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::config::Config;
+use crate::metrics::Metrics;
 use crate::pb::sepp::v1::{
     EnqueueRequest, EnqueueResponse, ErrorDetails, ExtendRequest, Job, JobResult, NackRequest,
     job_result, nack_retry,
@@ -48,6 +49,7 @@ struct Store {
     scheduled: Keyspace,
     leases: Keyspace,
     params: StorageParams,
+    metrics: Metrics,
 }
 
 fn read_u32(bytes: &[u8], at: usize) -> Option<u32> {
@@ -256,6 +258,16 @@ struct Indexes {
     dedup_timers: TimerIndex,
 }
 
+impl Indexes {
+    fn depths(&self) -> (u64, u64, u64) {
+        (
+            self.ready.keys.len() as u64,
+            self.scheduled.keys.len() as u64,
+            self.leases.keys.len() as u64,
+        )
+    }
+}
+
 fn rebuild_indexes(store: &Store) -> Result<Indexes, fjall::Error> {
     let mut indexes = Indexes::default();
     for guard in store.ready.iter() {
@@ -399,7 +411,11 @@ fn run_committer(
             }
             run_rpc_cycle(&store, &mut indexes, &notifiers, rpcs);
         }
+
+        let (ready, scheduled, inflight) = indexes.depths();
+        store.metrics.set_queue_depths(ready, scheduled, inflight);
     }
+    info!("committer thread stopped; storage is no longer accepting commands");
 }
 
 fn run_rpc_cycle(
@@ -524,10 +540,12 @@ fn run_sweep_cycle(store: &Store, indexes: &mut Indexes, notifiers: &QueueNotifi
 }
 
 fn commit_and_persist(store: &Store, batch: OwnedWriteBatch) -> Result<(), Status> {
-    match batch
+    let started = std::time::Instant::now();
+    let result = batch
         .commit()
-        .and_then(|()| store.db.persist(store.params.persist_mode))
-    {
+        .and_then(|()| store.db.persist(store.params.persist_mode));
+    store.metrics.record_commit(started.elapsed());
+    match result {
         Ok(()) => Ok(()),
         Err(e) => {
             error!(error = %e, "storage commit failed");
@@ -929,6 +947,11 @@ fn apply_sweep(
         };
 
         if inflight.attempt >= inflight.max_attempts {
+            warn!(
+                job_id = %String::from_utf8_lossy(job_id),
+                attempt = inflight.attempt,
+                "job dead-lettered: lease expired with attempts exhausted"
+            );
             batch.insert(
                 &store.dead_letters,
                 job_id.to_vec(),
@@ -1036,7 +1059,7 @@ pub struct Storage {
 }
 
 impl Storage {
-    pub fn open(config: &Config) -> Result<Self, fjall::Error> {
+    pub fn open(config: &Config, metrics: Metrics) -> Result<Self, fjall::Error> {
         let mut builder = Database::builder(config.server.db_path.as_str());
         if let Some(bytes) = config.storage.cache_size_bytes {
             builder = builder.cache_size(bytes);
@@ -1068,6 +1091,7 @@ impl Storage {
             leases: db.keyspace("leases", KeyspaceCreateOptions::default)?,
             db,
             params,
+            metrics,
         };
         let indexes = rebuild_indexes(&store)?;
 
@@ -1083,6 +1107,10 @@ impl Storage {
             .expect("failed to spawn committer thread");
 
         Ok(Self { tx, notifiers })
+    }
+
+    pub fn command_queue_depth(&self) -> usize {
+        self.tx.len()
     }
 
     pub fn job_waiter(&self, queues: &[String]) -> JobWaiter {

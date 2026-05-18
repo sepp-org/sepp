@@ -1,4 +1,5 @@
 use crate::config::{Config, LimitsConfig};
+use crate::metrics::{self, Metrics};
 use crate::pb::sepp::v1::{
     AckRequest, AckResponse, EnqueueBatchRequest, EnqueueBatchResponse, EnqueueRequest,
     ErrorDetails, ExtendRequest, ExtendResponse, GetServerInfoRequest, GetServerInfoResponse,
@@ -7,7 +8,9 @@ use crate::pb::sepp::v1::{
 };
 use crate::storage::{Storage, now_ms};
 use crate::telemetry;
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, time::Duration, time::Instant as StdInstant};
+
+use opentelemetry::metrics::ObservableGauge;
 
 use prost_protovalidate::Validator;
 use tokio::time::{Instant, sleep_until};
@@ -18,14 +21,27 @@ pub struct QueueServer {
     validator: Validator,
     storage: Storage,
     limits: LimitsConfig,
+    metrics: Metrics,
+    _command_queue_gauge: ObservableGauge<u64>,
+    _queue_depth_gauges: Vec<ObservableGauge<u64>>,
 }
 
 impl QueueServer {
     pub fn new(config: &Config) -> Result<Self, Box<dyn std::error::Error>> {
+        let metrics = Metrics::new(config.metrics.enabled);
+        let storage = Storage::open(config, metrics.clone())?;
+        let command_queue_gauge = {
+            let storage = storage.clone();
+            metrics::register_command_queue_gauge(move || storage.command_queue_depth() as u64)
+        };
+        let queue_depth_gauges = metrics.register_queue_depth_gauges();
         Ok(Self {
             validator: Validator::default(),
-            storage: Storage::open(config)?,
+            storage,
             limits: config.limits.clone(),
+            metrics,
+            _command_queue_gauge: command_queue_gauge,
+            _queue_depth_gauges: queue_depth_gauges,
         })
     }
 
@@ -111,9 +127,14 @@ impl QueueService for QueueServer {
     ) -> Result<Response<EnqueueBatchResponse>, Status> {
         // The span must be parented *before* it is entered, so create it here
         // and `.instrument` the body rather than using `#[tracing::instrument]`.
-        let span = tracing::info_span!("sepp.enqueue", job_ids = tracing::field::Empty);
+        let span = tracing::info_span!(
+            "sepp.enqueue",
+            job_ids = tracing::field::Empty,
+            error = tracing::field::Empty
+        );
         telemetry::set_parent_from_metadata(&span, request.metadata());
-        async move {
+        let started = StdInstant::now();
+        let result = async move {
             let req = request.into_inner();
             if req.jobs.is_empty() {
                 return Err(Status::invalid_argument(
@@ -167,6 +188,7 @@ impl QueueService for QueueServer {
                 })
                 .collect();
             tracing::Span::current().record("job_ids", tracing::field::debug(&job_ids));
+            self.metrics.record_enqueued(job_ids.len() as u64);
 
             let mut enqueued = enqueued.into_iter();
             let results = slots
@@ -178,8 +200,11 @@ impl QueueService for QueueServer {
 
             Ok(Response::new(EnqueueBatchResponse { results }))
         }
-        .instrument(span)
-        .await
+        .instrument(span.clone())
+        .await;
+        self.metrics
+            .observe("enqueue_batch", started, &span, &result);
+        result
     }
 
     async fn reserve(
@@ -189,10 +214,12 @@ impl QueueService for QueueServer {
         let span = tracing::info_span!(
             "sepp.reserve",
             job_ids = tracing::field::Empty,
+            error = tracing::field::Empty,
             worker_id = request.get_ref().worker_id.as_deref().unwrap_or("<none>"),
         );
         telemetry::set_parent_from_metadata(&span, request.metadata());
-        async move {
+        let started = StdInstant::now();
+        let result = async move {
             let req = request.into_inner();
             self.validator
                 .validate(&req)
@@ -233,10 +260,7 @@ impl QueueService for QueueServer {
                 if !jobs.is_empty() {
                     let job_ids: Vec<&str> = jobs.iter().map(|j| j.id.as_str()).collect();
                     tracing::Span::current().record("job_ids", tracing::field::debug(&job_ids));
-                    // One short span per delivered job, sitting under this
-                    // `sepp.reserve` span and linked to the job's originating
-                    // (producer) trace — so delivery is cross-referenceable
-                    // without extending the producer's trace.
+                    self.metrics.record_reserved(jobs.len() as u64);
                     for job in &jobs {
                         let deliver = tracing::info_span!(
                             "sepp.deliver",
@@ -262,51 +286,80 @@ impl QueueService for QueueServer {
                 }
             }
         }
-        .instrument(span)
-        .await
+        .instrument(span.clone())
+        .await;
+        self.metrics.observe("reserve", started, &span, &result);
+        result
     }
 
     async fn ack(&self, request: Request<AckRequest>) -> Result<Response<AckResponse>, Status> {
-        let span = tracing::info_span!("sepp.ack", job_id = %request.get_ref().job_id, worker_id = request.get_ref().worker_id.as_deref().unwrap_or("<none>"));
+        let span = tracing::info_span!(
+            "sepp.ack",
+            job_id = %request.get_ref().job_id,
+            worker_id = request.get_ref().worker_id.as_deref().unwrap_or("<none>"),
+            error = tracing::field::Empty
+        );
         telemetry::set_parent_from_metadata(&span, request.metadata());
-        async move {
+        let started = StdInstant::now();
+        let result = async move {
             let req = request.into_inner();
             self.validator
                 .validate(&req)
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
             self.storage.ack(req.job_id.clone(), req.attempt).await?;
+            self.metrics.record_acked();
             Ok(Response::new(AckResponse { job_id: req.job_id }))
         }
-        .instrument(span)
-        .await
+        .instrument(span.clone())
+        .await;
+        self.metrics.observe("ack", started, &span, &result);
+        result
     }
 
     async fn nack(&self, request: Request<NackRequest>) -> Result<Response<NackResponse>, Status> {
-        let span = tracing::info_span!("sepp.nack", job_id = %request.get_ref().job_id, worker_id = request.get_ref().worker_id.as_deref().unwrap_or("<none>"));
+        let span = tracing::info_span!(
+            "sepp.nack",
+            job_id = %request.get_ref().job_id,
+            worker_id = request.get_ref().worker_id.as_deref().unwrap_or("<none>"),
+            error = tracing::field::Empty
+        );
         telemetry::set_parent_from_metadata(&span, request.metadata());
-        async move {
+        let started = StdInstant::now();
+        let result = async move {
             let req = request.into_inner();
             self.validator
                 .validate(&req)
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
             let job_id = req.job_id.clone();
             let dead_lettered = self.storage.nack(req).await?;
+            self.metrics.record_nacked(dead_lettered);
+            if dead_lettered {
+                tracing::info!(%job_id, "job dead-lettered via nack");
+            }
             Ok(Response::new(NackResponse {
                 job_id,
                 dead_lettered,
             }))
         }
-        .instrument(span)
-        .await
+        .instrument(span.clone())
+        .await;
+        self.metrics.observe("nack", started, &span, &result);
+        result
     }
 
     async fn extend(
         &self,
         request: Request<ExtendRequest>,
     ) -> Result<Response<ExtendResponse>, Status> {
-        let span = tracing::info_span!("sepp.extend", job_id = %request.get_ref().job_id, worker_id = request.get_ref().worker_id.as_deref().unwrap_or("<none>"));
+        let span = tracing::info_span!(
+            "sepp.extend",
+            job_id = %request.get_ref().job_id,
+            worker_id = request.get_ref().worker_id.as_deref().unwrap_or("<none>"),
+            error = tracing::field::Empty
+        );
         telemetry::set_parent_from_metadata(&span, request.metadata());
-        async move {
+        let started = StdInstant::now();
+        let result = async move {
             let mut req = request.into_inner();
             self.validator
                 .validate(&req)
@@ -319,8 +372,10 @@ impl QueueService for QueueServer {
                 lease_expires_at,
             }))
         }
-        .instrument(span)
-        .await
+        .instrument(span.clone())
+        .await;
+        self.metrics.observe("extend", started, &span, &result);
+        result
     }
 
     async fn get_server_info(

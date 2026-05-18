@@ -95,3 +95,13 @@ service_name = "sepp"
 # Head sampling ratio in [0.0, 1.0] for traces this server roots. Sampling
 # decisions inherited from a caller's trace context are always honored.
 sample_ratio = 1.0
+
+[metrics]
+# Export OTLP metrics (request rates, latency, job counts, command-queue
+# depth). Independent of [tracing]; when disabled, recording is a no-op and
+# costs nothing.
+enabled = false
+# OTLP/gRPC endpoint the periodic metric reader exports to.
+otlp_endpoint = "http://localhost:4317"
+# How often metrics are flushed to the endpoint.
+export_interval_ms = 60000

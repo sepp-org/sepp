@@ -146,6 +146,24 @@ impl Default for TracingConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MetricsConfig {
+    pub enabled: bool,
+    pub otlp_endpoint: String,
+    pub export_interval_ms: u64,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            otlp_endpoint: "http://localhost:4317".to_string(),
+            export_interval_ms: 60_000,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -154,6 +172,7 @@ pub struct Config {
     pub storage: StorageConfig,
     pub logging: LoggingConfig,
     pub tracing: TracingConfig,
+    pub metrics: MetricsConfig,
 }
 
 impl Config {
@@ -264,6 +283,14 @@ impl Config {
         }
         if self.tracing.enabled && self.tracing.service_name.is_empty() {
             return Err("tracing.service_name must not be empty".into());
+        }
+        if self.metrics.enabled {
+            if self.metrics.otlp_endpoint.is_empty() {
+                return Err("metrics.otlp_endpoint must not be empty when enabled".into());
+            }
+            if self.metrics.export_interval_ms == 0 {
+                return Err("metrics.export_interval_ms must be > 0".into());
+            }
         }
         Ok(())
     }
