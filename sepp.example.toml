@@ -20,10 +20,37 @@ db_path = "./sepp-data"
 max_lease_duration_ms = 300000
 # max_attempts used for an enqueue that does not set one.
 default_max_attempts = 3
+# Ceiling a client-supplied max_attempts is clamped to, so a job cannot be
+# made effectively un-dead-letterable. Must be >= default_max_attempts.
+max_attempts_ceiling = 100
+# priority used for an enqueue that does not set one. Range 0-9.
+default_priority = 0
 # Largest batch a single reserve call may claim (max_jobs is clamped to this).
 max_reserve_batch = 256
+# Largest number of queues a single reserve call may name.
+max_reserve_queues = 32
 # Upper bound a reserve wait_timeout_ms is clamped to.
 max_wait_timeout_ms = 300000
+# Largest number of jobs a single EnqueueBatch may carry; over this is rejected.
+max_enqueue_batch = 256
+# Largest job payload accepted, in bytes.
+max_payload_bytes = 1048576
+# Hard ceiling on a decoded gRPC request, in bytes. Must be >= max_payload_bytes.
+max_message_bytes = 16777216
+# Per-job custom-map limits: entry count, total key+value bytes, and key bytes.
+max_custom_entries = 64
+max_custom_total_bytes = 16384
+max_custom_key_bytes = 256
+# Largest queue name accepted, in bytes. Capped at 65535 by the on-disk key
+# format.
+max_queue_name_bytes = 512
+# Largest job_type accepted, in bytes.
+max_job_type_bytes = 256
+# Largest idempotency_key accepted, in bytes.
+max_idempotency_key_bytes = 256
+# How far into the future a job may be scheduled. Also clamps a nack retry
+# delay. Default 30 days.
+max_schedule_horizon_ms = 2592000000
 
 [storage]
 # Group-commit fsync durability. "sync_all" is correct on every filesystem;

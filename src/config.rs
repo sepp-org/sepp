@@ -36,8 +36,21 @@ impl Default for ServerConfig {
 pub struct LimitsConfig {
     pub max_lease_duration_ms: u64,
     pub default_max_attempts: u32,
+    pub max_attempts_ceiling: u32,
+    pub default_priority: u32,
     pub max_reserve_batch: u32,
+    pub max_reserve_queues: u32,
     pub max_wait_timeout_ms: u64,
+    pub max_enqueue_batch: u32,
+    pub max_payload_bytes: u64,
+    pub max_message_bytes: u64,
+    pub max_custom_entries: u32,
+    pub max_custom_total_bytes: u64,
+    pub max_custom_key_bytes: u32,
+    pub max_queue_name_bytes: u32,
+    pub max_job_type_bytes: u32,
+    pub max_idempotency_key_bytes: u32,
+    pub max_schedule_horizon_ms: u64,
 }
 
 impl Default for LimitsConfig {
@@ -45,8 +58,21 @@ impl Default for LimitsConfig {
         Self {
             max_lease_duration_ms: 5 * 60 * 1000,
             default_max_attempts: 3,
+            max_attempts_ceiling: 100,
+            default_priority: 0,
             max_reserve_batch: 256,
+            max_reserve_queues: 32,
             max_wait_timeout_ms: 5 * 60 * 1000,
+            max_enqueue_batch: 256,
+            max_payload_bytes: 1 << 20,
+            max_message_bytes: 16 << 20,
+            max_custom_entries: 64,
+            max_custom_total_bytes: 16 << 10,
+            max_custom_key_bytes: 256,
+            max_queue_name_bytes: 512,
+            max_job_type_bytes: 256,
+            max_idempotency_key_bytes: 256,
+            max_schedule_horizon_ms: 30 * 24 * 60 * 60 * 1000,
         }
     }
 }
@@ -164,6 +190,54 @@ impl Config {
         }
         if self.limits.max_wait_timeout_ms == 0 {
             return Err("limits.max_wait_timeout_ms must be > 0".into());
+        }
+        if self.limits.max_attempts_ceiling == 0 {
+            return Err("limits.max_attempts_ceiling must be > 0".into());
+        }
+        if self.limits.default_max_attempts > self.limits.max_attempts_ceiling {
+            return Err(
+                "limits.default_max_attempts must not exceed limits.max_attempts_ceiling".into(),
+            );
+        }
+        if self.limits.default_priority > 9 {
+            return Err("limits.default_priority must be in [0, 9]".into());
+        }
+        if self.limits.max_reserve_queues == 0 {
+            return Err("limits.max_reserve_queues must be > 0".into());
+        }
+        if self.limits.max_enqueue_batch == 0 {
+            return Err("limits.max_enqueue_batch must be > 0".into());
+        }
+        if self.limits.max_payload_bytes == 0 {
+            return Err("limits.max_payload_bytes must be > 0".into());
+        }
+        if self.limits.max_message_bytes < self.limits.max_payload_bytes {
+            return Err(
+                "limits.max_message_bytes must be >= limits.max_payload_bytes".into(),
+            );
+        }
+        if self.limits.max_custom_entries == 0 {
+            return Err("limits.max_custom_entries must be > 0".into());
+        }
+        if self.limits.max_custom_total_bytes == 0 {
+            return Err("limits.max_custom_total_bytes must be > 0".into());
+        }
+        if self.limits.max_custom_key_bytes == 0 {
+            return Err("limits.max_custom_key_bytes must be > 0".into());
+        }
+        if self.limits.max_queue_name_bytes == 0
+            || self.limits.max_queue_name_bytes > u16::MAX as u32
+        {
+            return Err("limits.max_queue_name_bytes must be in [1, 65535]".into());
+        }
+        if self.limits.max_job_type_bytes == 0 {
+            return Err("limits.max_job_type_bytes must be > 0".into());
+        }
+        if self.limits.max_idempotency_key_bytes == 0 {
+            return Err("limits.max_idempotency_key_bytes must be > 0".into());
+        }
+        if self.limits.max_schedule_horizon_ms == 0 {
+            return Err("limits.max_schedule_horizon_ms must be > 0".into());
         }
         if self.storage.sweep_interval_ms == 0 {
             return Err("storage.sweep_interval_ms must be > 0".into());

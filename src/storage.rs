@@ -32,6 +32,9 @@ struct StorageParams {
     sweep_limit: usize,
     dedup_window_ms: i64,
     default_max_attempts: u32,
+    default_priority: u32,
+    max_attempts_ceiling: u32,
+    max_schedule_horizon_ms: u64,
 }
 
 struct Store {
@@ -585,13 +588,14 @@ fn apply_enqueue(
             id: id.clone(),
             job_type: req.job_type,
             payload: req.payload,
-            priority: req.priority.unwrap_or(0),
+            priority: req.priority.unwrap_or(store.params.default_priority),
             trace_context: req.trace_context,
             enqueued_at: now,
             attempt: 1,
             max_attempts: req
                 .max_attempts
-                .unwrap_or(store.params.default_max_attempts),
+                .unwrap_or(store.params.default_max_attempts)
+                .min(store.params.max_attempts_ceiling),
             lease_expires_at: 0,
             custom: req.custom,
             scheduled_at: req.scheduled_at,
@@ -774,7 +778,7 @@ fn apply_nack(
     let strategy = req.retry.as_ref().and_then(|r| r.strategy.as_ref());
     let force_dead_letter = matches!(strategy, Some(nack_retry::Strategy::DeadLetter(_)));
     let retry_delay_ms = match strategy {
-        Some(nack_retry::Strategy::DelayMs(ms)) => *ms,
+        Some(nack_retry::Strategy::DelayMs(ms)) => (*ms).min(store.params.max_schedule_horizon_ms),
         _ => 0,
     };
     if force_dead_letter || inflight.attempt >= inflight.max_attempts {
@@ -1049,6 +1053,9 @@ impl Storage {
             sweep_limit: config.storage.sweep_limit,
             dedup_window_ms: config.storage.dedup_window_ms,
             default_max_attempts: config.limits.default_max_attempts,
+            default_priority: config.limits.default_priority,
+            max_attempts_ceiling: config.limits.max_attempts_ceiling,
+            max_schedule_horizon_ms: config.limits.max_schedule_horizon_ms,
         };
         let store = Store {
             payloads: db.keyspace("payloads", KeyspaceCreateOptions::default)?,
