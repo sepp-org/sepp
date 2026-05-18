@@ -29,8 +29,10 @@ max_wait_timeout_ms = 300000
 # Group-commit fsync durability. "sync_all" is correct on every filesystem;
 # "sync_data" is faster but only safe on some — change with care.
 persist_mode = "sync_all"
-# How often the timer sweep runs. Also the worst-case lateness of a scheduled
-# promotion or a lease expiry.
+# Upper bound on how long the committer parks between maintenance checks when
+# no nearer timer is pending. Sweeps are otherwise driven by actual timer
+# deadlines, so a scheduled promotion or lease expiry fires on time regardless.
+# Useful to cap the wait against a backward wall-clock jump.
 sweep_interval_ms = 1000
 # Upper bound on timers processed in a single sweep.
 sweep_limit = 10000

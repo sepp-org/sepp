@@ -9,7 +9,7 @@ use std::{
 
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, OwnedWriteBatch, PersistMode};
 use prost::Message;
-use tokio::sync::{Notify, futures::Notified, mpsc, oneshot};
+use tokio::sync::{Notify, futures::Notified, oneshot};
 use tonic::Status;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
@@ -239,6 +239,10 @@ impl TimerIndex {
         self.keys.remove(&key);
         Some(key)
     }
+
+    fn earliest(&self) -> Option<i64> {
+        self.keys.iter().next().map(|k| deadline_of(k))
+    }
 }
 
 #[derive(Default)]
@@ -331,7 +335,6 @@ enum Command {
         req: ExtendRequest,
         resp: oneshot::Sender<Result<i64, Status>>,
     },
-    Sweep,
 }
 
 type Responder = Box<dyn FnOnce(&Result<(), Status>) + Send>;
@@ -343,32 +346,55 @@ struct Cycle {
     dedup_seen: HashMap<(String, String), String>,
 }
 
+fn next_deadline(indexes: &Indexes) -> Option<i64> {
+    [
+        indexes.scheduled.earliest(),
+        indexes.leases.earliest(),
+        indexes.dedup_timers.earliest(),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+}
+
 fn run_committer(
     store: Store,
     mut indexes: Indexes,
-    mut rx: mpsc::Receiver<Command>,
+    rx: flume::Receiver<Command>,
     notifiers: QueueNotifiers,
+    max_sweep_interval: Duration,
 ) {
-    while let Some(first) = rx.blocking_recv() {
-        let mut rpcs = vec![first];
-        let mut sweep_due = false;
-        while let Ok(c) = rx.try_recv() {
-            rpcs.push(c);
-        }
-        rpcs.retain(|c| {
-            if matches!(c, Command::Sweep) {
-                sweep_due = true;
-                false
-            } else {
-                true
-            }
-        });
-
-        if !rpcs.is_empty() {
-            run_rpc_cycle(&store, &mut indexes, &notifiers, rpcs);
-        }
+    loop {
+        let sweep_due = next_deadline(&indexes).is_some_and(|d| d <= now_ms());
         if sweep_due {
             run_sweep_cycle(&store, &mut indexes, &notifiers);
+        }
+
+        let first = if sweep_due {
+            match rx.try_recv() {
+                Ok(c) => Some(c),
+                Err(flume::TryRecvError::Empty) => None,
+                Err(flume::TryRecvError::Disconnected) => break,
+            }
+        } else {
+            let wait = match next_deadline(&indexes) {
+                Some(deadline) => Duration::from_millis((deadline - now_ms()).max(0) as u64)
+                    .min(max_sweep_interval),
+                None => max_sweep_interval,
+            };
+            match rx.recv_timeout(wait) {
+                Ok(c) => Some(c),
+                Err(flume::RecvTimeoutError::Timeout) => None,
+                Err(flume::RecvTimeoutError::Disconnected) => break,
+            }
+        };
+
+        if let Some(first) = first {
+            let mut rpcs = vec![first];
+            while let Ok(c) = rx.try_recv() {
+                rpcs.push(c);
+            }
+            run_rpc_cycle(&store, &mut indexes, &notifiers, rpcs);
         }
     }
 }
@@ -438,7 +464,6 @@ fn run_rpc_cycle(
                     }
                 }
             }
-            Command::Sweep => unreachable!("sweep pokes are partitioned out"),
         }
     }
 
@@ -580,7 +605,11 @@ fn apply_enqueue(
         match job.scheduled_at {
             Some(at) if at > now => {
                 let tk = timer_key(at, &id);
-                batch.insert(&store.scheduled, tk.clone(), job.attempt.to_be_bytes().to_vec());
+                batch.insert(
+                    &store.scheduled,
+                    tk.clone(),
+                    job.attempt.to_be_bytes().to_vec(),
+                );
                 indexes.scheduled.insert(tk);
             }
             _ => {
@@ -998,7 +1027,7 @@ impl Future for Armed<'_> {
 
 #[derive(Clone)]
 pub struct Storage {
-    tx: mpsc::Sender<Command>,
+    tx: flume::Sender<Command>,
     notifiers: QueueNotifiers,
 }
 
@@ -1035,35 +1064,16 @@ impl Storage {
         };
         let indexes = rebuild_indexes(&store)?;
 
-        let (tx, rx) = mpsc::channel(config.storage.command_queue_capacity);
+        let (tx, rx) = flume::bounded(config.storage.command_queue_capacity);
         let notifiers = QueueNotifiers::default();
+        let max_sweep_interval = Duration::from_millis(config.storage.sweep_interval_ms);
         std::thread::Builder::new()
             .name("sepp-committer".to_string())
             .spawn({
                 let notifiers = notifiers.clone();
-                move || run_committer(store, indexes, rx, notifiers)
+                move || run_committer(store, indexes, rx, notifiers, max_sweep_interval)
             })
             .expect("failed to spawn committer thread");
-
-        let sweep_interval = Duration::from_millis(config.storage.sweep_interval_ms);
-        std::thread::Builder::new()
-            .name("sepp-sweep-ticker".to_string())
-            .spawn({
-                let tx = tx.clone();
-                move || {
-                    loop {
-                        std::thread::sleep(sweep_interval);
-                        match tx.try_send(Command::Sweep) {
-                            Ok(()) => {}
-                            // Channel saturated — a cycle is already backed up,
-                            // and the next tick will retry.
-                            Err(mpsc::error::TrySendError::Full(_)) => {}
-                            Err(mpsc::error::TrySendError::Closed(_)) => break,
-                        }
-                    }
-                }
-            })
-            .expect("failed to spawn sweep ticker thread");
 
         Ok(Self { tx, notifiers })
     }
@@ -1077,7 +1087,7 @@ impl Storage {
     async fn send<T>(&self, make: impl FnOnce(oneshot::Sender<T>) -> Command) -> Result<T, Status> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
-            .send(make(resp_tx))
+            .send_async(make(resp_tx))
             .await
             .map_err(|_| Status::internal("storage unavailable"))?;
         resp_rx
@@ -1251,7 +1261,10 @@ mod tests {
         assert_eq!(i64::from_be_bytes(v[..8].try_into().unwrap()), 123_456);
         assert_eq!(v[8], 2);
         assert_eq!(encode_dead_letter(0, DeadLetterCause::Rejected)[8], 0);
-        assert_eq!(encode_dead_letter(0, DeadLetterCause::AttemptsExhausted)[8], 1);
+        assert_eq!(
+            encode_dead_letter(0, DeadLetterCause::AttemptsExhausted)[8],
+            1
+        );
     }
 
     #[test]
@@ -1347,6 +1360,34 @@ mod tests {
         assert_eq!(idx.pop_due(200), Some(timer_key(100, "a")));
         assert_eq!(idx.pop_due(200), None);
         assert_eq!(idx.pop_due(500), Some(timer_key(500, "b")));
+    }
+
+    #[test]
+    fn timer_index_earliest_reports_the_lowest_deadline() {
+        let mut idx = TimerIndex::default();
+        assert_eq!(idx.earliest(), None);
+
+        idx.insert(timer_key(300, "c"));
+        idx.insert(timer_key(100, "a"));
+        idx.insert(timer_key(200, "b"));
+        assert_eq!(idx.earliest(), Some(100));
+
+        idx.remove(&timer_key(100, "a"));
+        assert_eq!(idx.earliest(), Some(200));
+    }
+
+    #[test]
+    fn next_deadline_is_the_minimum_across_every_timer_index() {
+        let mut indexes = Indexes::default();
+        assert_eq!(next_deadline(&indexes), None);
+
+        indexes.scheduled.insert(timer_key(500, "s"));
+        indexes.leases.insert(timer_key(200, "l"));
+        indexes.dedup_timers.insert(dedup_timer_key(800, b"d"));
+        assert_eq!(next_deadline(&indexes), Some(200));
+
+        indexes.leases.remove(&timer_key(200, "l"));
+        assert_eq!(next_deadline(&indexes), Some(500));
     }
 
     #[test]

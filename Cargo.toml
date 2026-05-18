@@ -13,6 +13,7 @@ prost-reflect = "0.16"
 prost-protovalidate = "0.3"
 uuid = { version = "1.23.1", features = ["v4"] }
 fjall = "3"
+flume = "0.11"
 serde = { version = "1", features = ["derive"] }
 figment = { version = "0.10", features = ["toml", "env"] }
 tracing = "0.1"
