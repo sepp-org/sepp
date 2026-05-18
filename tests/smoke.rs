@@ -1,9 +1,26 @@
+//! End-to-end smoke tests that drive a real server process over gRPC, using
+//! the generated protobuf client directly (no SDK wrapper). Each test owns its
+//! own server process, port and database, so they run independently.
+
 use std::collections::HashMap;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, SystemTime};
 
-use sepp_rs::client::{RetryDirective, SeppClient};
-use sepp_rs::{EnqueueAck, EnqueueRequest, Job, Payload, Primitive, Priority, ReserveOptions};
+use sepp::pb::sepp::v1::{
+    AckRequest, EnqueueBatchRequest, EnqueueRequest, EnqueueResponse, ExtendRequest,
+    GetServerInfoRequest, Job, NackRequest, NackRetry, Payload, PrimitiveValue, ReserveRequest,
+    job_result, nack_retry, primitive_value, queue_service_client::QueueServiceClient,
+};
+use tonic::transport::Channel;
+
+type Client = QueueServiceClient<Channel>;
+
+/// How a nacked job should be retried, mirroring the proto `NackRetry` oneof.
+enum Retry {
+    Default,
+    After(Duration),
+    DeadLetter,
+}
 
 struct ServerGuard {
     child: Child,
@@ -36,7 +53,7 @@ fn temp_db(tag: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("sepp-smoke-{tag}-{unique}"))
 }
 
-async fn spawn_server(db_path: &std::path::Path) -> (Child, SeppClient) {
+async fn spawn_server(db_path: &std::path::Path) -> (Child, Client) {
     let port = free_port();
     let child = Command::new(env!("CARGO_BIN_EXE_sepp"))
         .env("SEPP_SERVER__LISTEN_ADDR", format!("127.0.0.1:{port}"))
@@ -47,7 +64,7 @@ async fn spawn_server(db_path: &std::path::Path) -> (Child, SeppClient) {
 
     let addr = format!("http://127.0.0.1:{port}");
     for _ in 0..100 {
-        if let Ok(client) = SeppClient::connect(addr.clone()).await {
+        if let Ok(client) = QueueServiceClient::connect(addr.clone()).await {
             return (child, client);
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -55,8 +72,10 @@ async fn spawn_server(db_path: &std::path::Path) -> (Child, SeppClient) {
     panic!("server did not become reachable on {addr}");
 }
 
-async fn start_server() -> (ServerGuard, SeppClient) {
-    let db_path = temp_db("main");
+/// Spawns a fresh server with a throwaway database and returns a guard that
+/// kills the process and deletes the database when dropped.
+async fn start_server(tag: &str) -> (ServerGuard, Client) {
+    let db_path = temp_db(tag);
     let (child, client) = spawn_server(&db_path).await;
     (
         ServerGuard {
@@ -68,84 +87,207 @@ async fn start_server() -> (ServerGuard, SeppClient) {
 }
 
 fn enqueue_req(queue: &str) -> EnqueueRequest {
-    EnqueueRequest::new(queue, "smoke-job").expect("valid enqueue request")
+    EnqueueRequest {
+        queue: queue.to_string(),
+        job_type: "smoke-job".to_string(),
+        ..Default::default()
+    }
 }
 
-async fn enqueue_one(client: &SeppClient, req: EnqueueRequest) -> EnqueueAck {
-    client
-        .enqueue(req)
+/// Enqueues a single job through `EnqueueBatch` and unwraps its success result.
+async fn enqueue(client: &Client, req: EnqueueRequest) -> EnqueueResponse {
+    let result = client
+        .clone()
+        .enqueue_batch(EnqueueBatchRequest { jobs: vec![req] })
         .await
-        .expect("enqueue RPC")
-        .expect("job accepted")
+        .expect("enqueue_batch RPC")
+        .into_inner()
+        .results
+        .into_iter()
+        .next()
+        .expect("one result per submitted job");
+    match result.outcome {
+        Some(job_result::Outcome::Success(s)) => s,
+        other => panic!("job was not accepted: {other:?}"),
+    }
 }
 
-async fn reserve(client: &SeppClient, queue: &str, lease: Duration, wait: Duration) -> Option<Job> {
-    let opts = ReserveOptions::new([queue], lease)
-        .expect("valid reserve options")
-        .with_wait_timeout(wait);
+async fn reserve_batch(
+    client: &Client,
+    queues: &[&str],
+    lease: Duration,
+    wait: Duration,
+    max_jobs: Option<u32>,
+) -> Vec<Job> {
     client
-        .reserve(&opts)
+        .clone()
+        .reserve(ReserveRequest {
+            queues: queues.iter().map(|q| q.to_string()).collect(),
+            wait_timeout_ms: wait.as_millis() as u64,
+            lease_duration_ms: lease.as_millis() as u64,
+            worker_id: None,
+            max_jobs,
+        })
         .await
         .expect("reserve RPC")
-        .and_then(|jobs| jobs.into_iter().next())
+        .into_inner()
+        .jobs
 }
 
-#[tokio::test]
-async fn smoke() {
-    let (_guard, client) = start_server().await;
+async fn reserve(client: &Client, queue: &str, lease: Duration, wait: Duration) -> Option<Job> {
+    reserve_batch(client, &[queue], lease, wait, None)
+        .await
+        .into_iter()
+        .next()
+}
 
-    let info = client.get_server_info().await.expect("server info");
-    assert!(!info.version.is_empty(), "server reports a version");
-    assert!(info.max_payload_size > 0, "server advertises a payload limit");
+async fn ack(client: &Client, job: &Job) {
+    client
+        .clone()
+        .ack(AckRequest {
+            job_id: job.id.clone(),
+            attempt: job.attempt,
+            worker_id: None,
+        })
+        .await
+        .expect("ack RPC");
+}
+
+/// Nacks a job and returns whether the server dead-lettered it.
+async fn nack(client: &Client, job: &Job, retry: Retry, reason: &str) -> bool {
+    let strategy = match retry {
+        Retry::Default => nack_retry::Strategy::Default(()),
+        Retry::After(delay) => nack_retry::Strategy::DelayMs(delay.as_millis() as u64),
+        Retry::DeadLetter => nack_retry::Strategy::DeadLetter(()),
+    };
+    client
+        .clone()
+        .nack(NackRequest {
+            job_id: job.id.clone(),
+            attempt: job.attempt,
+            reason: Some(reason.to_string()),
+            retry: Some(NackRetry {
+                strategy: Some(strategy),
+            }),
+            worker_id: None,
+        })
+        .await
+        .expect("nack RPC")
+        .into_inner()
+        .dead_lettered
+}
+
+async fn extend(client: &Client, job: &Job, lease: Duration) {
+    client
+        .clone()
+        .extend(ExtendRequest {
+            job_id: job.id.clone(),
+            attempt: job.attempt,
+            lease_duration_ms: lease.as_millis() as u64,
+            worker_id: None,
+        })
+        .await
+        .expect("extend RPC");
+}
+
+fn prim_str(value: &str) -> PrimitiveValue {
+    PrimitiveValue {
+        value: Some(primitive_value::Value::StringValue(value.to_string())),
+    }
+}
+
+fn prim_int(value: i64) -> PrimitiveValue {
+    PrimitiveValue {
+        value: Some(primitive_value::Value::IntValue(value)),
+    }
+}
+
+fn epoch_ms_in(d: Duration) -> i64 {
+    (SystemTime::now() + d)
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
+const LEASE: Duration = Duration::from_secs(30);
+const WAIT: Duration = Duration::from_secs(5);
+const NO_WAIT: Duration = Duration::from_millis(200);
+
+#[tokio::test]
+async fn server_advertises_its_capabilities() {
+    let (_guard, client) = start_server("info").await;
+
+    let info = client
+        .clone()
+        .get_server_info(GetServerInfoRequest {})
+        .await
+        .expect("get_server_info RPC")
+        .into_inner();
+
+    assert!(!info.server_version.is_empty(), "server reports a version");
+    assert!(
+        info.max_payload_bytes > 0,
+        "server advertises a payload limit"
+    );
     assert!(
         !info.allowed_encodings.is_empty(),
         "server advertises supported encodings"
     );
+}
 
-    let ack = enqueue_one(
+#[tokio::test]
+async fn enqueue_reserve_ack_roundtrip() {
+    let (_guard, client) = start_server("basic").await;
+
+    let ack_resp = enqueue(
         &client,
-        enqueue_req("smoke-basic").with_payload(Payload {
-            data: b"hello".to_vec(),
-            encoding: "text/plain".to_string(),
-        }),
+        EnqueueRequest {
+            payload: Some(Payload {
+                data: b"hello".to_vec(),
+                encoding: "text/plain".to_string(),
+            }),
+            ..enqueue_req("smoke-basic")
+        },
     )
     .await;
-    assert!(!ack.deduplicated);
+    assert!(!ack_resp.deduplicated);
 
-    let job = reserve(
-        &client,
-        "smoke-basic",
-        Duration::from_secs(30),
-        Duration::from_secs(5),
-    )
-    .await
-    .expect("basic job is reservable");
-    assert_eq!(job.ctx.id, ack.job_id);
-    assert_eq!(job.ctx.attempt, 1);
+    let job = reserve(&client, "smoke-basic", LEASE, WAIT)
+        .await
+        .expect("basic job is reservable");
+    assert_eq!(job.id, ack_resp.job_id);
+    assert_eq!(job.attempt, 1);
     assert_eq!(
         job.payload.as_ref().map(|p| p.data.as_slice()),
         Some(&b"hello"[..]),
     );
-    client.ack(&job.ctx).await.expect("ack");
 
-    let gone = reserve(
-        &client,
-        "smoke-basic",
-        Duration::from_secs(30),
-        Duration::from_millis(200),
-    )
-    .await;
+    ack(&client, &job).await;
+
+    let gone = reserve(&client, "smoke-basic", LEASE, NO_WAIT).await;
     assert!(gone.is_none(), "acked job must not be redelivered");
+}
 
-    let first = enqueue_one(
+#[tokio::test]
+async fn idempotency_key_deduplicates_enqueue() {
+    let (_guard, client) = start_server("dedup").await;
+
+    let first = enqueue(
         &client,
-        enqueue_req("smoke-dedup").with_idempotency_key("k1"),
+        EnqueueRequest {
+            idempotency_key: Some("k1".to_string()),
+            ..enqueue_req("smoke-dedup")
+        },
     )
     .await;
     assert!(!first.deduplicated);
-    let second = enqueue_one(
+
+    let second = enqueue(
         &client,
-        enqueue_req("smoke-dedup").with_idempotency_key("k1"),
+        EnqueueRequest {
+            idempotency_key: Some("k1".to_string()),
+            ..enqueue_req("smoke-dedup")
+        },
     )
     .await;
     assert!(
@@ -153,423 +295,373 @@ async fn smoke() {
         "second enqueue with the same key is deduplicated"
     );
     assert_eq!(second.job_id, first.job_id);
+}
 
-    enqueue_one(&client, enqueue_req("smoke-nack")).await;
-    let job = reserve(
-        &client,
-        "smoke-nack",
-        Duration::from_secs(30),
-        Duration::from_secs(5),
-    )
-    .await
-    .expect("nack job reservable");
-    assert_eq!(job.ctx.attempt, 1);
-    let dead = client
-        .nack(&job.ctx, RetryDirective::Default, "smoke retry")
+#[tokio::test]
+async fn nack_redelivers_and_increments_attempt() {
+    let (_guard, client) = start_server("nack").await;
+
+    enqueue(&client, enqueue_req("smoke-nack")).await;
+    let job = reserve(&client, "smoke-nack", LEASE, WAIT)
         .await
-        .expect("nack");
+        .expect("nack job reservable");
+    assert_eq!(job.attempt, 1);
+
+    let dead = nack(&client, &job, Retry::Default, "smoke retry").await;
     assert!(!dead, "first nack should not dead-letter");
-    let retried = reserve(
-        &client,
-        "smoke-nack",
-        Duration::from_secs(30),
-        Duration::from_secs(5),
-    )
-    .await
-    .expect("nacked job is redelivered");
-    assert_eq!(retried.ctx.attempt, 2);
-    client.ack(&retried.ctx).await.expect("ack retry");
 
-    enqueue_one(&client, enqueue_req("smoke-delay")).await;
-    let job = reserve(
-        &client,
-        "smoke-delay",
-        Duration::from_secs(30),
-        Duration::from_secs(5),
-    )
-    .await
-    .expect("delay job reservable");
-    assert_eq!(job.ctx.attempt, 1);
-    let dead = client
-        .nack(
-            &job.ctx,
-            RetryDirective::After(Duration::from_secs(3)),
-            "retry later",
-        )
+    let retried = reserve(&client, "smoke-nack", LEASE, WAIT)
         .await
-        .expect("nack with delay");
-    assert!(!dead, "a delayed nack retries, it does not dead-letter");
-    let too_early = reserve(
+        .expect("nacked job is redelivered");
+    assert_eq!(retried.attempt, 2);
+    ack(&client, &retried).await;
+}
+
+#[tokio::test]
+async fn delayed_nack_defers_redelivery() {
+    let (_guard, client) = start_server("delay").await;
+
+    enqueue(&client, enqueue_req("smoke-delay")).await;
+    let job = reserve(&client, "smoke-delay", LEASE, WAIT)
+        .await
+        .expect("delay job reservable");
+    assert_eq!(job.attempt, 1);
+
+    let dead = nack(
         &client,
-        "smoke-delay",
-        Duration::from_secs(30),
-        Duration::from_millis(200),
+        &job,
+        Retry::After(Duration::from_secs(3)),
+        "retry later",
     )
     .await;
+    assert!(!dead, "a delayed nack retries, it does not dead-letter");
+
+    let too_early = reserve(&client, "smoke-delay", LEASE, NO_WAIT).await;
     assert!(
         too_early.is_none(),
         "a delayed-retry job is not reservable before its delay elapses"
     );
-    let retried = reserve(
-        &client,
-        "smoke-delay",
-        Duration::from_secs(30),
-        Duration::from_secs(15),
-    )
-    .await
-    .expect("a delayed-retry job becomes reservable after its delay");
+
+    let retried = reserve(&client, "smoke-delay", LEASE, Duration::from_secs(15))
+        .await
+        .expect("a delayed-retry job becomes reservable after its delay");
     assert_eq!(
-        retried.ctx.attempt, 2,
+        retried.attempt, 2,
         "the delayed retry still increments the attempt"
     );
-    client.ack(&retried.ctx).await.expect("ack delayed retry");
+    ack(&client, &retried).await;
+}
 
-    let scheduled_for = SystemTime::now() + Duration::from_secs(3);
-    enqueue_one(
+#[tokio::test]
+async fn scheduled_job_waits_for_its_time() {
+    let (_guard, client) = start_server("sched").await;
+
+    enqueue(
         &client,
-        enqueue_req("smoke-sched").with_scheduled_at(scheduled_for),
+        EnqueueRequest {
+            scheduled_at: Some(epoch_ms_in(Duration::from_secs(3))),
+            ..enqueue_req("smoke-sched")
+        },
     )
     .await;
-    let early = reserve(
-        &client,
-        "smoke-sched",
-        Duration::from_secs(30),
-        Duration::from_millis(200),
-    )
-    .await;
+
+    let early = reserve(&client, "smoke-sched", LEASE, NO_WAIT).await;
     assert!(
         early.is_none(),
         "scheduled job must not be reservable before its time"
     );
-    let promoted = reserve(
-        &client,
-        "smoke-sched",
-        Duration::from_secs(30),
-        Duration::from_secs(15),
-    )
-    .await
-    .expect("scheduled job becomes reservable after its schedule");
-    client.ack(&promoted.ctx).await.expect("ack scheduled");
 
-    enqueue_one(&client, enqueue_req("smoke-lease")).await;
-    let leased = reserve(
-        &client,
-        "smoke-lease",
-        Duration::from_secs(1),
-        Duration::from_secs(5),
-    )
-    .await
-    .expect("lease job reservable");
-    assert_eq!(leased.ctx.attempt, 1);
-    let held = reserve(
-        &client,
-        "smoke-lease",
-        Duration::from_secs(1),
-        Duration::from_millis(200),
-    )
-    .await;
-    assert!(held.is_none(), "leased job must not be reservable");
-    let redelivered = reserve(
-        &client,
-        "smoke-lease",
-        Duration::from_secs(30),
-        Duration::from_secs(15),
-    )
-    .await
-    .expect("expired lease is redelivered");
-    assert_eq!(
-        redelivered.ctx.attempt, 2,
-        "redelivery increments the attempt"
-    );
-    client.ack(&redelivered.ctx).await.expect("ack redelivered");
-
-    let batch = client
-        .enqueue_batch([
-            enqueue_req("smoke-batch"),
-            enqueue_req("smoke-batch"),
-            enqueue_req("smoke-batch"),
-        ])
+    let promoted = reserve(&client, "smoke-sched", LEASE, Duration::from_secs(15))
         .await
-        .expect("enqueue_batch RPC");
-    assert!(batch.all_succeeded(), "every job in the batch is accepted");
+        .expect("scheduled job becomes reservable after its schedule");
+    ack(&client, &promoted).await;
+}
+
+#[tokio::test]
+async fn expired_lease_redelivers_job() {
+    let (_guard, client) = start_server("lease").await;
+
+    enqueue(&client, enqueue_req("smoke-lease")).await;
+    let leased = reserve(&client, "smoke-lease", Duration::from_secs(1), WAIT)
+        .await
+        .expect("lease job reservable");
+    assert_eq!(leased.attempt, 1);
+
+    let held = reserve(&client, "smoke-lease", Duration::from_secs(1), NO_WAIT).await;
+    assert!(held.is_none(), "leased job must not be reservable");
+
+    let redelivered = reserve(&client, "smoke-lease", LEASE, Duration::from_secs(15))
+        .await
+        .expect("expired lease is redelivered");
+    assert_eq!(redelivered.attempt, 2, "redelivery increments the attempt");
+    ack(&client, &redelivered).await;
+}
+
+#[tokio::test]
+async fn extend_keeps_lease_alive() {
+    let (_guard, client) = start_server("extend").await;
+
+    enqueue(&client, enqueue_req("smoke-extend")).await;
+    let leased = reserve(&client, "smoke-extend", Duration::from_secs(1), WAIT)
+        .await
+        .expect("extend job reservable");
+    assert_eq!(leased.attempt, 1);
+
+    extend(&client, &leased, LEASE).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let still_held = reserve(&client, "smoke-extend", Duration::from_secs(1), NO_WAIT).await;
+    assert!(
+        still_held.is_none(),
+        "an extended lease keeps the job from being redelivered past its original deadline"
+    );
+    ack(&client, &leased).await;
+}
+
+#[tokio::test]
+async fn batch_enqueue_accepts_every_job() {
+    let (_guard, client) = start_server("batch").await;
+
+    let results = client
+        .clone()
+        .enqueue_batch(EnqueueBatchRequest {
+            jobs: vec![
+                enqueue_req("smoke-batch"),
+                enqueue_req("smoke-batch"),
+                enqueue_req("smoke-batch"),
+            ],
+        })
+        .await
+        .expect("enqueue_batch RPC")
+        .into_inner()
+        .results;
+
     assert_eq!(
-        batch.results().len(),
+        results.len(),
         3,
         "the batch returns one result per submitted job"
     );
-    for _ in 0..3 {
-        let job = reserve(
-            &client,
-            "smoke-batch",
-            Duration::from_secs(30),
-            Duration::from_secs(5),
-        )
-        .await
-        .expect("each batched job is reservable");
-        client.ack(&job.ctx).await.expect("ack batched job");
-    }
-    let drained = reserve(
-        &client,
-        "smoke-batch",
-        Duration::from_secs(30),
-        Duration::from_millis(200),
-    )
-    .await;
-    assert!(drained.is_none(), "the batch holds exactly three jobs");
+    assert!(
+        results
+            .iter()
+            .all(|r| matches!(r.outcome, Some(job_result::Outcome::Success(_)))),
+        "every job in the batch is accepted"
+    );
 
-    enqueue_one(
+    for _ in 0..3 {
+        let job = reserve(&client, "smoke-batch", LEASE, WAIT)
+            .await
+            .expect("each batched job is reservable");
+        ack(&client, &job).await;
+    }
+    let drained = reserve(&client, "smoke-batch", LEASE, NO_WAIT).await;
+    assert!(drained.is_none(), "the batch holds exactly three jobs");
+}
+
+#[tokio::test]
+async fn higher_priority_is_reserved_first() {
+    let (_guard, client) = start_server("prio").await;
+
+    enqueue(
         &client,
-        enqueue_req("smoke-prio").with_priority(Priority::new(1).expect("valid priority")),
+        EnqueueRequest {
+            priority: Some(1),
+            ..enqueue_req("smoke-prio")
+        },
     )
     .await;
-    let high = enqueue_one(
+    let high = enqueue(
         &client,
-        enqueue_req("smoke-prio").with_priority(Priority::MAX),
+        EnqueueRequest {
+            priority: Some(9),
+            ..enqueue_req("smoke-prio")
+        },
     )
     .await;
-    let first = reserve(
-        &client,
-        "smoke-prio",
-        Duration::from_secs(30),
-        Duration::from_secs(5),
-    )
-    .await
-    .expect("priority job reservable");
+
+    let first = reserve(&client, "smoke-prio", LEASE, WAIT)
+        .await
+        .expect("priority job reservable");
     assert_eq!(
-        first.ctx.id, high.job_id,
+        first.id, high.job_id,
         "the higher-priority job is reserved before the lower one, regardless of enqueue order"
     );
-    client.ack(&first.ctx).await.expect("ack high priority");
-    let second = reserve(
-        &client,
-        "smoke-prio",
-        Duration::from_secs(30),
-        Duration::from_secs(5),
-    )
-    .await
-    .expect("lower-priority job reservable");
-    client.ack(&second.ctx).await.expect("ack low priority");
+    ack(&client, &first).await;
 
-    let early = enqueue_one(&client, enqueue_req("smoke-fifo")).await;
+    let second = reserve(&client, "smoke-prio", LEASE, WAIT)
+        .await
+        .expect("lower-priority job reservable");
+    ack(&client, &second).await;
+}
+
+#[tokio::test]
+async fn jobs_of_equal_priority_are_fifo() {
+    let (_guard, client) = start_server("fifo").await;
+
+    let early = enqueue(&client, enqueue_req("smoke-fifo")).await;
     tokio::time::sleep(Duration::from_millis(5)).await;
-    let late = enqueue_one(&client, enqueue_req("smoke-fifo")).await;
-    let r1 = reserve(
-        &client,
-        "smoke-fifo",
-        Duration::from_secs(30),
-        Duration::from_secs(5),
-    )
-    .await
-    .expect("first fifo job reservable");
+    let late = enqueue(&client, enqueue_req("smoke-fifo")).await;
+
+    let r1 = reserve(&client, "smoke-fifo", LEASE, WAIT)
+        .await
+        .expect("first fifo job reservable");
     assert_eq!(
-        r1.ctx.id, early.job_id,
+        r1.id, early.job_id,
         "within one priority the earlier-enqueued job is reserved first"
     );
-    let r2 = reserve(
-        &client,
-        "smoke-fifo",
-        Duration::from_secs(30),
-        Duration::from_secs(5),
-    )
-    .await
-    .expect("second fifo job reservable");
-    assert_eq!(r2.ctx.id, late.job_id);
-    client.ack(&r1.ctx).await.expect("ack fifo 1");
-    client.ack(&r2.ctx).await.expect("ack fifo 2");
+    let r2 = reserve(&client, "smoke-fifo", LEASE, WAIT)
+        .await
+        .expect("second fifo job reservable");
+    assert_eq!(r2.id, late.job_id);
 
-    enqueue_one(
+    ack(&client, &r1).await;
+    ack(&client, &r2).await;
+}
+
+#[tokio::test]
+async fn job_dead_letters_when_attempts_are_exhausted() {
+    let (_guard, client) = start_server("dlq").await;
+
+    enqueue(
         &client,
-        enqueue_req("smoke-dlq").with_max_attempts(2),
+        EnqueueRequest {
+            max_attempts: Some(2),
+            ..enqueue_req("smoke-dlq")
+        },
     )
     .await;
-    let a1 = reserve(
-        &client,
-        "smoke-dlq",
-        Duration::from_secs(30),
-        Duration::from_secs(5),
-    )
-    .await
-    .expect("dlq job attempt 1 reservable");
-    assert_eq!(a1.ctx.attempt, 1);
-    let dead1 = client
-        .nack(&a1.ctx, RetryDirective::Default, "fail 1")
+
+    let a1 = reserve(&client, "smoke-dlq", LEASE, WAIT)
         .await
-        .expect("nack 1");
+        .expect("dlq job attempt 1 reservable");
+    assert_eq!(a1.attempt, 1);
+    let dead1 = nack(&client, &a1, Retry::Default, "fail 1").await;
     assert!(!dead1, "attempt 1 of 2 is retried, not dead-lettered");
-    let a2 = reserve(
-        &client,
-        "smoke-dlq",
-        Duration::from_secs(30),
-        Duration::from_secs(5),
-    )
-    .await
-    .expect("dlq job attempt 2 reservable");
-    assert_eq!(a2.ctx.attempt, 2);
-    let dead2 = client
-        .nack(&a2.ctx, RetryDirective::Default, "fail 2")
+
+    let a2 = reserve(&client, "smoke-dlq", LEASE, WAIT)
         .await
-        .expect("nack 2");
+        .expect("dlq job attempt 2 reservable");
+    assert_eq!(a2.attempt, 2);
+    let dead2 = nack(&client, &a2, Retry::Default, "fail 2").await;
     assert!(
         dead2,
         "nacking the final attempt exhausts max_attempts and dead-letters the job"
     );
-    let gone = reserve(
-        &client,
-        "smoke-dlq",
-        Duration::from_secs(30),
-        Duration::from_millis(200),
-    )
-    .await;
-    assert!(gone.is_none(), "a dead-lettered job is not redelivered");
 
-    enqueue_one(&client, enqueue_req("smoke-dlq-force")).await;
-    let job = reserve(
-        &client,
-        "smoke-dlq-force",
-        Duration::from_secs(30),
-        Duration::from_secs(5),
-    )
-    .await
-    .expect("force-dlq job reservable");
-    assert_eq!(job.ctx.attempt, 1);
-    let dead = client
-        .nack(&job.ctx, RetryDirective::DeadLetter, "drop it")
+    let gone = reserve(&client, "smoke-dlq", LEASE, NO_WAIT).await;
+    assert!(gone.is_none(), "a dead-lettered job is not redelivered");
+}
+
+#[tokio::test]
+async fn dead_letter_directive_drops_job_immediately() {
+    let (_guard, client) = start_server("dlq-force").await;
+
+    enqueue(&client, enqueue_req("smoke-dlq-force")).await;
+    let job = reserve(&client, "smoke-dlq-force", LEASE, WAIT)
         .await
-        .expect("nack");
+        .expect("force-dlq job reservable");
+    assert_eq!(job.attempt, 1);
+
+    let dead = nack(&client, &job, Retry::DeadLetter, "drop it").await;
     assert!(
         dead,
         "a DeadLetter nack dead-letters immediately, before attempts are exhausted"
     );
-    let gone = reserve(
-        &client,
-        "smoke-dlq-force",
-        Duration::from_secs(30),
-        Duration::from_millis(200),
-    )
-    .await;
+
+    let gone = reserve(&client, "smoke-dlq-force", LEASE, NO_WAIT).await;
     assert!(
         gone.is_none(),
         "a force-dead-lettered job is not redelivered"
     );
+}
 
-    let mq_job = enqueue_one(&client, enqueue_req("smoke-mq-b")).await;
-    let mq_opts = ReserveOptions::new(["smoke-mq-a", "smoke-mq-b"], Duration::from_secs(30))
-        .expect("valid reserve options")
-        .with_wait_timeout(Duration::from_secs(5));
-    let claimed = client
-        .reserve(&mq_opts)
+#[tokio::test]
+async fn reserve_spans_multiple_queues() {
+    let (_guard, client) = start_server("mq").await;
+
+    let mq_job = enqueue(&client, enqueue_req("smoke-mq-b")).await;
+
+    let claimed = reserve_batch(&client, &["smoke-mq-a", "smoke-mq-b"], LEASE, WAIT, None)
         .await
-        .expect("multi-queue reserve RPC")
-        .and_then(|jobs| jobs.into_iter().next())
+        .into_iter()
+        .next()
         .expect("a reserve over several queues claims from whichever has work");
     assert_eq!(
-        claimed.ctx.id, mq_job.job_id,
+        claimed.id, mq_job.job_id,
         "the multi-queue reserve claims the job from the non-empty queue"
     );
-    client.ack(&claimed.ctx).await.expect("ack multi-queue job");
+    ack(&client, &claimed).await;
+}
+
+#[tokio::test]
+async fn batch_reserve_returns_up_to_max_jobs() {
+    let (_guard, client) = start_server("rbatch").await;
 
     for _ in 0..5 {
-        enqueue_one(&client, enqueue_req("smoke-rbatch")).await;
+        enqueue(&client, enqueue_req("smoke-rbatch")).await;
     }
-    let batch_opts = ReserveOptions::new(["smoke-rbatch"], Duration::from_secs(30))
-        .expect("valid reserve options")
-        .with_wait_timeout(Duration::from_secs(5))
-        .with_max_jobs(3);
-    let first_batch = client
-        .reserve(&batch_opts)
-        .await
-        .expect("batch reserve RPC")
-        .expect("a non-empty queue yields a batch");
+
+    let first_batch = reserve_batch(&client, &["smoke-rbatch"], LEASE, WAIT, Some(3)).await;
     assert_eq!(
         first_batch.len(),
         3,
         "a batch reserve claims at most max_jobs in one call"
     );
     for job in &first_batch {
-        client.ack(&job.ctx).await.expect("ack batch-reserved job");
+        ack(&client, job).await;
     }
-    let rest = client
-        .reserve(&batch_opts)
-        .await
-        .expect("batch reserve RPC")
-        .expect("the queue still has jobs");
+
+    let rest = reserve_batch(&client, &["smoke-rbatch"], LEASE, WAIT, Some(3)).await;
     assert_eq!(
         rest.len(),
         2,
         "a batch reserve returns whatever is available, up to max_jobs"
     );
     for job in &rest {
-        client.ack(&job.ctx).await.expect("ack batch-reserved job");
+        ack(&client, job).await;
     }
+}
+
+#[tokio::test]
+async fn payload_and_custom_fields_roundtrip() {
+    let (_guard, client) = start_server("custom").await;
 
     let mut custom = HashMap::new();
-    custom.insert(
-        "region".to_string(),
-        Primitive::String("eu-west".to_string()),
-    );
-    custom.insert("retries".to_string(), Primitive::Int(7));
-    enqueue_one(
+    custom.insert("region".to_string(), prim_str("eu-west"));
+    custom.insert("retries".to_string(), prim_int(7));
+
+    enqueue(
         &client,
-        enqueue_req("smoke-custom")
-            .with_payload(Payload {
+        EnqueueRequest {
+            payload: Some(Payload {
                 data: b"{}".to_vec(),
                 encoding: "application/json".to_string(),
-            })
-            .with_custom(custom),
+            }),
+            custom,
+            ..enqueue_req("smoke-custom")
+        },
     )
     .await;
-    let job = reserve(
-        &client,
-        "smoke-custom",
-        Duration::from_secs(30),
-        Duration::from_secs(5),
-    )
-    .await
-    .expect("custom job reservable");
+
+    let job = reserve(&client, "smoke-custom", LEASE, WAIT)
+        .await
+        .expect("custom job reservable");
     let payload = job.payload.as_ref().expect("payload round-trips");
     assert_eq!(
         payload.encoding, "application/json",
         "payload encoding round-trips intact"
     );
     assert_eq!(
-        job.ctx.custom.get("region"),
-        Some(&Primitive::String("eu-west".to_string())),
+        job.custom.get("region"),
+        Some(&prim_str("eu-west")),
         "custom string field round-trips intact"
     );
     assert_eq!(
-        job.ctx.custom.get("retries"),
-        Some(&Primitive::Int(7)),
+        job.custom.get("retries"),
+        Some(&prim_int(7)),
         "custom int field round-trips intact"
     );
-    client.ack(&job.ctx).await.expect("ack custom job");
-
-    enqueue_one(&client, enqueue_req("smoke-extend")).await;
-    let leased = reserve(
-        &client,
-        "smoke-extend",
-        Duration::from_secs(1),
-        Duration::from_secs(5),
-    )
-    .await
-    .expect("extend job reservable");
-    assert_eq!(leased.ctx.attempt, 1);
-    client
-        .extend(&leased.ctx, Duration::from_secs(30))
-        .await
-        .expect("extend RPC");
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    let still_held = reserve(
-        &client,
-        "smoke-extend",
-        Duration::from_secs(1),
-        Duration::from_millis(200),
-    )
-    .await;
-    assert!(
-        still_held.is_none(),
-        "an extended lease keeps the job from being redelivered past its original deadline"
-    );
-    client.ack(&leased.ctx).await.expect("ack extended job");
+    ack(&client, &job).await;
 }
 
 #[tokio::test]
@@ -582,7 +674,7 @@ async fn durability_survives_restart() {
             child,
             db_path: None,
         };
-        enqueue_one(&client, enqueue_req("smoke-restart")).await.job_id
+        enqueue(&client, enqueue_req("smoke-restart")).await.job_id
     };
 
     let (child, client) = spawn_server(&db_path).await;
@@ -591,18 +683,10 @@ async fn durability_survives_restart() {
         db_path: Some(db_path),
     };
 
-    let job = reserve(
-        &client,
-        "smoke-restart",
-        Duration::from_secs(30),
-        Duration::from_secs(5),
-    )
-    .await
-    .expect("a job enqueued before a restart is still reservable after it");
-    assert_eq!(
-        job.ctx.id, job_id,
-        "the same job survives a server restart"
-    );
-    assert_eq!(job.ctx.attempt, 1);
-    client.ack(&job.ctx).await.expect("ack restart job");
+    let job = reserve(&client, "smoke-restart", LEASE, WAIT)
+        .await
+        .expect("a job enqueued before a restart is still reservable after it");
+    assert_eq!(job.id, job_id, "the same job survives a server restart");
+    assert_eq!(job.attempt, 1);
+    ack(&client, &job).await;
 }

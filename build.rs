@@ -41,7 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .configure(&mut prost_config, protos, includes)?;
 
     tonic_prost_build::configure()
-        .build_client(false)
+        .build_client(true) // For the smoke test
         .build_server(true)
         .compile_with_config(prost_config, protos, includes)?;
 

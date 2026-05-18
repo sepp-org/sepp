@@ -2,16 +2,11 @@ use std::time::Duration;
 
 use tonic::transport::Server;
 
-use crate::config::Config;
-use crate::pb::sepp::v1::queue_service_server::QueueServiceServer;
-use crate::queue_server::QueueServer;
+use sepp::config::Config;
+use sepp::pb::sepp::v1::queue_service_server::QueueServiceServer;
+use sepp::queue_server::QueueServer;
+use sepp::telemetry;
 use tracing::info;
-
-mod config;
-mod pb;
-mod queue_server;
-mod storage;
-mod telemetry;
 
 fn config_path_arg() -> Option<String> {
     let mut args = std::env::args();
@@ -36,7 +31,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Server::builder()
         .http2_keepalive_interval(Some(Duration::from_secs(30)))
         .http2_keepalive_timeout(Some(Duration::from_secs(10)))
-        .add_service(QueueServiceServer::new(svc))
+        .add_service(
+            QueueServiceServer::new(svc)
+                .max_decoding_message_size(config.limits.max_message_bytes as usize),
+        )
         .serve_with_shutdown(addr, shutdown_signal())
         .await?;
     info!("queue server stopped");
