@@ -80,6 +80,14 @@ command_queue_capacity = 1024
 # 512 MiB; must be >= 64 MiB. Raising it pushes out the point at which a
 # large backlog forces heavy flushing.
 #max_journaling_size_bytes = 4294967296    # 4 GiB
+# Upper limit on file descriptors fjall caches, shared across all keyspaces.
+# Absent = fjall's default (400 on Windows, 900 on Linux, 150 on macOS); must
+# be >= 10. Raising it cuts file reopens once many SST files accumulate.
+#max_cached_files = 2000
+# Background worker threads fjall uses for flushing and compaction. Absent =
+# fjall's default of min(CPU cores, 4); must be > 0. Raise it on large hosts
+# under heavy write load.
+#worker_threads = 8
 
 [logging]
 # Log filter: a level (trace/debug/info/warn/error) or a full directive like

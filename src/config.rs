@@ -90,6 +90,8 @@ pub struct StorageConfig {
     pub command_queue_capacity: usize,
     pub cache_size_bytes: Option<u64>,
     pub max_journaling_size_bytes: Option<u64>,
+    pub max_cached_files: Option<usize>,
+    pub worker_threads: Option<usize>,
 }
 
 impl Default for StorageConfig {
@@ -102,6 +104,8 @@ impl Default for StorageConfig {
             command_queue_capacity: 1024,
             cache_size_bytes: None,
             max_journaling_size_bytes: None,
+            max_cached_files: None,
+            worker_threads: None,
         }
     }
 }
@@ -283,6 +287,14 @@ impl Config {
             && bytes < 64 * 1024 * 1024
         {
             return Err("storage.max_journaling_size_bytes must be >= 64 MiB when set".into());
+        }
+        if let Some(n) = self.storage.max_cached_files
+            && n < 10
+        {
+            return Err("storage.max_cached_files must be >= 10 when set".into());
+        }
+        if matches!(self.storage.worker_threads, Some(0)) {
+            return Err("storage.worker_threads must be > 0 when set".into());
         }
         if !(0.0..=1.0).contains(&self.tracing.sample_ratio) {
             return Err("tracing.sample_ratio must be in [0.0, 1.0]".into());

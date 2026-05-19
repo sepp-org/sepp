@@ -1067,6 +1067,12 @@ impl Storage {
         if let Some(bytes) = config.storage.max_journaling_size_bytes {
             builder = builder.max_journaling_size(bytes);
         }
+        if let Some(n) = config.storage.max_cached_files {
+            builder = builder.max_cached_files(Some(n));
+        }
+        if let Some(n) = config.storage.worker_threads {
+            builder = builder.worker_threads(n);
+        }
         let db = builder.open()?;
         let params = StorageParams {
             persist_mode: match config.storage.persist_mode {
