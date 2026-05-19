@@ -1,8 +1,10 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    unsafe {
-        std::env::set_var("PROTOC", protoc_bin_vendored::protoc_bin_path()?);
-    }
-
+    // `protoc` must be installed and on PATH (or pointed at by the PROTOC env
+    // var). It is a build prerequisite — see the README. We cannot vendor it:
+    // a transitive dependency (`prost-protovalidate-types`) also compiles
+    // `.proto` files in its own build script and resolves `protoc` the same
+    // way, and a build script cannot inject env vars into sibling crates.
+    //
     // Proto files are vendored into `proto/` (committed to the repo). To refresh
     // them after an upstream change, run:
     //

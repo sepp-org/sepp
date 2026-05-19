@@ -14,6 +14,20 @@
 listen_addr = "0.0.0.0:50051"
 # Directory for the fjall database.
 db_path = "./sepp-data"
+# TLS for the gRPC listener. Set both paths to PEM files to serve over TLS;
+# leave both unset (the default) to serve plaintext. Setting only one is a
+# configuration error. New connections pick up a changed cert only after a
+# restart — the server does not hot-reload it.
+#tls_cert_path = "/etc/sepp/tls/server.crt"
+#tls_key_path = "/etc/sepp/tls/server.key"
+
+[auth]
+# API-key authentication. Callers present a key in the gRPC `authorization`
+# metadata as `Bearer <key>`. Omit this key entirely to disable auth (every
+# caller is allowed); set an explicit list to accept only those keys; set an
+# empty list [] to reject every caller. Keys are bearer secrets — run TLS
+# (above) so they are not sent in the clear.
+#api_keys = ["key-for-worker-pool", "key-for-producers"]
 
 [limits]
 # Upper bound a reserve lease is clamped to.

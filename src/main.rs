@@ -1,13 +1,15 @@
 use std::time::Duration;
 
-use tonic::transport::Server;
+use tonic::service::interceptor::InterceptedService;
+use tonic::transport::{Identity, Server, ServerTlsConfig};
 
+use sepp::auth::ApiKeyInterceptor;
 use sepp::config::Config;
 use sepp::metrics;
 use sepp::pb::sepp::v1::queue_service_server::QueueServiceServer;
 use sepp::queue_server::QueueServer;
 use sepp::telemetry;
-use tracing::info;
+use tracing::{info, warn};
 
 fn config_path_arg() -> Option<String> {
     let mut args = std::env::args();
@@ -30,20 +32,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _metrics = metrics::init(&config.metrics, &config.tracing.service_name)?;
     let addr = config.server.listen_addr.parse()?;
     let svc = QueueServer::new(&config)?;
-    info!(%addr, db_path = %config.server.db_path, "queue server listening");
 
-    Server::builder()
+    let queue_service = QueueServiceServer::new(svc)
+        .max_decoding_message_size(config.limits.max_message_bytes as usize);
+    let interceptor = ApiKeyInterceptor::new(&config.auth.api_keys);
+    let service = InterceptedService::new(queue_service, interceptor.clone());
+
+    let tls_enabled = config.server.tls_enabled();
+    let mut builder = Server::builder()
         .http2_keepalive_interval(Some(Duration::from_secs(30)))
-        .http2_keepalive_timeout(Some(Duration::from_secs(10)))
-        .add_service(
-            QueueServiceServer::new(svc)
-                .max_decoding_message_size(config.limits.max_message_bytes as usize),
-        )
+        .http2_keepalive_timeout(Some(Duration::from_secs(10)));
+    if tls_enabled {
+        let identity = load_tls_identity(&config)?;
+        builder = builder.tls_config(ServerTlsConfig::new().identity(identity))?;
+    }
+
+    if interceptor.is_enforcing() && !tls_enabled {
+        warn!("API-key auth is enabled without TLS; keys are sent in plaintext");
+    }
+    let on_off = |on: bool| if on { "enabled" } else { "disabled" };
+    info!(
+        %addr,
+        db_path = %config.server.db_path,
+        tls = on_off(tls_enabled),
+        auth = on_off(interceptor.is_enforcing()),
+        "queue server listening",
+    );
+
+    builder
+        .add_service(service)
         .serve_with_shutdown(addr, shutdown_signal())
         .await?;
 
     info!("queue server stopped");
     Ok(())
+}
+
+fn load_tls_identity(config: &Config) -> Result<Identity, Box<dyn std::error::Error>> {
+    let cert_path = config
+        .server
+        .tls_cert_path
+        .as_deref()
+        .expect("tls_cert_path set");
+    let key_path = config
+        .server
+        .tls_key_path
+        .as_deref()
+        .expect("tls_key_path set");
+    let cert = std::fs::read(cert_path)
+        .map_err(|e| format!("reading server.tls_cert_path ({cert_path}): {e}"))?;
+    let key = std::fs::read(key_path)
+        .map_err(|e| format!("reading server.tls_key_path ({key_path}): {e}"))?;
+    Ok(Identity::from_pem(cert, key))
 }
 
 // Catch panics for logging

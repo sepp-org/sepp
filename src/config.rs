@@ -20,6 +20,14 @@ pub enum PersistMode {
 pub struct ServerConfig {
     pub listen_addr: String,
     pub db_path: String,
+    pub tls_cert_path: Option<String>,
+    pub tls_key_path: Option<String>,
+}
+
+impl ServerConfig {
+    pub fn tls_enabled(&self) -> bool {
+        self.tls_cert_path.is_some() && self.tls_key_path.is_some()
+    }
 }
 
 impl Default for ServerConfig {
@@ -27,8 +35,16 @@ impl Default for ServerConfig {
         Self {
             listen_addr: "0.0.0.0:50051".to_string(),
             db_path: "./sepp-data".to_string(),
+            tls_cert_path: None,
+            tls_key_path: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AuthConfig {
+    pub api_keys: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -175,6 +191,7 @@ impl Default for MetricsConfig {
 #[serde(default)]
 pub struct Config {
     pub server: ServerConfig,
+    pub auth: AuthConfig,
     pub limits: LimitsConfig,
     pub storage: StorageConfig,
     pub logging: LoggingConfig,
@@ -204,6 +221,31 @@ impl Config {
             .map_err(|e| format!("server.listen_addr is not a valid address: {e}"))?;
         if self.server.db_path.is_empty() {
             return Err("server.db_path must not be empty".into());
+        }
+        match (&self.server.tls_cert_path, &self.server.tls_key_path) {
+            (Some(_), None) => {
+                return Err(
+                    "server.tls_cert_path is set but server.tls_key_path is not; set both or neither".into(),
+                );
+            }
+            (None, Some(_)) => {
+                return Err(
+                    "server.tls_key_path is set but server.tls_cert_path is not; set both or neither".into(),
+                );
+            }
+            (Some(cert), Some(key)) => {
+                if cert.is_empty() || key.is_empty() {
+                    return Err(
+                        "server.tls_cert_path and server.tls_key_path must not be empty".into(),
+                    );
+                }
+            }
+            (None, None) => {}
+        }
+        if let Some(keys) = &self.auth.api_keys
+            && keys.iter().any(|k| k.is_empty())
+        {
+            return Err("auth.api_keys entries must not be empty".into());
         }
         if self.limits.max_lease_duration_ms == 0 {
             return Err("limits.max_lease_duration_ms must be > 0".into());

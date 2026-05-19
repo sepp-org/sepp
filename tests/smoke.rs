@@ -54,13 +54,23 @@ fn temp_db(tag: &str) -> std::path::PathBuf {
 }
 
 async fn spawn_server(db_path: &std::path::Path) -> (Child, Client) {
+    spawn_server_with_env(db_path, &[]).await
+}
+
+async fn spawn_server_with_env(
+    db_path: &std::path::Path,
+    extra_env: &[(&str, &str)],
+) -> (Child, Client) {
     let port = free_port();
-    let child = Command::new(env!("CARGO_BIN_EXE_sepp"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_sepp"));
+    command
         .env("SEPP_SERVER__LISTEN_ADDR", format!("127.0.0.1:{port}"))
         .env("SEPP_SERVER__DB_PATH", db_path)
-        .stdout(Stdio::null())
-        .spawn()
-        .expect("spawn sepp server");
+        .stdout(Stdio::null());
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+    let child = command.spawn().expect("spawn sepp server");
 
     let addr = format!("http://127.0.0.1:{port}");
     for _ in 0..100 {
@@ -664,6 +674,51 @@ async fn payload_and_custom_fields_roundtrip() {
         "custom int field round-trips intact"
     );
     ack(&client, &job).await;
+}
+
+/// Wraps a message in a request carrying an `authorization: Bearer <key>`
+/// header, the way an authenticated client presents its API key.
+fn with_key<T>(msg: T, key: &str) -> tonic::Request<T> {
+    let mut req = tonic::Request::new(msg);
+    req.metadata_mut()
+        .insert("authorization", format!("Bearer {key}").parse().unwrap());
+    req
+}
+
+#[tokio::test]
+async fn api_key_auth_gates_requests() {
+    let db_path = temp_db("auth");
+    let (child, client) =
+        spawn_server_with_env(&db_path, &[("SEPP_AUTH__API_KEYS", r#"["smoke-secret"]"#)]).await;
+    let _guard = ServerGuard {
+        child,
+        db_path: Some(db_path),
+    };
+
+    // No key at all is rejected.
+    let status = client
+        .clone()
+        .get_server_info(GetServerInfoRequest {})
+        .await
+        .expect_err("a request without an API key is rejected");
+    assert_eq!(status.code(), tonic::Code::Unauthenticated);
+
+    // A key that is not in the configured list is rejected.
+    let status = client
+        .clone()
+        .get_server_info(with_key(GetServerInfoRequest {}, "wrong-key"))
+        .await
+        .expect_err("a request with an unknown API key is rejected");
+    assert_eq!(status.code(), tonic::Code::Unauthenticated);
+
+    // The configured key is accepted.
+    let info = client
+        .clone()
+        .get_server_info(with_key(GetServerInfoRequest {}, "smoke-secret"))
+        .await
+        .expect("a request with a valid API key is accepted")
+        .into_inner();
+    assert!(!info.server_version.is_empty());
 }
 
 #[tokio::test]
