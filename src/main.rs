@@ -1,3 +1,4 @@
+use std::process::ExitCode;
 use std::time::Duration;
 
 use tonic::service::interceptor::InterceptedService;
@@ -10,6 +11,8 @@ use sepp::pb::sepp::v1::queue_service_server::QueueServiceServer;
 use sepp::queue_server::QueueServer;
 use sepp::telemetry;
 use tracing::{info, warn};
+
+const EXAMPLE_CONFIG: &str = include_str!("../sepp.example.toml");
 
 fn config_path_arg() -> Option<String> {
     let mut args = std::env::args();
@@ -24,8 +27,32 @@ fn config_path_arg() -> Option<String> {
     std::env::var("SEPP_CONFIG").ok()
 }
 
+fn handle_subcommand() -> Option<ExitCode> {
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() != Some("config") {
+        return None;
+    }
+    match args.next().as_deref() {
+        Some("example") => {
+            print!("{EXAMPLE_CONFIG}");
+            Some(ExitCode::SUCCESS)
+        }
+        Some(other) => {
+            eprintln!("sepp config: unknown subcommand '{other}'\n\nusage: sepp config example");
+            Some(ExitCode::FAILURE)
+        }
+        None => {
+            eprintln!("sepp config: missing subcommand\n\nusage: sepp config example");
+            Some(ExitCode::FAILURE)
+        }
+    }
+}
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
+    if let Some(code) = handle_subcommand() {
+        return Ok(code);
+    }
     let config = Config::load(config_path_arg().as_deref())?;
     let _telemetry = telemetry::init(&config.logging, &config.tracing)?;
     install_panic_hook();
@@ -65,7 +92,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     info!("queue server stopped");
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }
 
 fn load_tls_identity(config: &Config) -> Result<Identity, Box<dyn std::error::Error>> {
