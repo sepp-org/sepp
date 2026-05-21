@@ -11,7 +11,7 @@ use sepp::pb::sepp::v1::queue_service_server::QueueServiceServer;
 use sepp::queue_server::QueueServer;
 use sepp::queues::QueueRegistry;
 use sepp::telemetry;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 const EXAMPLE_CONFIG: &str = include_str!("../sepp.example.toml");
 
@@ -57,10 +57,25 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     let config = Config::load(config_path_arg().as_deref())?;
     let _telemetry = telemetry::init(&config.logging, &config.tracing)?;
     install_panic_hook();
+    debug!(
+        persist_mode = ?config.storage.persist_mode,
+        sweep_interval_ms = config.storage.sweep_interval_ms,
+        sweep_limit = config.storage.sweep_limit,
+        command_queue_capacity = config.storage.command_queue_capacity,
+        tracing_enabled = config.tracing.enabled,
+        sample_ratio = config.tracing.sample_ratio,
+        metrics_enabled = config.metrics.enabled,
+        metrics_export_interval_ms = config.metrics.export_interval_ms,
+        "configuration loaded",
+    );
     let _metrics = metrics::init(&config.metrics, &config.tracing.service_name)?;
     let addr = config.server.listen_addr.parse()?;
     let registry = QueueRegistry::from_config(&config);
     let declared_queues = registry.declared_count();
+    if declared_queues > 0 {
+        let names: Vec<&str> = registry.declared_names().collect();
+        info!(queues = ?names, "declared queues from config");
+    }
     let svc = QueueServer::new(&config, registry.into_shared())?;
 
     let queue_service = QueueServiceServer::new(svc)

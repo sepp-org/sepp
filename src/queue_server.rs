@@ -212,13 +212,22 @@ impl QueueService for QueueServer {
                         slots.push(None);
                         valid.push(job);
                     }
-                    Some((code, message)) => slots.push(Some(JobResult {
-                        outcome: Some(job_result::Outcome::Error(ErrorDetails {
-                            code,
-                            message,
-                            context: HashMap::new(),
-                        })),
-                    })),
+                    Some((code, message)) => {
+                        tracing::info!(
+                            queue = %job.queue,
+                            job_type = %job.job_type,
+                            code = %code,
+                            %message,
+                            "enqueue rejected",
+                        );
+                        slots.push(Some(JobResult {
+                            outcome: Some(job_result::Outcome::Error(ErrorDetails {
+                                code,
+                                message,
+                                context: HashMap::new(),
+                            })),
+                        }));
+                    }
                 }
             }
 

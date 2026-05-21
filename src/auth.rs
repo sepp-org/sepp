@@ -3,6 +3,7 @@ use std::sync::{Arc, RwLock};
 
 use tonic::service::Interceptor;
 use tonic::{Request, Status};
+use tracing::warn;
 
 #[derive(Clone)]
 pub struct ApiKeyInterceptor {
@@ -44,10 +45,16 @@ impl Interceptor for ApiKeyInterceptor {
             .and_then(|value| value.strip_prefix("Bearer "));
         match presented {
             Some(key) if allowed.contains(key) => Ok(request),
-            Some(_) => Err(Status::unauthenticated("invalid API key")),
-            None => Err(Status::unauthenticated(
-                "missing API key; expected an `authorization: Bearer <key>` header",
-            )),
+            Some(_) => {
+                warn!("rejected request: invalid API key");
+                Err(Status::unauthenticated("invalid API key"))
+            }
+            None => {
+                warn!("rejected request: missing API key");
+                Err(Status::unauthenticated(
+                    "missing API key; expected an `authorization: Bearer <key>` header",
+                ))
+            }
         }
     }
 }

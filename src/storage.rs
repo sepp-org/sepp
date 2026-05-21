@@ -1004,6 +1004,12 @@ fn apply_sweep(
                 continue;
             };
             let attempt = inflight.attempt + 1;
+            debug!(
+                job_id = %job_id_str,
+                queue = %inflight.queue,
+                attempt,
+                "lease expired; requeueing job",
+            );
             let rk = ready_key(
                 &inflight.queue,
                 inflight.priority,
@@ -1156,6 +1162,15 @@ impl Storage {
                 move || run_committer(store, indexes, rx, notifiers, max_sweep_interval)
             })
             .expect("failed to spawn committer thread");
+
+        info!(
+            db_path = %config.server.db_path,
+            persist_mode = ?config.storage.persist_mode,
+            sweep_interval_ms = config.storage.sweep_interval_ms,
+            sweep_limit = config.storage.sweep_limit,
+            command_queue_capacity = config.storage.command_queue_capacity,
+            "storage opened",
+        );
 
         Ok(Self { tx, notifiers })
     }
