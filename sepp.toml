@@ -1,63 +1,160 @@
 # sepp server configuration.
 #
 # Copy to `sepp.toml` (loaded automatically from the working directory) or
-# point at it with `--config <path>` or the SEPP_CONFIG env var. Every value
-# below is the built-in default, so an absent file — or an absent field — is
-# fine; the file only overrides what it sets.
+# point at it with `--config <path>` or the SEPP_CONFIG env var.
 #
 # Any field can also be overridden by an environment variable: prefix `SEPP_`,
 # uppercase, and join the section and field with `__`. For example,
-# `SEPP_SERVER__LISTEN_ADDR=0.0.0.0:6000`. Env vars win over the file.
+# `SEPP_SERVER__LISTEN_ADDR=0.0.0.0:6000`. Env vars take precedence over the file.
 
 [server]
-# host:port the gRPC server binds to.
+# host:port to bind sepp to.
 listen_addr = "0.0.0.0:50051"
-# Directory for the fjall database.
+
+# Directory of the durable database.
 db_path = "./sepp-data"
 
+# TLS settings. Set both or neither.
+#tls_cert_path = "/etc/sepp/tls/server.crt"
+#tls_key_path = "/etc/sepp/tls/server.key"
+
+[auth]
+# Primitive API key authentication. If omitted, every caller is allowed.
+# If set to a non-empty list, only those keys are accepted.
+# If set to an empty list, no caller is allowed.
+# Should always be used over TLS, otherwise keys are sent in the clear.
+#api_keys = ["key-for-worker-pool", "key-for-producers"]
+
 [limits]
-# Upper bound a reserve lease is clamped to.
+# Maximum time a client has to complete a job before it is eligible to be leased out again.
 max_lease_duration_ms = 300000
-# max_attempts used for an enqueue that does not set one.
+
+# The default number of times a job will be retried before being dead-lettered.
+# Will be used if the client does not set a max_attempts value.
 default_max_attempts = 3
-# Largest batch a single reserve call may claim (max_jobs is clamped to this).
+
+# Ceiling a client-supplied max_attempts is clamped to, so a job cannot be
+# made effectively un-dead-letterable. Must be >= default_max_attempts.
+max_attempts_ceiling = 100
+
+# Priority used for an enqueue that does not set one. Range 0-9.
+# Higher values are higher priority; lower values are lower priority.
+default_priority = 0
+
+# Largest batch of jobs a single reserve call may claim.
 max_reserve_batch = 256
 
+# Largest number of queues a single reserve call may reserve from at once.
+max_reserve_queues = 32
+
+# Upper bound a reserve wait_timeout_ms (set by the client) is clamped to.
+# A reserve call will keep the connection open for this duration, even if no jobs are available at the time.
+# This is known as long-polling.
+max_wait_timeout_ms = 300000
+
+# Largest number of jobs a single EnqueueBatch may carry.
+max_enqueue_batch = 256
+
+# Largest job payload accepted, in bytes.
+max_payload_bytes = 1048576
+
+# Payload encodings the server accepts. Omit this key to accept any encoding;
+# set an explicit list to allow only those; set an empty list [] to reject
+# every payload. Jobs enqueued without a payload are unaffected.
+#allowed_encodings = ["json", "msgpack"]
+
+# Hard ceiling on a decoded gRPC request, in bytes. Must be >= max_payload_bytes.
+max_message_bytes = 16777216
+
+# Per-job custom-map limits: entry count, total key+value bytes and key bytes.
+max_custom_entries = 64
+max_custom_total_bytes = 16384
+max_custom_key_bytes = 256
+
+# Largest queue name accepted, in bytes. Capped at 65535 by the on-disk key format.
+max_queue_name_bytes = 512
+
+# Largest job_type accepted, in bytes.
+max_job_type_bytes = 256
+
+# Largest idempotency_key accepted, in bytes.
+max_idempotency_key_bytes = 256
+
+# How far into the future a job may be scheduled.
+# Also clamps the nack retry delay set by the client.
+# Default 30 days.
+max_schedule_horizon_ms = 2592000000
+
 [storage]
-# Group-commit fsync durability. "sync_all" is correct on every filesystem;
-# "sync_data" is faster but only safe on some — change with care.
+# Fsync durability mode. "sync_all" is the classic fsync,
+# "sync_data" is faster but only safe on some filesystems.
+# When in doubt, use "sync_all".
 persist_mode = "sync_all"
-# How often the timer sweep runs. Also the worst-case lateness of a scheduled
-# promotion or a lease expiry.
+
+# Maximum time to park the committer between maintenance checks, useful
+# in case of backwards clock jumps.
+# During a sweep sepp will check for expired leases, scheduled jobs etc.
 sweep_interval_ms = 1000
-# Upper bound on timers processed in a single sweep.
+
+# Limits the amount of work done in a single sweep, to avoid blocking.
 sweep_limit = 10000
-# How long an idempotency_key keeps deduplicating (24h).
+
+# How long an idempotency_key keeps deduplicating.
 dedup_window_ms = 86400000
+
+# Capacity of the channel feeding the committer thread.
+command_queue_capacity = 4096
+
 # fjall block-cache capacity in bytes. Absent = fjall's default. The fjall
-# docs recommend ~20-25% of available memory; a larger cache keeps more hot
-# blocks resident, which helps `reserve` (it reads the oldest, coldest jobs).
-cache_size_bytes = 2147483648
+# docs recommend ~20-25% of available memory.
+# Try inceasing this if throughput is not high enough.
+#cache_size_bytes = 268435456
+
 # fjall journal (WAL) size ceiling in bytes. Absent = fjall's default of
-# 512 MiB; must be >= 64 MiB. Raising it pushes out the point at which a
-# large backlog forces heavy flushing.
-#max_journaling_size_bytes = 4294967296    # 4 GiB
+# 512 MiB; must be >= 64 MiB. Doesn't need to be raised unless you have a
+# very large backlog of writes.
+#max_journaling_size_bytes = 4294967296
+
+# Upper limit on file descriptors fjall caches, shared across all keyspaces.
+# Absent = fjall's default (400 on Windows, 900 on Linux, 150 on macOS); must
+# be >= 10.
+#max_cached_files = 2000
+
+# Background worker threads fjall uses for flushing and compaction. Absent =
+# fjall's default of min(CPU cores, 4); must be > 0.
+# Raise it if under heavy write load.
+#worker_threads = 8
 
 [logging]
 # Log filter: a level (trace/debug/info/warn/error) or a full directive like
 # "info,sepp=debug". The RUST_LOG env var overrides this when set.
-level = "info"
+level = "info,lsm_tree=warn,fjall=warn"
+
 # Output format: "text" (human-readable) or "json" (for log aggregators).
 format = "text"
 
 [tracing]
 # Export spans over OTLP for distributed tracing. When false, the server still
 # logs but installs no OpenTelemetry layer and contacts no collector.
-enabled = true
+enabled = false
+
 # OTLP/gRPC collector endpoint (e.g. an OpenTelemetry Collector or Jaeger).
 otlp_endpoint = "http://localhost:4317"
+
 # `service.name` resource attribute reported to the collector.
 service_name = "sepp"
+
 # Head sampling ratio in [0.0, 1.0] for traces this server roots. Sampling
 # decisions inherited from a caller's trace context are always honored.
 sample_ratio = 1.0
+
+[metrics]
+# Export OTLP metrics (request rates, latency, job counts, command-queue
+# depth). Independent of [tracing].
+enabled = true
+
+# OTLP/gRPC endpoint the periodic metric reader exports to.
+otlp_endpoint = "http://localhost:4317"
+
+# How often metrics are flushed to the endpoint.
+export_interval_ms = 60000

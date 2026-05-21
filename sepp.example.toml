@@ -128,7 +128,7 @@ command_queue_capacity = 4096
 [logging]
 # Log filter: a level (trace/debug/info/warn/error) or a full directive like
 # "info,sepp=debug". The RUST_LOG env var overrides this when set.
-level = "info"
+level = "info,lsm_tree=warn,fjall=warn"
 
 # Output format: "text" (human-readable) or "json" (for log aggregators).
 format = "text"
