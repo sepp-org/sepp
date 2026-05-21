@@ -20,6 +20,7 @@ use crate::pb::sepp::v1::{
     EnqueueRequest, EnqueueResponse, ErrorDetails, ExtendRequest, Job, JobResult, NackRequest,
     job_result, nack_retry,
 };
+use crate::queues::SharedRegistry;
 
 pub fn now_ms() -> i64 {
     SystemTime::now()
@@ -31,11 +32,6 @@ pub fn now_ms() -> i64 {
 struct StorageParams {
     persist_mode: PersistMode,
     sweep_limit: usize,
-    dedup_window_ms: i64,
-    default_max_attempts: u32,
-    default_priority: u32,
-    max_attempts_ceiling: u32,
-    max_schedule_horizon_ms: u64,
 }
 
 struct Store {
@@ -49,6 +45,7 @@ struct Store {
     scheduled: Keyspace,
     leases: Keyspace,
     params: StorageParams,
+    registry: SharedRegistry,
     metrics: Metrics,
 }
 
@@ -265,6 +262,36 @@ impl Indexes {
             self.scheduled.keys.len() as u64,
             self.leases.keys.len() as u64,
         )
+    }
+}
+
+fn warn_on_undeclared_persisted_queues(store: &Store) {
+    let registry = store.registry.load();
+    let mut undeclared: BTreeSet<String> = BTreeSet::new();
+    for guard in store.payloads.iter() {
+        let Ok((_, value)) = guard.into_inner() else {
+            continue;
+        };
+        let Some(qlen_bytes) = value.first_chunk::<2>() else {
+            continue;
+        };
+        let qlen = u16::from_be_bytes(*qlen_bytes) as usize;
+        let Some(queue_bytes) = value.get(2..2 + qlen) else {
+            continue;
+        };
+        let Ok(queue) = std::str::from_utf8(queue_bytes) else {
+            continue;
+        };
+        if !registry.is_declared(queue) {
+            undeclared.insert(queue.to_owned());
+        }
+    }
+    if !undeclared.is_empty() {
+        warn!(
+            queues = ?undeclared,
+            "strict mode is on but the database holds jobs in queues that are not declared; \
+             new enqueues/reserves on these queues will be rejected"
+        );
     }
 }
 
@@ -562,9 +589,11 @@ fn apply_enqueue(
     jobs: Vec<EnqueueRequest>,
 ) -> Vec<PerJob> {
     let now = now_ms();
+    let registry = store.registry.load();
     let mut results = Vec::with_capacity(jobs.len());
 
     for req in jobs {
+        let limits = registry.effective(&req.queue);
         let mut stale_dedup_timer: Option<Vec<u8>> = None;
 
         if let Some(key) = &req.idempotency_key {
@@ -579,7 +608,7 @@ fn apply_enqueue(
             let dkey = dedup_key(&req.queue, key);
             match store.dedup.get(&dkey) {
                 Ok(Some(existing)) => match decode_dedup(&existing) {
-                    Some((ts, job_id)) if now - ts < store.params.dedup_window_ms => {
+                    Some((ts, job_id)) if now - ts < limits.dedup_window_ms => {
                         results.push(PerJob::Settled(job_ok(EnqueueResponse {
                             job_id: job_id.to_owned(),
                             deduplicated: true,
@@ -588,7 +617,7 @@ fn apply_enqueue(
                     }
                     Some((ts, _)) => {
                         stale_dedup_timer =
-                            Some(dedup_timer_key(ts + store.params.dedup_window_ms, &dkey));
+                            Some(dedup_timer_key(ts + limits.dedup_window_ms, &dkey));
                     }
                     None => {}
                 },
@@ -606,14 +635,14 @@ fn apply_enqueue(
             id: id.clone(),
             job_type: req.job_type,
             payload: req.payload,
-            priority: req.priority.unwrap_or(store.params.default_priority),
+            priority: req.priority.unwrap_or(limits.default_priority),
             trace_context: req.trace_context,
             enqueued_at: now,
             attempt: 1,
             max_attempts: req
                 .max_attempts
-                .unwrap_or(store.params.default_max_attempts)
-                .min(store.params.max_attempts_ceiling),
+                .unwrap_or(limits.default_max_attempts)
+                .min(limits.max_attempts_ceiling),
             lease_expires_at: 0,
             custom: req.custom,
             scheduled_at: req.scheduled_at,
@@ -647,7 +676,7 @@ fn apply_enqueue(
                 batch.remove(&store.dedup_timers, old_timer.clone());
                 indexes.dedup_timers.remove(&old_timer);
             }
-            let dtk = dedup_timer_key(now + store.params.dedup_window_ms, &dkey);
+            let dtk = dedup_timer_key(now + limits.dedup_window_ms, &dkey);
             batch.insert(&store.dedup_timers, dtk.clone(), Vec::new());
             indexes.dedup_timers.insert(dtk);
             batch.insert(&store.dedup, dkey, encode_dedup(now, &id));
@@ -796,7 +825,14 @@ fn apply_nack(
     let strategy = req.retry.as_ref().and_then(|r| r.strategy.as_ref());
     let force_dead_letter = matches!(strategy, Some(nack_retry::Strategy::DeadLetter(_)));
     let retry_delay_ms = match strategy {
-        Some(nack_retry::Strategy::DelayMs(ms)) => (*ms).min(store.params.max_schedule_horizon_ms),
+        Some(nack_retry::Strategy::DelayMs(ms)) => {
+            let max = store
+                .registry
+                .load()
+                .effective(&inflight.queue)
+                .max_schedule_horizon_ms;
+            (*ms).min(max)
+        }
         _ => 0,
     };
     if force_dead_letter || inflight.attempt >= inflight.max_attempts {
@@ -857,8 +893,13 @@ fn apply_extend(
     if inflight.attempt != req.attempt {
         return Err(Status::failed_precondition("attempt mismatch"));
     }
+    let max_lease = store
+        .registry
+        .load()
+        .effective(&inflight.queue)
+        .max_lease_duration_ms;
     let old_timer = timer_key(inflight.lease_expires_at, &req.job_id);
-    let lease_expires_at = now_ms() + req.lease_duration_ms as i64;
+    let lease_expires_at = now_ms() + req.lease_duration_ms.min(max_lease) as i64;
     inflight.lease_expires_at = lease_expires_at;
 
     batch.insert(
@@ -1059,7 +1100,11 @@ pub struct Storage {
 }
 
 impl Storage {
-    pub fn open(config: &Config, metrics: Metrics) -> Result<Self, fjall::Error> {
+    pub fn open(
+        config: &Config,
+        registry: SharedRegistry,
+        metrics: Metrics,
+    ) -> Result<Self, fjall::Error> {
         let mut builder = Database::builder(config.server.db_path.as_str());
         if let Some(bytes) = config.storage.cache_size_bytes {
             builder = builder.cache_size(bytes);
@@ -1080,11 +1125,6 @@ impl Storage {
                 crate::config::PersistMode::SyncData => PersistMode::SyncData,
             },
             sweep_limit: config.storage.sweep_limit,
-            dedup_window_ms: config.storage.dedup_window_ms,
-            default_max_attempts: config.limits.default_max_attempts,
-            default_priority: config.limits.default_priority,
-            max_attempts_ceiling: config.limits.max_attempts_ceiling,
-            max_schedule_horizon_ms: config.limits.max_schedule_horizon_ms,
         };
         let store = Store {
             payloads: db.keyspace("payloads", KeyspaceCreateOptions::default)?,
@@ -1097,9 +1137,14 @@ impl Storage {
             leases: db.keyspace("leases", KeyspaceCreateOptions::default)?,
             db,
             params,
+            registry,
             metrics,
         };
         let indexes = rebuild_indexes(&store)?;
+
+        if config.server.strict_queues {
+            warn_on_undeclared_persisted_queues(&store);
+        }
 
         let (tx, rx) = flume::bounded(config.storage.command_queue_capacity);
         let notifiers = QueueNotifiers::default();

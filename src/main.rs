@@ -9,6 +9,7 @@ use sepp::config::Config;
 use sepp::metrics;
 use sepp::pb::sepp::v1::queue_service_server::QueueServiceServer;
 use sepp::queue_server::QueueServer;
+use sepp::queues::QueueRegistry;
 use sepp::telemetry;
 use tracing::{info, warn};
 
@@ -58,7 +59,9 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     install_panic_hook();
     let _metrics = metrics::init(&config.metrics, &config.tracing.service_name)?;
     let addr = config.server.listen_addr.parse()?;
-    let svc = QueueServer::new(&config)?;
+    let registry = QueueRegistry::from_config(&config);
+    let declared_queues = registry.declared_count();
+    let svc = QueueServer::new(&config, registry.into_shared())?;
 
     let queue_service = QueueServiceServer::new(svc)
         .max_decoding_message_size(config.limits.max_message_bytes as usize);
@@ -83,6 +86,8 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
         db_path = %config.server.db_path,
         tls = on_off(tls_enabled),
         auth = on_off(interceptor.is_enforcing()),
+        strict_queues = on_off(config.server.strict_queues),
+        declared_queues,
         "queue server listening",
     );
 
