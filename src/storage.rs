@@ -15,7 +15,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::config::Config;
-use crate::metrics::Metrics;
+use crate::metrics::{CycleMetrics, Metrics, QueueDepthSnapshot};
 use crate::pb::sepp::v1::{
     EnqueueRequest, EnqueueResponse, ErrorDetails, ExtendRequest, Job, JobResult, NackRequest,
     job_result, nack_retry,
@@ -62,6 +62,11 @@ fn queue_prefix(queue: &str) -> Vec<u8> {
     k.extend_from_slice(&(queue.len() as u16).to_be_bytes());
     k.extend_from_slice(queue.as_bytes());
     k
+}
+
+fn read_queue(bytes: &[u8]) -> Option<&str> {
+    let len = u16::from_be_bytes(*bytes.first_chunk::<2>()?) as usize;
+    std::str::from_utf8(bytes.get(2..2 + len)?).ok()
 }
 
 fn ready_key(queue: &str, priority: u32, enqueued_at: i64, job_id: &str) -> Vec<u8> {
@@ -196,13 +201,32 @@ fn status_to_error(s: &Status) -> ErrorDetails {
     }
 }
 
+fn bump_queue(map: &mut HashMap<String, u64>, queue: &str) {
+    *map.entry(queue.to_string()).or_default() += 1;
+}
+
+fn drop_queue(map: &mut HashMap<String, u64>, queue: &str) {
+    if let Some(n) = map.get_mut(queue) {
+        *n -= 1;
+        if *n == 0 {
+            map.remove(queue);
+        }
+    }
+}
+
 #[derive(Default)]
 struct ReadyIndex {
     keys: BTreeMap<Vec<u8>, u32>,
+    by_queue: HashMap<String, u64>,
 }
 
 impl ReadyIndex {
     fn insert(&mut self, ready_key: Vec<u8>, attempt: u32) {
+        if !self.keys.contains_key(&ready_key)
+            && let Some(queue) = read_queue(&ready_key)
+        {
+            bump_queue(&mut self.by_queue, queue);
+        }
         self.keys.insert(ready_key, attempt);
     }
 
@@ -214,36 +238,50 @@ impl ReadyIndex {
             .filter(|(k, _)| k.starts_with(queue_prefix))
             .map(|(k, _)| k.clone())?;
         let attempt = self.keys.remove(&key)?;
+        if let Some(queue) = read_queue(&key) {
+            drop_queue(&mut self.by_queue, queue);
+        }
         Some((key, attempt))
     }
 }
 
+// Timer keys are `deadline | job_id` and carry no queue, so each key stores
+// its owning queue as the map value. Caller passes it on insert; pop_due /
+// remove return it so we can keep the by_queue counter in sync without an
+// extra DB lookup.
 #[derive(Default)]
 struct TimerIndex {
-    keys: BTreeSet<Vec<u8>>,
+    keys: BTreeMap<Vec<u8>, String>,
+    by_queue: HashMap<String, u64>,
 }
 
 impl TimerIndex {
-    fn insert(&mut self, key: Vec<u8>) {
-        self.keys.insert(key);
+    fn insert(&mut self, key: Vec<u8>, queue: &str) {
+        if !self.keys.contains_key(&key) {
+            bump_queue(&mut self.by_queue, queue);
+        }
+        self.keys.insert(key, queue.to_string());
     }
 
-    fn remove(&mut self, key: &[u8]) {
-        self.keys.remove(key);
+    fn remove(&mut self, key: &[u8]) -> Option<String> {
+        let queue = self.keys.remove(key)?;
+        drop_queue(&mut self.by_queue, &queue);
+        Some(queue)
     }
 
-    fn pop_due(&mut self, now: i64) -> Option<Vec<u8>> {
-        let first = self.keys.iter().next()?;
-        if deadline_of(first) > now {
+    fn pop_due(&mut self, now: i64) -> Option<(Vec<u8>, String)> {
+        let (key, _) = self.keys.iter().next()?;
+        if deadline_of(key) > now {
             return None;
         }
-        let key = first.clone();
-        self.keys.remove(&key);
-        Some(key)
+        let key = key.clone();
+        let queue = self.keys.remove(&key)?;
+        drop_queue(&mut self.by_queue, &queue);
+        Some((key, queue))
     }
 
     fn earliest(&self) -> Option<i64> {
-        self.keys.iter().next().map(|k| deadline_of(k))
+        self.keys.keys().next().map(|k| deadline_of(k))
     }
 }
 
@@ -256,12 +294,12 @@ struct Indexes {
 }
 
 impl Indexes {
-    fn depths(&self) -> (u64, u64, u64) {
-        (
-            self.ready.keys.len() as u64,
-            self.scheduled.keys.len() as u64,
-            self.leases.keys.len() as u64,
-        )
+    fn snapshot(&self) -> QueueDepthSnapshot {
+        QueueDepthSnapshot {
+            ready: self.ready.by_queue.clone(),
+            scheduled: self.scheduled.by_queue.clone(),
+            inflight: self.leases.by_queue.clone(),
+        }
     }
 }
 
@@ -272,14 +310,7 @@ fn warn_on_undeclared_persisted_queues(store: &Store) {
         let Ok((_, value)) = guard.into_inner() else {
             continue;
         };
-        let Some(qlen_bytes) = value.first_chunk::<2>() else {
-            continue;
-        };
-        let qlen = u16::from_be_bytes(*qlen_bytes) as usize;
-        let Some(queue_bytes) = value.get(2..2 + qlen) else {
-            continue;
-        };
-        let Ok(queue) = std::str::from_utf8(queue_bytes) else {
+        let Some(queue) = read_queue(&value) else {
             continue;
         };
         if !registry.is_declared(queue) {
@@ -304,15 +335,26 @@ fn rebuild_indexes(store: &Store) -> Result<Indexes, fjall::Error> {
     }
     for guard in store.scheduled.iter() {
         let (key, _) = guard.into_inner()?;
-        indexes.scheduled.insert(key.to_vec());
+        let queue = key
+            .get(8..)
+            .and_then(|job_id| store.payloads.get(job_id).ok().flatten())
+            .and_then(|stored| read_queue(&stored).map(str::to_owned))
+            .unwrap_or_default();
+        indexes.scheduled.insert(key.to_vec(), &queue);
     }
     for guard in store.leases.iter() {
         let (key, _) = guard.into_inner()?;
-        indexes.leases.insert(key.to_vec());
+        let queue = key
+            .get(8..)
+            .and_then(|job_id| store.inflight.get(job_id).ok().flatten())
+            .and_then(|stored| decode_inflight(&stored).ok().map(|i| i.queue))
+            .unwrap_or_default();
+        indexes.leases.insert(key.to_vec(), &queue);
     }
     for guard in store.dedup_timers.iter() {
         let (key, _) = guard.into_inner()?;
-        indexes.dedup_timers.insert(key.to_vec());
+        let queue = key.get(8..).and_then(read_queue).unwrap_or("").to_string();
+        indexes.dedup_timers.insert(key.to_vec(), &queue);
     }
     Ok(indexes)
 }
@@ -381,11 +423,80 @@ enum Command {
 
 type Responder = Box<dyn FnOnce(&Result<(), Status>) + Send>;
 
-#[derive(Default)]
 struct Cycle {
     dirty: bool,
     new_ready: HashSet<String>,
     dedup_seen: HashMap<(String, String), String>,
+    // `None` when metrics are disabled — every recorder method becomes a no-op
+    // and we skip allocating into nine HashMaps that would never be flushed.
+    metrics: Option<CycleMetrics>,
+}
+
+impl Cycle {
+    fn new(metrics_enabled: bool) -> Self {
+        Self {
+            dirty: false,
+            new_ready: HashSet::new(),
+            dedup_seen: HashMap::new(),
+            metrics: metrics_enabled.then(CycleMetrics::default),
+        }
+    }
+
+    fn enqueued(&mut self, queue: &str) {
+        if let Some(m) = self.metrics.as_mut() {
+            bump_queue(&mut m.enqueued_by_queue, queue);
+        }
+    }
+
+    fn reserved(&mut self, queue: &str) {
+        if let Some(m) = self.metrics.as_mut() {
+            bump_queue(&mut m.reserved_by_queue, queue);
+        }
+    }
+
+    fn acked(&mut self, queue: &str) {
+        if let Some(m) = self.metrics.as_mut() {
+            bump_queue(&mut m.acked_by_queue, queue);
+        }
+    }
+
+    fn nacked(&mut self, queue: &str) {
+        if let Some(m) = self.metrics.as_mut() {
+            bump_queue(&mut m.nacked_by_queue, queue);
+        }
+    }
+
+    fn deduplicated(&mut self, queue: &str) {
+        if let Some(m) = self.metrics.as_mut() {
+            bump_queue(&mut m.deduplicated_by_queue, queue);
+        }
+    }
+
+    fn dead_lettered(&mut self, queue: &str, cause: &'static str) {
+        if let Some(m) = self.metrics.as_mut() {
+            *m.dead_lettered_by_queue_cause
+                .entry((queue.to_string(), cause))
+                .or_default() += 1;
+        }
+    }
+
+    fn sweep_promotion(&mut self, queue: &str) {
+        if let Some(m) = self.metrics.as_mut() {
+            bump_queue(&mut m.sweep_promotions_by_queue, queue);
+        }
+    }
+
+    fn sweep_lease_redelivery(&mut self, queue: &str) {
+        if let Some(m) = self.metrics.as_mut() {
+            bump_queue(&mut m.sweep_lease_redeliveries_by_queue, queue);
+        }
+    }
+
+    fn sweep_dedup_expiration(&mut self, queue: &str) {
+        if let Some(m) = self.metrics.as_mut() {
+            bump_queue(&mut m.sweep_dedup_expirations_by_queue, queue);
+        }
+    }
 }
 
 fn next_deadline(indexes: &Indexes) -> Option<i64> {
@@ -439,8 +550,9 @@ fn run_committer(
             run_rpc_cycle(&store, &mut indexes, &notifiers, rpcs);
         }
 
-        let (ready, scheduled, inflight) = indexes.depths();
-        store.metrics.set_queue_depths(ready, scheduled, inflight);
+        if store.metrics.is_enabled() {
+            store.metrics.set_queue_depths(indexes.snapshot());
+        }
     }
     info!("committer thread stopped; storage is no longer accepting commands");
 }
@@ -452,7 +564,7 @@ fn run_rpc_cycle(
     rpcs: Vec<Command>,
 ) {
     let mut batch = store.db.batch();
-    let mut cycle = Cycle::default();
+    let mut cycle = Cycle::new(store.metrics.is_enabled());
     let mut responders: Vec<Responder> = Vec::new();
 
     for cmd in rpcs {
@@ -526,6 +638,9 @@ fn run_rpc_cycle(
         responder(&outcome);
     }
     if outcome.is_ok() {
+        if let Some(m) = &cycle.metrics {
+            store.metrics.flush_cycle(m);
+        }
         for queue in &cycle.new_ready {
             notifiers.wake(queue);
         }
@@ -535,7 +650,7 @@ fn run_rpc_cycle(
 fn run_sweep_cycle(store: &Store, indexes: &mut Indexes, notifiers: &QueueNotifiers) {
     let started = std::time::Instant::now();
     let mut batch = store.db.batch();
-    let mut cycle = Cycle::default();
+    let mut cycle = Cycle::new(store.metrics.is_enabled());
 
     let processed = match apply_sweep(store, indexes, &mut batch, &mut cycle) {
         Ok(processed) => processed,
@@ -553,6 +668,9 @@ fn run_sweep_cycle(store: &Store, indexes: &mut Indexes, notifiers: &QueueNotifi
     if outcome.is_err() {
         resync(store, indexes);
         return;
+    }
+    if let Some(m) = &cycle.metrics {
+        store.metrics.flush_cycle(m);
     }
     for queue in &cycle.new_ready {
         notifiers.wake(queue);
@@ -598,9 +716,10 @@ fn apply_enqueue(
 
         if let Some(key) = &req.idempotency_key {
             let dk = (req.queue.clone(), key.clone());
-            if let Some(existing) = cycle.dedup_seen.get(&dk) {
+            if let Some(existing) = cycle.dedup_seen.get(&dk).cloned() {
+                cycle.deduplicated(&req.queue);
                 results.push(PerJob::Settled(job_ok(EnqueueResponse {
-                    job_id: existing.clone(),
+                    job_id: existing,
                     deduplicated: true,
                 })));
                 continue;
@@ -609,6 +728,7 @@ fn apply_enqueue(
             match store.dedup.get(&dkey) {
                 Ok(Some(existing)) => match decode_dedup(&existing) {
                     Some((ts, job_id)) if now - ts < limits.dedup_window_ms => {
+                        cycle.deduplicated(&req.queue);
                         results.push(PerJob::Settled(job_ok(EnqueueResponse {
                             job_id: job_id.to_owned(),
                             deduplicated: true,
@@ -661,7 +781,7 @@ fn apply_enqueue(
                     tk.clone(),
                     job.attempt.to_be_bytes().to_vec(),
                 );
-                indexes.scheduled.insert(tk);
+                indexes.scheduled.insert(tk, &queue);
             }
             _ => {
                 let rk = ready_key(&queue, job.priority, job.enqueued_at, &id);
@@ -678,10 +798,11 @@ fn apply_enqueue(
             }
             let dtk = dedup_timer_key(now + limits.dedup_window_ms, &dkey);
             batch.insert(&store.dedup_timers, dtk.clone(), Vec::new());
-            indexes.dedup_timers.insert(dtk);
+            indexes.dedup_timers.insert(dtk, &queue);
             batch.insert(&store.dedup, dkey, encode_dedup(now, &id));
-            cycle.dedup_seen.insert((queue, key.clone()), id.clone());
+            cycle.dedup_seen.insert((queue.clone(), key.clone()), id.clone());
         }
+        cycle.enqueued(&queue);
         cycle.dirty = true;
 
         results.push(PerJob::Pending(EnqueueResponse {
@@ -769,7 +890,8 @@ fn apply_reserve(
             );
             let lease_timer = timer_key(lease_expires_at, &job.id);
             batch.insert(&store.leases, lease_timer.clone(), Vec::new());
-            indexes.leases.insert(lease_timer);
+            indexes.leases.insert(lease_timer, &inflight.queue);
+            cycle.reserved(&inflight.queue);
             cycle.dirty = true;
             jobs.push(job);
         }
@@ -800,6 +922,7 @@ fn apply_ack(
     let lease_timer = timer_key(inflight.lease_expires_at, job_id);
     batch.remove(&store.leases, lease_timer.clone());
     indexes.leases.remove(&lease_timer);
+    cycle.acked(&inflight.queue);
     cycle.dirty = true;
     Ok(())
 }
@@ -836,10 +959,10 @@ fn apply_nack(
         _ => 0,
     };
     if force_dead_letter || inflight.attempt >= inflight.max_attempts {
-        let cause = if force_dead_letter {
-            DeadLetterCause::Rejected
+        let (cause, cause_label) = if force_dead_letter {
+            (DeadLetterCause::Rejected, "rejected")
         } else {
-            DeadLetterCause::AttemptsExhausted
+            (DeadLetterCause::AttemptsExhausted, "attempts_exhausted")
         };
         batch.insert(
             &store.dead_letters,
@@ -849,6 +972,8 @@ fn apply_nack(
         batch.remove(&store.inflight, req.job_id.into_bytes());
         batch.remove(&store.leases, lease_timer.clone());
         indexes.leases.remove(&lease_timer);
+        cycle.nacked(&inflight.queue);
+        cycle.dead_lettered(&inflight.queue, cause_label);
         cycle.dirty = true;
         return Ok(true);
     }
@@ -858,7 +983,7 @@ fn apply_nack(
         let deadline = now_ms().saturating_add(i64::try_from(retry_delay_ms).unwrap_or(i64::MAX));
         let tk = timer_key(deadline, &req.job_id);
         batch.insert(&store.scheduled, tk.clone(), attempt.to_be_bytes().to_vec());
-        indexes.scheduled.insert(tk);
+        indexes.scheduled.insert(tk, &inflight.queue);
     } else {
         let rk = ready_key(
             &inflight.queue,
@@ -868,11 +993,12 @@ fn apply_nack(
         );
         batch.insert(&store.ready, rk.clone(), attempt.to_be_bytes().to_vec());
         indexes.ready.insert(rk, attempt);
-        cycle.new_ready.insert(inflight.queue);
+        cycle.new_ready.insert(inflight.queue.clone());
     }
     batch.remove(&store.inflight, req.job_id.into_bytes());
     batch.remove(&store.leases, lease_timer.clone());
     indexes.leases.remove(&lease_timer);
+    cycle.nacked(&inflight.queue);
     cycle.dirty = true;
     Ok(false)
 }
@@ -911,7 +1037,7 @@ fn apply_extend(
     indexes.leases.remove(&old_timer);
     let new_timer = timer_key(lease_expires_at, &req.job_id);
     batch.insert(&store.leases, new_timer.clone(), Vec::new());
-    indexes.leases.insert(new_timer);
+    indexes.leases.insert(new_timer, &inflight.queue);
     cycle.dirty = true;
     Ok(lease_expires_at)
 }
@@ -930,7 +1056,7 @@ fn apply_sweep(
     // out lease-expiry redelivery.
     let mut budget = store.params.sweep_limit;
     while budget > 0 {
-        let Some(timer_k) = indexes.scheduled.pop_due(now) else {
+        let Some((timer_k, _)) = indexes.scheduled.pop_due(now) else {
             break;
         };
         budget -= 1;
@@ -960,12 +1086,13 @@ fn apply_sweep(
         let rk = ready_key(&queue, job.priority, job.enqueued_at, &job.id);
         batch.insert(&store.ready, rk.clone(), attempt.to_be_bytes().to_vec());
         indexes.ready.insert(rk, attempt);
+        cycle.sweep_promotion(&queue);
         cycle.new_ready.insert(queue);
     }
 
     let mut budget = store.params.sweep_limit;
     while budget > 0 {
-        let Some(timer_k) = indexes.leases.pop_due(now) else {
+        let Some((timer_k, _)) = indexes.leases.pop_due(now) else {
             break;
         };
         budget -= 1;
@@ -999,6 +1126,7 @@ fn apply_sweep(
                 encode_dead_letter(now, DeadLetterCause::LeaseExpired),
             );
             batch.remove(&store.inflight, job_id.to_vec());
+            cycle.dead_lettered(&inflight.queue, "lease_expired");
         } else {
             let Ok(job_id_str) = std::str::from_utf8(job_id) else {
                 continue;
@@ -1019,13 +1147,14 @@ fn apply_sweep(
             batch.insert(&store.ready, rk.clone(), attempt.to_be_bytes().to_vec());
             indexes.ready.insert(rk, attempt);
             batch.remove(&store.inflight, job_id.to_vec());
+            cycle.sweep_lease_redelivery(&inflight.queue);
             cycle.new_ready.insert(inflight.queue);
         }
     }
 
     let mut budget = store.params.sweep_limit;
     while budget > 0 {
-        let Some(timer_k) = indexes.dedup_timers.pop_due(now) else {
+        let Some((timer_k, queue)) = indexes.dedup_timers.pop_due(now) else {
             break;
         };
         budget -= 1;
@@ -1034,6 +1163,7 @@ fn apply_sweep(
             batch.remove(&store.dedup, dedup_k.to_vec());
         }
         batch.remove(&store.dedup_timers, timer_k.clone());
+        cycle.sweep_dedup_expiration(&queue);
         cycle.dirty = true;
     }
 
@@ -1433,34 +1563,52 @@ mod tests {
     #[test]
     fn timer_index_pops_in_deadline_order() {
         let mut idx = TimerIndex::default();
-        idx.insert(timer_key(300, "c"));
-        idx.insert(timer_key(100, "a"));
-        idx.insert(timer_key(200, "b"));
+        idx.insert(timer_key(300, "c"), "q");
+        idx.insert(timer_key(100, "a"), "q");
+        idx.insert(timer_key(200, "b"), "q");
 
-        assert_eq!(idx.pop_due(i64::MAX), Some(timer_key(100, "a")));
-        assert_eq!(idx.pop_due(i64::MAX), Some(timer_key(200, "b")));
-        assert_eq!(idx.pop_due(i64::MAX), Some(timer_key(300, "c")));
+        assert_eq!(
+            idx.pop_due(i64::MAX),
+            Some((timer_key(100, "a"), "q".to_string()))
+        );
+        assert_eq!(
+            idx.pop_due(i64::MAX),
+            Some((timer_key(200, "b"), "q".to_string()))
+        );
+        assert_eq!(
+            idx.pop_due(i64::MAX),
+            Some((timer_key(300, "c"), "q".to_string()))
+        );
         assert_eq!(idx.pop_due(i64::MAX), None);
     }
 
     #[test]
     fn timer_index_pop_due_respects_the_now_boundary() {
         let mut idx = TimerIndex::default();
-        idx.insert(timer_key(100, "a"));
+        idx.insert(timer_key(100, "a"), "q");
 
         assert_eq!(idx.pop_due(99), None);
-        assert_eq!(idx.pop_due(100), Some(timer_key(100, "a")));
+        assert_eq!(
+            idx.pop_due(100),
+            Some((timer_key(100, "a"), "q".to_string()))
+        );
     }
 
     #[test]
     fn timer_index_only_yields_due_entries() {
         let mut idx = TimerIndex::default();
-        idx.insert(timer_key(100, "a"));
-        idx.insert(timer_key(500, "b"));
+        idx.insert(timer_key(100, "a"), "q");
+        idx.insert(timer_key(500, "b"), "q");
 
-        assert_eq!(idx.pop_due(200), Some(timer_key(100, "a")));
+        assert_eq!(
+            idx.pop_due(200),
+            Some((timer_key(100, "a"), "q".to_string()))
+        );
         assert_eq!(idx.pop_due(200), None);
-        assert_eq!(idx.pop_due(500), Some(timer_key(500, "b")));
+        assert_eq!(
+            idx.pop_due(500),
+            Some((timer_key(500, "b"), "q".to_string()))
+        );
     }
 
     #[test]
@@ -1468,9 +1616,9 @@ mod tests {
         let mut idx = TimerIndex::default();
         assert_eq!(idx.earliest(), None);
 
-        idx.insert(timer_key(300, "c"));
-        idx.insert(timer_key(100, "a"));
-        idx.insert(timer_key(200, "b"));
+        idx.insert(timer_key(300, "c"), "q");
+        idx.insert(timer_key(100, "a"), "q");
+        idx.insert(timer_key(200, "b"), "q");
         assert_eq!(idx.earliest(), Some(100));
 
         idx.remove(&timer_key(100, "a"));
@@ -1482,9 +1630,9 @@ mod tests {
         let mut indexes = Indexes::default();
         assert_eq!(next_deadline(&indexes), None);
 
-        indexes.scheduled.insert(timer_key(500, "s"));
-        indexes.leases.insert(timer_key(200, "l"));
-        indexes.dedup_timers.insert(dedup_timer_key(800, b"d"));
+        indexes.scheduled.insert(timer_key(500, "s"), "q");
+        indexes.leases.insert(timer_key(200, "l"), "q");
+        indexes.dedup_timers.insert(dedup_timer_key(800, b"d"), "q");
         assert_eq!(next_deadline(&indexes), Some(200));
 
         indexes.leases.remove(&timer_key(200, "l"));
@@ -1494,8 +1642,40 @@ mod tests {
     #[test]
     fn timer_index_remove_drops_the_entry() {
         let mut idx = TimerIndex::default();
-        idx.insert(timer_key(100, "a"));
+        idx.insert(timer_key(100, "a"), "q");
         idx.remove(&timer_key(100, "a"));
         assert_eq!(idx.pop_due(i64::MAX), None);
+    }
+
+    #[test]
+    fn timer_index_tracks_per_queue_depths() {
+        let mut idx = TimerIndex::default();
+        idx.insert(timer_key(100, "a"), "qa");
+        idx.insert(timer_key(200, "b"), "qa");
+        idx.insert(timer_key(300, "c"), "qb");
+        assert_eq!(idx.by_queue.get("qa").copied(), Some(2));
+        assert_eq!(idx.by_queue.get("qb").copied(), Some(1));
+
+        idx.remove(&timer_key(100, "a"));
+        assert_eq!(idx.by_queue.get("qa").copied(), Some(1));
+
+        idx.pop_due(i64::MAX);
+        assert_eq!(idx.by_queue.get("qa").copied(), None);
+        assert_eq!(idx.by_queue.get("qb").copied(), Some(1));
+    }
+
+    #[test]
+    fn ready_index_tracks_per_queue_depths() {
+        let mut idx = ReadyIndex::default();
+        idx.insert(ready_key("qa", 5, 100, "j1"), 1);
+        idx.insert(ready_key("qa", 5, 200, "j2"), 1);
+        idx.insert(ready_key("qb", 5, 100, "j3"), 1);
+        assert_eq!(idx.by_queue.get("qa").copied(), Some(2));
+        assert_eq!(idx.by_queue.get("qb").copied(), Some(1));
+
+        idx.pop_front(&queue_prefix("qa"));
+        assert_eq!(idx.by_queue.get("qa").copied(), Some(1));
+        idx.pop_front(&queue_prefix("qa"));
+        assert_eq!(idx.by_queue.get("qa").copied(), None);
     }
 }

@@ -25,7 +25,7 @@ impl Drop for TelemetryGuard {
         if let Some(provider) = self.provider.take()
             && let Err(e) = provider.shutdown()
         {
-            eprintln!("opentelemetry tracer shutdown failed: {e}");
+            tracing::debug!("opentelemetry tracer shutdown failed: {e}");
         }
     }
 }

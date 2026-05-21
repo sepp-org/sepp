@@ -1,7 +1,8 @@
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwap;
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::{Counter, Histogram, ObservableGauge};
 use opentelemetry_otlp::WithExportConfig;
@@ -21,7 +22,7 @@ impl Drop for MetricsGuard {
         if let Some(provider) = self.provider.take()
             && let Err(e) = provider.shutdown()
         {
-            eprintln!("opentelemetry meter shutdown failed: {e}");
+            tracing::debug!("opentelemetry meter shutdown failed: {e}");
         }
     }
 }
@@ -54,6 +55,26 @@ pub fn init(
     })
 }
 
+#[derive(Default)]
+pub struct QueueDepthSnapshot {
+    pub ready: HashMap<String, u64>,
+    pub scheduled: HashMap<String, u64>,
+    pub inflight: HashMap<String, u64>,
+}
+
+#[derive(Default)]
+pub struct CycleMetrics {
+    pub enqueued_by_queue: HashMap<String, u64>,
+    pub reserved_by_queue: HashMap<String, u64>,
+    pub acked_by_queue: HashMap<String, u64>,
+    pub nacked_by_queue: HashMap<String, u64>,
+    pub dead_lettered_by_queue_cause: HashMap<(String, &'static str), u64>,
+    pub deduplicated_by_queue: HashMap<String, u64>,
+    pub sweep_promotions_by_queue: HashMap<String, u64>,
+    pub sweep_lease_redeliveries_by_queue: HashMap<String, u64>,
+    pub sweep_dedup_expirations_by_queue: HashMap<String, u64>,
+}
+
 #[derive(Clone)]
 pub struct Metrics {
     enabled: bool,
@@ -64,10 +85,14 @@ pub struct Metrics {
     jobs_acked: Counter<u64>,
     jobs_nacked: Counter<u64>,
     jobs_dead_lettered: Counter<u64>,
+    jobs_deduplicated: Counter<u64>,
+    jobs_rejected: Counter<u64>,
+    reserve_empty: Counter<u64>,
+    sweep_promotions: Counter<u64>,
+    sweep_lease_redeliveries: Counter<u64>,
+    sweep_dedup_expirations: Counter<u64>,
     commit_duration_ms: Histogram<f64>,
-    ready_depth: Arc<AtomicU64>,
-    scheduled_depth: Arc<AtomicU64>,
-    inflight_depth: Arc<AtomicU64>,
+    queue_depths: Arc<ArcSwap<QueueDepthSnapshot>>,
 }
 
 impl Metrics {
@@ -85,14 +110,22 @@ impl Metrics {
             jobs_acked: meter.u64_counter("sepp.jobs.acked").build(),
             jobs_nacked: meter.u64_counter("sepp.jobs.nacked").build(),
             jobs_dead_lettered: meter.u64_counter("sepp.jobs.dead_lettered").build(),
+            jobs_deduplicated: meter.u64_counter("sepp.jobs.deduplicated").build(),
+            jobs_rejected: meter.u64_counter("sepp.jobs.rejected").build(),
+            reserve_empty: meter.u64_counter("sepp.reserve.empty").build(),
+            sweep_promotions: meter.u64_counter("sepp.sweep.promotions").build(),
+            sweep_lease_redeliveries: meter.u64_counter("sepp.sweep.lease_redeliveries").build(),
+            sweep_dedup_expirations: meter.u64_counter("sepp.sweep.dedup_expirations").build(),
             commit_duration_ms: meter
                 .f64_histogram("sepp.commit.duration")
                 .with_unit("ms")
                 .build(),
-            ready_depth: Arc::new(AtomicU64::new(0)),
-            scheduled_depth: Arc::new(AtomicU64::new(0)),
-            inflight_depth: Arc::new(AtomicU64::new(0)),
+            queue_depths: Arc::new(ArcSwap::from_pointee(QueueDepthSnapshot::default())),
         }
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
     }
 
     pub fn observe<T>(
@@ -128,29 +161,52 @@ impl Metrics {
         );
     }
 
-    pub fn record_enqueued(&self, jobs: u64) {
-        if self.enabled {
-            self.jobs_enqueued.add(jobs, &[]);
+    pub fn flush_cycle(&self, m: &CycleMetrics) {
+        if !self.enabled {
+            return;
+        }
+        add_by_queue(&self.jobs_enqueued, &m.enqueued_by_queue);
+        add_by_queue(&self.jobs_reserved, &m.reserved_by_queue);
+        add_by_queue(&self.jobs_acked, &m.acked_by_queue);
+        add_by_queue(&self.jobs_nacked, &m.nacked_by_queue);
+        add_by_queue(&self.jobs_deduplicated, &m.deduplicated_by_queue);
+        add_by_queue(&self.sweep_promotions, &m.sweep_promotions_by_queue);
+        add_by_queue(
+            &self.sweep_lease_redeliveries,
+            &m.sweep_lease_redeliveries_by_queue,
+        );
+        add_by_queue(
+            &self.sweep_dedup_expirations,
+            &m.sweep_dedup_expirations_by_queue,
+        );
+        for ((queue, cause), n) in &m.dead_lettered_by_queue_cause {
+            self.jobs_dead_lettered.add(
+                *n,
+                &[
+                    KeyValue::new("queue", queue.clone()),
+                    KeyValue::new("cause", *cause),
+                ],
+            );
         }
     }
 
-    pub fn record_reserved(&self, jobs: u64) {
+    pub fn record_rejected(&self, queue: &str, reason: &'static str) {
         if self.enabled {
-            self.jobs_reserved.add(jobs, &[]);
+            self.jobs_rejected.add(
+                1,
+                &[
+                    KeyValue::new("queue", queue.to_string()),
+                    KeyValue::new("reason", reason),
+                ],
+            );
         }
     }
 
-    pub fn record_acked(&self) {
+    pub fn record_reserve_empty(&self, queues: &[String]) {
         if self.enabled {
-            self.jobs_acked.add(1, &[]);
-        }
-    }
-
-    pub fn record_nacked(&self, dead_lettered: bool) {
-        if self.enabled {
-            self.jobs_nacked.add(1, &[]);
-            if dead_lettered {
-                self.jobs_dead_lettered.add(1, &[]);
+            for queue in queues {
+                self.reserve_empty
+                    .add(1, &[KeyValue::new("queue", queue.clone())]);
             }
         }
     }
@@ -162,27 +218,54 @@ impl Metrics {
         }
     }
 
-    pub fn set_queue_depths(&self, ready: u64, scheduled: u64, inflight: u64) {
+    pub fn set_queue_depths(&self, snapshot: QueueDepthSnapshot) {
         if self.enabled {
-            self.ready_depth.store(ready, Ordering::Relaxed);
-            self.scheduled_depth.store(scheduled, Ordering::Relaxed);
-            self.inflight_depth.store(inflight, Ordering::Relaxed);
+            self.queue_depths.store(Arc::new(snapshot));
         }
     }
 
     pub fn register_queue_depth_gauges(&self) -> Vec<ObservableGauge<u64>> {
         let meter = opentelemetry::global::meter("sepp");
-        let gauge = |name: &'static str, cell: Arc<AtomicU64>| {
+        let ready = {
+            let depths = self.queue_depths.clone();
             meter
-                .u64_observable_gauge(name)
-                .with_callback(move |observer| observer.observe(cell.load(Ordering::Relaxed), &[]))
+                .u64_observable_gauge("sepp.queue.ready")
+                .with_callback(move |observer| {
+                    for (queue, depth) in &depths.load().ready {
+                        observer.observe(*depth, &[KeyValue::new("queue", queue.clone())]);
+                    }
+                })
                 .build()
         };
-        vec![
-            gauge("sepp.queue.ready", self.ready_depth.clone()),
-            gauge("sepp.queue.scheduled", self.scheduled_depth.clone()),
-            gauge("sepp.queue.inflight", self.inflight_depth.clone()),
-        ]
+        let scheduled = {
+            let depths = self.queue_depths.clone();
+            meter
+                .u64_observable_gauge("sepp.queue.scheduled")
+                .with_callback(move |observer| {
+                    for (queue, depth) in &depths.load().scheduled {
+                        observer.observe(*depth, &[KeyValue::new("queue", queue.clone())]);
+                    }
+                })
+                .build()
+        };
+        let inflight = {
+            let depths = self.queue_depths.clone();
+            meter
+                .u64_observable_gauge("sepp.queue.inflight")
+                .with_callback(move |observer| {
+                    for (queue, depth) in &depths.load().inflight {
+                        observer.observe(*depth, &[KeyValue::new("queue", queue.clone())]);
+                    }
+                })
+                .build()
+        };
+        vec![ready, scheduled, inflight]
+    }
+}
+
+fn add_by_queue(counter: &Counter<u64>, counts: &HashMap<String, u64>) {
+    for (queue, n) in counts {
+        counter.add(*n, &[KeyValue::new("queue", queue.clone())]);
     }
 }
 

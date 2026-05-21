@@ -191,38 +191,41 @@ impl QueueService for QueueServer {
             let mut valid = Vec::new();
             let mut slots: Vec<Option<JobResult>> = Vec::with_capacity(req.jobs.len());
             for job in req.jobs {
-                let rejection = match self.validator.validate(&job) {
-                    Ok(()) => {
-                        if self.strict_queues && !registry.is_declared(&job.queue) {
-                            Some((
-                                "UNKNOWN_QUEUE".to_string(),
-                                format!("queue {:?} is not declared (strict mode)", job.queue),
-                            ))
-                        } else {
-                            let limits = registry.effective(&job.queue);
-                            self.check_enqueue_limits(&job, &limits)
-                                .err()
-                                .map(|m| ("INVALID_ARGUMENT".to_string(), m))
+                let rejection: Option<(&'static str, &'static str, String)> =
+                    match self.validator.validate(&job) {
+                        Ok(()) => {
+                            if self.strict_queues && !registry.is_declared(&job.queue) {
+                                Some((
+                                    "UNKNOWN_QUEUE",
+                                    "unknown_queue",
+                                    format!("queue {:?} is not declared (strict mode)", job.queue),
+                                ))
+                            } else {
+                                let limits = registry.effective(&job.queue);
+                                self.check_enqueue_limits(&job, &limits)
+                                    .err()
+                                    .map(|m| ("INVALID_ARGUMENT", "invalid_argument", m))
+                            }
                         }
-                    }
-                    Err(e) => Some(("INVALID_ARGUMENT".to_string(), e.to_string())),
-                };
+                        Err(e) => Some(("INVALID_ARGUMENT", "invalid_argument", e.to_string())),
+                    };
                 match rejection {
                     None => {
                         slots.push(None);
                         valid.push(job);
                     }
-                    Some((code, message)) => {
+                    Some((code, reason, message)) => {
                         tracing::info!(
                             queue = %job.queue,
                             job_type = %job.job_type,
-                            code = %code,
+                            code,
                             %message,
                             "enqueue rejected",
                         );
+                        self.metrics.record_rejected(&job.queue, reason);
                         slots.push(Some(JobResult {
                             outcome: Some(job_result::Outcome::Error(ErrorDetails {
-                                code,
+                                code: code.to_string(),
                                 message,
                                 context: HashMap::new(),
                             })),
@@ -249,7 +252,6 @@ impl QueueService for QueueServer {
                 })
                 .collect();
             tracing::Span::current().record("job_ids", tracing::field::debug(&job_ids));
-            self.metrics.record_enqueued(job_ids.len() as u64);
 
             let mut enqueued = enqueued.into_iter();
             let results = slots
@@ -344,7 +346,6 @@ impl QueueService for QueueServer {
                 if !jobs.is_empty() {
                     let job_ids: Vec<&str> = jobs.iter().map(|j| j.id.as_str()).collect();
                     tracing::Span::current().record("job_ids", tracing::field::debug(&job_ids));
-                    self.metrics.record_reserved(jobs.len() as u64);
                     for job in &jobs {
                         let deliver = tracing::info_span!(
                             "sepp.deliver",
@@ -359,12 +360,14 @@ impl QueueService for QueueServer {
                 }
 
                 if Instant::now() >= deadline {
+                    self.metrics.record_reserve_empty(&req.queues);
                     return Ok(Response::new(ReserveResponse { jobs: Vec::new() }));
                 }
 
                 tokio::select! {
                     _ = armed => {}
                     _ = sleep_until(deadline) => {
+                        self.metrics.record_reserve_empty(&req.queues);
                         return Ok(Response::new(ReserveResponse { jobs: Vec::new() }));
                     }
                 }
@@ -391,7 +394,6 @@ impl QueueService for QueueServer {
                 .validate(&req)
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
             self.storage.ack(req.job_id.clone(), req.attempt).await?;
-            self.metrics.record_acked();
             Ok(Response::new(AckResponse { job_id: req.job_id }))
         }
         .instrument(span.clone())
@@ -416,7 +418,6 @@ impl QueueService for QueueServer {
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
             let job_id = req.job_id.clone();
             let dead_lettered = self.storage.nack(req).await?;
-            self.metrics.record_nacked(dead_lettered);
             if dead_lettered {
                 tracing::info!(%job_id, "job dead-lettered via nack");
             }
