@@ -18,6 +18,12 @@ db_path = "./sepp-data"
 #tls_cert_path = "/etc/sepp/tls/server.crt"
 #tls_key_path = "/etc/sepp/tls/server.key"
 
+# When true, an enqueue or reserve referring to an undeclared queue is
+# rejected. When false (default), undeclared queues are auto-created on first
+# use. Per-queue declarations and overrides (see [[queues]] below) always take
+# effect regardless of this flag; strict only gates rejection of unknown names.
+strict_queues = false
+
 [auth]
 # Primitive API key authentication. If omitted, every caller is allowed.
 # If set to a non-empty list, only those keys are accepted.
@@ -158,3 +164,35 @@ otlp_endpoint = "http://localhost:4317"
 
 # How often metrics are flushed to the endpoint.
 export_interval_ms = 60000
+
+# Per-queue declarations and overrides. Each missing field falls back to the
+# matching global default in [limits] / [storage]. Allowed even when
+# server.strict_queues = false; in strict mode, only the queues listed here
+# may be used.
+#
+# Overridable fields (all optional):
+#   max_lease_duration_ms
+#   default_max_attempts
+#   max_attempts_ceiling
+#   default_priority
+#   max_payload_bytes
+#   allowed_encodings
+#   max_schedule_horizon_ms
+#   max_custom_entries
+#   max_custom_total_bytes
+#   max_custom_key_bytes
+#   dedup_window_ms
+
+#[[queues]]
+#name = "emails"
+#max_lease_duration_ms = 60000
+#default_max_attempts = 5
+#default_priority = 5
+
+#[[queues]]
+#name = "reports"
+
+#[[queues]]
+#name = "large_payloads"
+#max_payload_bytes = 8388608
+#dedup_window_ms = 3600000

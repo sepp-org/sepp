@@ -1,4 +1,4 @@
-use std::{error::Error, path::Path};
+use std::{collections::HashSet, error::Error, path::Path};
 
 use figment::{
     Figment,
@@ -22,6 +22,7 @@ pub struct ServerConfig {
     pub db_path: String,
     pub tls_cert_path: Option<String>,
     pub tls_key_path: Option<String>,
+    pub strict_queues: bool,
 }
 
 impl ServerConfig {
@@ -37,7 +38,136 @@ impl Default for ServerConfig {
             db_path: "./sepp-data".to_string(),
             tls_cert_path: None,
             tls_key_path: None,
+            strict_queues: false,
         }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct QueueConfig {
+    pub name: String,
+    pub max_lease_duration_ms: Option<u64>,
+    pub default_max_attempts: Option<u32>,
+    pub max_attempts_ceiling: Option<u32>,
+    pub default_priority: Option<u32>,
+    pub max_payload_bytes: Option<u64>,
+    pub allowed_encodings: Option<Vec<String>>,
+    pub max_schedule_horizon_ms: Option<u64>,
+    pub max_custom_entries: Option<u32>,
+    pub max_custom_total_bytes: Option<u64>,
+    pub max_custom_key_bytes: Option<u32>,
+    pub dedup_window_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EffectiveLimits {
+    pub max_lease_duration_ms: u64,
+    pub default_max_attempts: u32,
+    pub max_attempts_ceiling: u32,
+    pub default_priority: u32,
+    pub max_payload_bytes: u64,
+    pub allowed_encodings: Option<Vec<String>>,
+    pub max_schedule_horizon_ms: u64,
+    pub max_custom_entries: u32,
+    pub max_custom_total_bytes: u64,
+    pub max_custom_key_bytes: u32,
+    pub dedup_window_ms: i64,
+}
+
+impl EffectiveLimits {
+    pub fn from_globals(limits: &LimitsConfig, storage: &StorageConfig) -> Self {
+        Self {
+            max_lease_duration_ms: limits.max_lease_duration_ms,
+            default_max_attempts: limits.default_max_attempts,
+            max_attempts_ceiling: limits.max_attempts_ceiling,
+            default_priority: limits.default_priority,
+            max_payload_bytes: limits.max_payload_bytes,
+            allowed_encodings: limits.allowed_encodings.clone(),
+            max_schedule_horizon_ms: limits.max_schedule_horizon_ms,
+            max_custom_entries: limits.max_custom_entries,
+            max_custom_total_bytes: limits.max_custom_total_bytes,
+            max_custom_key_bytes: limits.max_custom_key_bytes,
+            dedup_window_ms: storage.dedup_window_ms,
+        }
+    }
+
+    pub fn merged_with(&self, q: &QueueConfig) -> Self {
+        Self {
+            max_lease_duration_ms: q
+                .max_lease_duration_ms
+                .unwrap_or(self.max_lease_duration_ms),
+            default_max_attempts: q.default_max_attempts.unwrap_or(self.default_max_attempts),
+            max_attempts_ceiling: q.max_attempts_ceiling.unwrap_or(self.max_attempts_ceiling),
+            default_priority: q.default_priority.unwrap_or(self.default_priority),
+            max_payload_bytes: q.max_payload_bytes.unwrap_or(self.max_payload_bytes),
+            allowed_encodings: q
+                .allowed_encodings
+                .clone()
+                .or_else(|| self.allowed_encodings.clone()),
+            max_schedule_horizon_ms: q
+                .max_schedule_horizon_ms
+                .unwrap_or(self.max_schedule_horizon_ms),
+            max_custom_entries: q.max_custom_entries.unwrap_or(self.max_custom_entries),
+            max_custom_total_bytes: q
+                .max_custom_total_bytes
+                .unwrap_or(self.max_custom_total_bytes),
+            max_custom_key_bytes: q.max_custom_key_bytes.unwrap_or(self.max_custom_key_bytes),
+            dedup_window_ms: q.dedup_window_ms.unwrap_or(self.dedup_window_ms),
+        }
+    }
+
+    pub fn validate(&self, max_message_bytes: u64, scope: &str) -> Result<(), Box<dyn Error>> {
+        let bad =
+            |field: &str, msg: &str| -> Box<dyn Error> { format!("{scope}.{field}: {msg}").into() };
+        if self.max_lease_duration_ms == 0 {
+            return Err(bad("max_lease_duration_ms", "must be > 0"));
+        }
+        if self.default_max_attempts == 0 {
+            return Err(bad("default_max_attempts", "must be > 0"));
+        }
+        if self.max_attempts_ceiling == 0 {
+            return Err(bad("max_attempts_ceiling", "must be > 0"));
+        }
+        if self.default_max_attempts > self.max_attempts_ceiling {
+            return Err(bad(
+                "default_max_attempts",
+                "must not exceed max_attempts_ceiling",
+            ));
+        }
+        if self.default_priority > 9 {
+            return Err(bad("default_priority", "must be in [0, 9]"));
+        }
+        if self.max_payload_bytes == 0 {
+            return Err(bad("max_payload_bytes", "must be > 0"));
+        }
+        if self.max_payload_bytes > max_message_bytes {
+            return Err(bad(
+                "max_payload_bytes",
+                "must not exceed limits.max_message_bytes",
+            ));
+        }
+        if let Some(encodings) = &self.allowed_encodings
+            && encodings.iter().any(|e| e.is_empty())
+        {
+            return Err(bad("allowed_encodings", "entries must not be empty"));
+        }
+        if self.max_schedule_horizon_ms == 0 {
+            return Err(bad("max_schedule_horizon_ms", "must be > 0"));
+        }
+        if self.max_custom_entries == 0 {
+            return Err(bad("max_custom_entries", "must be > 0"));
+        }
+        if self.max_custom_total_bytes == 0 {
+            return Err(bad("max_custom_total_bytes", "must be > 0"));
+        }
+        if self.max_custom_key_bytes == 0 {
+            return Err(bad("max_custom_key_bytes", "must be > 0"));
+        }
+        if self.dedup_window_ms <= 0 {
+            return Err(bad("dedup_window_ms", "must be > 0"));
+        }
+        Ok(())
     }
 }
 
@@ -197,6 +327,7 @@ pub struct Config {
     pub logging: LoggingConfig,
     pub tracing: TracingConfig,
     pub metrics: MetricsConfig,
+    pub queues: Vec<QueueConfig>,
 }
 
 impl Config {
@@ -247,49 +378,21 @@ impl Config {
         {
             return Err("auth.api_keys entries must not be empty".into());
         }
-        if self.limits.max_lease_duration_ms == 0 {
-            return Err("limits.max_lease_duration_ms must be > 0".into());
-        }
-        if self.limits.default_max_attempts == 0 {
-            return Err("limits.default_max_attempts must be > 0".into());
-        }
+        // Request-shape limits — global only (not overridable per queue).
         if self.limits.max_reserve_batch == 0 {
             return Err("limits.max_reserve_batch must be > 0".into());
-        }
-        if self.limits.max_wait_timeout_ms == 0 {
-            return Err("limits.max_wait_timeout_ms must be > 0".into());
-        }
-        if self.limits.max_attempts_ceiling == 0 {
-            return Err("limits.max_attempts_ceiling must be > 0".into());
-        }
-        if self.limits.default_max_attempts > self.limits.max_attempts_ceiling {
-            return Err(
-                "limits.default_max_attempts must not exceed limits.max_attempts_ceiling".into(),
-            );
-        }
-        if self.limits.default_priority > 9 {
-            return Err("limits.default_priority must be in [0, 9]".into());
         }
         if self.limits.max_reserve_queues == 0 {
             return Err("limits.max_reserve_queues must be > 0".into());
         }
+        if self.limits.max_wait_timeout_ms == 0 {
+            return Err("limits.max_wait_timeout_ms must be > 0".into());
+        }
         if self.limits.max_enqueue_batch == 0 {
             return Err("limits.max_enqueue_batch must be > 0".into());
         }
-        if self.limits.max_payload_bytes == 0 {
-            return Err("limits.max_payload_bytes must be > 0".into());
-        }
-        if self.limits.max_message_bytes < self.limits.max_payload_bytes {
-            return Err("limits.max_message_bytes must be >= limits.max_payload_bytes".into());
-        }
-        if self.limits.max_custom_entries == 0 {
-            return Err("limits.max_custom_entries must be > 0".into());
-        }
-        if self.limits.max_custom_total_bytes == 0 {
-            return Err("limits.max_custom_total_bytes must be > 0".into());
-        }
-        if self.limits.max_custom_key_bytes == 0 {
-            return Err("limits.max_custom_key_bytes must be > 0".into());
+        if self.limits.max_message_bytes == 0 {
+            return Err("limits.max_message_bytes must be > 0".into());
         }
         if self.limits.max_queue_name_bytes == 0
             || self.limits.max_queue_name_bytes > u16::MAX as u32
@@ -302,14 +405,10 @@ impl Config {
         if self.limits.max_idempotency_key_bytes == 0 {
             return Err("limits.max_idempotency_key_bytes must be > 0".into());
         }
-        if self.limits.max_schedule_horizon_ms == 0 {
-            return Err("limits.max_schedule_horizon_ms must be > 0".into());
-        }
-        if let Some(encodings) = &self.limits.allowed_encodings
-            && encodings.iter().any(|e| e.is_empty())
-        {
-            return Err("limits.allowed_encodings entries must not be empty".into());
-        }
+        // Overridable per-job/per-queue limits — the same field rules apply
+        // to the global defaults and to each queue's merged effective view.
+        let defaults = EffectiveLimits::from_globals(&self.limits, &self.storage);
+        defaults.validate(self.limits.max_message_bytes, "limits")?;
         if self.storage.sweep_interval_ms == 0 {
             return Err("storage.sweep_interval_ms must be > 0".into());
         }
@@ -318,9 +417,6 @@ impl Config {
         }
         if self.storage.command_queue_capacity == 0 {
             return Err("storage.command_queue_capacity must be > 0".into());
-        }
-        if self.storage.dedup_window_ms <= 0 {
-            return Err("storage.dedup_window_ms must be > 0".into());
         }
         if matches!(self.storage.cache_size_bytes, Some(0)) {
             return Err("storage.cache_size_bytes must be > 0 when set".into());
@@ -351,6 +447,31 @@ impl Config {
             if self.metrics.export_interval_ms == 0 {
                 return Err("metrics.export_interval_ms must be > 0".into());
             }
+        }
+        self.validate_queues(&defaults)?;
+        Ok(())
+    }
+
+    fn validate_queues(&self, defaults: &EffectiveLimits) -> Result<(), Box<dyn Error>> {
+        let mut seen: HashSet<&str> = HashSet::new();
+        for q in &self.queues {
+            if q.name.is_empty() {
+                return Err("queues[].name must not be empty".into());
+            }
+            if q.name.len() > self.limits.max_queue_name_bytes as usize {
+                return Err(format!(
+                    "queues[].name {:?} exceeds limits.max_queue_name_bytes ({})",
+                    q.name, self.limits.max_queue_name_bytes
+                )
+                .into());
+            }
+            if !seen.insert(q.name.as_str()) {
+                return Err(format!("queues[] contains duplicate name {:?}", q.name).into());
+            }
+            defaults.merged_with(q).validate(
+                self.limits.max_message_bytes,
+                &format!("queues[{:?}]", q.name),
+            )?;
         }
         Ok(())
     }

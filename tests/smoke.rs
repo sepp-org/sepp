@@ -96,6 +96,30 @@ async fn start_server(tag: &str) -> (ServerGuard, Client) {
     )
 }
 
+fn temp_config_path(tag: &str) -> std::path::PathBuf {
+    let unique = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::env::temp_dir().join(format!("sepp-smoke-{tag}-{unique}.toml"))
+}
+
+async fn start_server_with_config(tag: &str, toml: &str) -> (ServerGuard, Client) {
+    let db_path = temp_db(tag);
+    let cfg_path = temp_config_path(tag);
+    std::fs::write(&cfg_path, toml).expect("write temp config");
+    let cfg_str = cfg_path.to_str().expect("utf-8 config path");
+    let (child, client) = spawn_server_with_env(&db_path, &[("SEPP_CONFIG", cfg_str)]).await;
+    let _ = std::fs::remove_file(&cfg_path);
+    (
+        ServerGuard {
+            child,
+            db_path: Some(db_path),
+        },
+        client,
+    )
+}
+
 fn enqueue_req(queue: &str) -> EnqueueRequest {
     EnqueueRequest {
         queue: queue.to_string(),
@@ -719,6 +743,122 @@ async fn api_key_auth_gates_requests() {
         .expect("a request with a valid API key is accepted")
         .into_inner();
     assert!(!info.server_version.is_empty());
+}
+
+async fn enqueue_one(client: &Client, req: EnqueueRequest) -> sepp::pb::sepp::v1::JobResult {
+    client
+        .clone()
+        .enqueue_batch(EnqueueBatchRequest { jobs: vec![req] })
+        .await
+        .expect("enqueue_batch RPC")
+        .into_inner()
+        .results
+        .into_iter()
+        .next()
+        .expect("one result per submitted job")
+}
+
+#[tokio::test]
+async fn strict_mode_rejects_undeclared_queues() {
+    let cfg = r#"
+[server]
+strict_queues = true
+
+[[queues]]
+name = "smoke-strict-emails"
+"#;
+    let (_guard, client) = start_server_with_config("strict", cfg).await;
+
+    let ok = enqueue_one(&client, enqueue_req("smoke-strict-emails")).await;
+    assert!(
+        matches!(ok.outcome, Some(job_result::Outcome::Success(_))),
+        "declared queue accepts enqueue: {:?}",
+        ok.outcome
+    );
+
+    let bad = enqueue_one(&client, enqueue_req("smoke-strict-ghost")).await;
+    match bad.outcome {
+        Some(job_result::Outcome::Error(e)) => {
+            assert_eq!(
+                e.code, "UNKNOWN_QUEUE",
+                "rejection code identifies the cause"
+            );
+            assert!(
+                e.message.contains("smoke-strict-ghost"),
+                "rejection names the queue: {:?}",
+                e.message
+            );
+        }
+        other => panic!("undeclared queue was not rejected: {other:?}"),
+    }
+
+    let status = client
+        .clone()
+        .reserve(ReserveRequest {
+            queues: vec!["smoke-strict-ghost".to_string()],
+            wait_timeout_ms: NO_WAIT.as_millis() as u64,
+            lease_duration_ms: LEASE.as_millis() as u64,
+            worker_id: None,
+            max_jobs: None,
+        })
+        .await
+        .expect_err("reserve from undeclared queue is rejected");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+}
+
+#[tokio::test]
+async fn per_queue_max_payload_overrides_global() {
+    let cfg = r#"
+[[queues]]
+name = "smoke-tiny"
+max_payload_bytes = 16
+"#;
+    let (_guard, client) = start_server_with_config("override", cfg).await;
+
+    let oversize = Payload {
+        data: vec![0u8; 1024],
+        encoding: "application/octet-stream".to_string(),
+    };
+
+    let rejected = enqueue_one(
+        &client,
+        EnqueueRequest {
+            payload: Some(oversize.clone()),
+            ..enqueue_req("smoke-tiny")
+        },
+    )
+    .await;
+    match rejected.outcome {
+        Some(job_result::Outcome::Error(e)) => {
+            assert_eq!(e.code, "INVALID_ARGUMENT");
+            assert!(
+                e.message.contains("max_payload_bytes"),
+                "rejection mentions the limit: {:?}",
+                e.message
+            );
+            assert!(
+                e.message.contains("16"),
+                "rejection reports the per-queue limit value, not the global: {:?}",
+                e.message
+            );
+        }
+        other => panic!("per-queue payload cap did not reject: {other:?}"),
+    }
+
+    // The same payload still fits the global default for an undeclared queue.
+    let accepted = enqueue_one(
+        &client,
+        EnqueueRequest {
+            payload: Some(oversize),
+            ..enqueue_req("smoke-untyped")
+        },
+    )
+    .await;
+    assert!(
+        matches!(accepted.outcome, Some(job_result::Outcome::Success(_))),
+        "the same payload is accepted on a queue without an override: {:?}",
+        accepted.outcome
+    );
 }
 
 #[tokio::test]
