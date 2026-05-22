@@ -483,11 +483,13 @@ impl Config {
             if !seen.insert(q.name.as_str()) {
                 return Err(format!("queues[] contains duplicate name {:?}", q.name).into());
             }
+
             defaults.merged_with(q).validate(
                 self.limits.max_message_bytes,
                 &format!("queues[{:?}]", q.name),
             )?;
         }
+
         Ok(())
     }
 }

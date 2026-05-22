@@ -17,6 +17,7 @@ const EXAMPLE_CONFIG: &str = include_str!("../sepp.example.toml");
 
 fn config_path_arg() -> Option<String> {
     let mut args = std::env::args();
+
     while let Some(arg) = args.next() {
         if arg == "--config" {
             return args.next();
@@ -25,6 +26,7 @@ fn config_path_arg() -> Option<String> {
             return Some(path.to_string());
         }
     }
+
     std::env::var("SEPP_CONFIG").ok()
 }
 
@@ -33,6 +35,7 @@ fn handle_subcommand() -> Option<ExitCode> {
     if args.next().as_deref() != Some("config") {
         return None;
     }
+
     match args.next().as_deref() {
         Some("example") => {
             print!("{EXAMPLE_CONFIG}");
@@ -54,8 +57,10 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     if let Some(code) = handle_subcommand() {
         return Ok(code);
     }
+
     let config = Config::load(config_path_arg().as_deref())?;
     let _telemetry = telemetry::init(&config.logging, &config.tracing)?;
+
     install_panic_hook();
     debug!(
         persist_mode = ?config.storage.persist_mode,
@@ -68,6 +73,7 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
         metrics_export_interval_ms = config.metrics.export_interval_ms,
         "configuration loaded",
     );
+
     let _metrics = metrics::init(&config.metrics, &config.tracing.service_name)?;
     let addr = config.server.listen_addr.parse()?;
     let registry = QueueRegistry::from_config(&config);
@@ -95,6 +101,7 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     if interceptor.is_enforcing() && !tls_enabled {
         warn!("API-key auth is enabled without TLS; keys are sent in plaintext");
     }
+
     let on_off = |on: bool| if on { "enabled" } else { "disabled" };
     info!(
         %addr,
@@ -121,21 +128,25 @@ fn load_tls_identity(config: &Config) -> Result<Identity, Box<dyn std::error::Er
         .tls_cert_path
         .as_deref()
         .expect("tls_cert_path set");
+
     let key_path = config
         .server
         .tls_key_path
         .as_deref()
         .expect("tls_key_path set");
+
     let cert = std::fs::read(cert_path)
         .map_err(|e| format!("reading server.tls_cert_path ({cert_path}): {e}"))?;
     let key = std::fs::read(key_path)
         .map_err(|e| format!("reading server.tls_key_path ({key_path}): {e}"))?;
+
     Ok(Identity::from_pem(cert, key))
 }
 
 // Catch panics for logging
 fn install_panic_hook() {
     let default = std::panic::take_hook();
+
     std::panic::set_hook(Box::new(move |info| {
         tracing::error!("panic: {info}");
         default(info);
@@ -163,5 +174,6 @@ async fn shutdown_signal() {
         _ = ctrl_c => {}
         _ = terminate => {}
     }
+
     info!("shutdown signal received");
 }

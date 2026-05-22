@@ -43,6 +43,7 @@ impl Interceptor for ApiKeyInterceptor {
             .get("authorization")
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.strip_prefix("Bearer "));
+
         match presented {
             Some(key) if allowed.contains(key) => Ok(request),
             Some(_) => {
