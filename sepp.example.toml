@@ -188,6 +188,7 @@ export_interval_ms = 60000
 #max_lease_duration_ms = 60000
 #default_max_attempts = 5
 #default_priority = 5
+#allowed_job_types = ["send_welcome", "send_receipt"]
 
 #[[queues]]
 #name = "reports"

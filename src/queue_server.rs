@@ -89,6 +89,14 @@ impl QueueServer {
                 s.max_job_type_bytes
             ));
         }
+        if let Some(allowed) = &limits.allowed_job_types
+            && !allowed.iter().any(|t| t == &job.job_type)
+        {
+            return Err(format!(
+                "job_type {:?} is not accepted by this queue",
+                job.job_type
+            ));
+        }
         if let Some(key) = &job.idempotency_key
             && key.len() > s.max_idempotency_key_bytes as usize
         {

@@ -53,6 +53,7 @@ pub struct QueueConfig {
     pub default_priority: Option<u32>,
     pub max_payload_bytes: Option<u64>,
     pub allowed_encodings: Option<Vec<String>>,
+    pub allowed_job_types: Option<Vec<String>>,
     pub max_schedule_horizon_ms: Option<u64>,
     pub max_custom_entries: Option<u32>,
     pub max_custom_total_bytes: Option<u64>,
@@ -68,6 +69,7 @@ pub struct EffectiveLimits {
     pub default_priority: u32,
     pub max_payload_bytes: u64,
     pub allowed_encodings: Option<Vec<String>>,
+    pub allowed_job_types: Option<Vec<String>>,
     pub max_schedule_horizon_ms: u64,
     pub max_custom_entries: u32,
     pub max_custom_total_bytes: u64,
@@ -84,6 +86,7 @@ impl EffectiveLimits {
             default_priority: limits.default_priority,
             max_payload_bytes: limits.max_payload_bytes,
             allowed_encodings: limits.allowed_encodings.clone(),
+            allowed_job_types: None,
             max_schedule_horizon_ms: limits.max_schedule_horizon_ms,
             max_custom_entries: limits.max_custom_entries,
             max_custom_total_bytes: limits.max_custom_total_bytes,
@@ -105,6 +108,7 @@ impl EffectiveLimits {
                 .allowed_encodings
                 .clone()
                 .or_else(|| self.allowed_encodings.clone()),
+            allowed_job_types: q.allowed_job_types.clone(),
             max_schedule_horizon_ms: q
                 .max_schedule_horizon_ms
                 .unwrap_or(self.max_schedule_horizon_ms),
@@ -151,6 +155,17 @@ impl EffectiveLimits {
             && encodings.iter().any(|e| e.is_empty())
         {
             return Err(bad("allowed_encodings", "entries must not be empty"));
+        }
+        if let Some(job_types) = &self.allowed_job_types {
+            if job_types.is_empty() {
+                return Err(bad(
+                    "allowed_job_types",
+                    "must contain at least one entry; omit the key to accept any job_type",
+                ));
+            }
+            if job_types.iter().any(|t| t.is_empty()) {
+                return Err(bad("allowed_job_types", "entries must not be empty"));
+            }
         }
         if self.max_schedule_horizon_ms == 0 {
             return Err(bad("max_schedule_horizon_ms", "must be > 0"));

@@ -70,7 +70,7 @@ async fn spawn_server_with_env(
     for (key, value) in extra_env {
         command.env(key, value);
     }
-    let child = command.spawn().expect("spawn sepp server");
+    let mut child = command.spawn().expect("spawn sepp server");
 
     let addr = format!("http://127.0.0.1:{port}");
     for _ in 0..100 {
@@ -79,6 +79,8 @@ async fn spawn_server_with_env(
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    let _ = child.kill();
+    let _ = child.wait();
     panic!("server did not become reachable on {addr}");
 }
 
@@ -858,6 +860,65 @@ max_payload_bytes = 16
         matches!(accepted.outcome, Some(job_result::Outcome::Success(_))),
         "the same payload is accepted on a queue without an override: {:?}",
         accepted.outcome
+    );
+}
+
+#[tokio::test]
+async fn per_queue_allowed_job_types_filters_enqueues() {
+    let cfg = r#"
+[[queues]]
+name = "smoke-typed"
+allowed_job_types = ["send_email"]
+"#;
+    let (_guard, client) = start_server_with_config("typed", cfg).await;
+
+    let rejected = enqueue_one(
+        &client,
+        EnqueueRequest {
+            job_type: "render_report".to_string(),
+            ..enqueue_req("smoke-typed")
+        },
+    )
+    .await;
+    match rejected.outcome {
+        Some(job_result::Outcome::Error(e)) => {
+            assert_eq!(e.code, "INVALID_ARGUMENT");
+            assert!(
+                e.message.contains("render_report"),
+                "rejection names the offending job_type: {:?}",
+                e.message
+            );
+        }
+        other => panic!("disallowed job_type was not rejected: {other:?}"),
+    }
+
+    let accepted = enqueue_one(
+        &client,
+        EnqueueRequest {
+            job_type: "send_email".to_string(),
+            ..enqueue_req("smoke-typed")
+        },
+    )
+    .await;
+    assert!(
+        matches!(accepted.outcome, Some(job_result::Outcome::Success(_))),
+        "an allow-listed job_type is accepted: {:?}",
+        accepted.outcome
+    );
+
+    // The restriction is per-queue: an undeclared queue accepts any job_type.
+    let elsewhere = enqueue_one(
+        &client,
+        EnqueueRequest {
+            job_type: "render_report".to_string(),
+            ..enqueue_req("smoke-untyped")
+        },
+    )
+    .await;
+    assert!(
+        matches!(elsewhere.outcome, Some(job_result::Outcome::Success(_))),
+        "a queue without an allow-list accepts any job_type: {:?}",
+        elsewhere.outcome
     );
 }
 

@@ -91,6 +91,24 @@ mod tests {
     }
 
     #[test]
+    fn allowed_job_types_is_per_queue_only() {
+        let cfg = cfg_with(vec![QueueConfig {
+            name: "strict".into(),
+            allowed_job_types: Some(vec!["send_email".into()]),
+            ..Default::default()
+        }]);
+        let reg = QueueRegistry::from_config(&cfg);
+        assert_eq!(
+            reg.effective("strict").allowed_job_types.as_deref(),
+            Some(&["send_email".into()][..])
+        );
+        assert!(
+            reg.effective("other").allowed_job_types.is_none(),
+            "queues without an override accept any job_type"
+        );
+    }
+
+    #[test]
     fn allowed_encodings_override_replaces_globally_allowed_list() {
         let mut cfg = cfg_with(vec![QueueConfig {
             name: "strict".into(),
