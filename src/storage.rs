@@ -7,7 +7,10 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use fjall::{Database, Keyspace, KeyspaceCreateOptions, OwnedWriteBatch, PersistMode};
+use fjall::{
+    KeyspaceCreateOptions, PersistMode, Readable, SingleWriterTxDatabase as TxDatabase,
+    SingleWriterTxKeyspace as TxKeyspace, SingleWriterWriteTx as WriteTransaction,
+};
 use prost::Message;
 use tokio::sync::{Notify, futures::Notified, oneshot};
 use tonic::Status;
@@ -35,15 +38,15 @@ struct StorageParams {
 }
 
 struct Store {
-    db: Database,
-    payloads: Keyspace,
-    inflight: Keyspace,
-    dead_letters: Keyspace,
-    ready: Keyspace,
-    dedup: Keyspace,
-    dedup_timers: Keyspace,
-    scheduled: Keyspace,
-    leases: Keyspace,
+    db: TxDatabase,
+    payloads: TxKeyspace,
+    inflight: TxKeyspace,
+    dead_letters: TxKeyspace,
+    ready: TxKeyspace,
+    dedup: TxKeyspace,
+    dedup_timers: TxKeyspace,
+    scheduled: TxKeyspace,
+    leases: TxKeyspace,
     params: StorageParams,
     registry: SharedRegistry,
     metrics: Metrics,
@@ -306,7 +309,8 @@ impl Indexes {
 fn warn_on_undeclared_persisted_queues(store: &Store) {
     let registry = store.registry.load();
     let mut undeclared: BTreeSet<String> = BTreeSet::new();
-    for guard in store.payloads.iter() {
+    let snap = store.db.read_tx();
+    for guard in snap.iter(&store.payloads) {
         let Ok((_, value)) = guard.into_inner() else {
             continue;
         };
@@ -328,30 +332,31 @@ fn warn_on_undeclared_persisted_queues(store: &Store) {
 
 fn rebuild_indexes(store: &Store) -> Result<Indexes, fjall::Error> {
     let mut indexes = Indexes::default();
-    for guard in store.ready.iter() {
+    let snap = store.db.read_tx();
+    for guard in snap.iter(&store.ready) {
         let (key, value) = guard.into_inner()?;
         let attempt = read_u32(&value, 0).unwrap_or(1);
         indexes.ready.insert(key.to_vec(), attempt);
     }
-    for guard in store.scheduled.iter() {
+    for guard in snap.iter(&store.scheduled) {
         let (key, _) = guard.into_inner()?;
         let queue = key
             .get(8..)
-            .and_then(|job_id| store.payloads.get(job_id).ok().flatten())
+            .and_then(|job_id| snap.get(&store.payloads, job_id).ok().flatten())
             .and_then(|stored| read_queue(&stored).map(str::to_owned))
             .unwrap_or_default();
         indexes.scheduled.insert(key.to_vec(), &queue);
     }
-    for guard in store.leases.iter() {
+    for guard in snap.iter(&store.leases) {
         let (key, _) = guard.into_inner()?;
         let queue = key
             .get(8..)
-            .and_then(|job_id| store.inflight.get(job_id).ok().flatten())
+            .and_then(|job_id| snap.get(&store.inflight, job_id).ok().flatten())
             .and_then(|stored| decode_inflight(&stored).ok().map(|i| i.queue))
             .unwrap_or_default();
         indexes.leases.insert(key.to_vec(), &queue);
     }
-    for guard in store.dedup_timers.iter() {
+    for guard in snap.iter(&store.dedup_timers) {
         let (key, _) = guard.into_inner()?;
         let queue = key.get(8..).and_then(read_queue).unwrap_or("").to_string();
         indexes.dedup_timers.insert(key.to_vec(), &queue);
@@ -426,7 +431,6 @@ type Responder = Box<dyn FnOnce(&Result<(), Status>) + Send>;
 struct Cycle {
     dirty: bool,
     new_ready: HashSet<String>,
-    dedup_seen: HashMap<(String, String), String>,
     // `None` when metrics are disabled — every recorder method becomes a no-op
     // and we skip allocating into nine HashMaps that would never be flushed.
     metrics: Option<CycleMetrics>,
@@ -437,7 +441,6 @@ impl Cycle {
         Self {
             dirty: false,
             new_ready: HashSet::new(),
-            dedup_seen: HashMap::new(),
             metrics: metrics_enabled.then(CycleMetrics::default),
         }
     }
@@ -563,14 +566,14 @@ fn run_rpc_cycle(
     notifiers: &QueueNotifiers,
     rpcs: Vec<Command>,
 ) {
-    let mut batch = store.db.batch();
+    let mut tx = store.db.write_tx();
     let mut cycle = Cycle::new(store.metrics.is_enabled());
     let mut responders: Vec<Responder> = Vec::new();
 
     for cmd in rpcs {
         match cmd {
             Command::Enqueue { jobs, resp } => {
-                let per_jobs = apply_enqueue(store, indexes, &mut batch, &mut cycle, jobs);
+                let per_jobs = apply_enqueue(store, indexes, &mut tx, &mut cycle, jobs);
                 responders.push(Box::new(move |o| {
                     let _ = resp.send(per_jobs.into_iter().map(|pj| pj.resolve(o)).collect());
                 }));
@@ -581,7 +584,7 @@ fn run_rpc_cycle(
                 max_jobs,
                 resp,
             } => match apply_reserve(
-                store, indexes, &mut batch, &mut cycle, &queues, lease_ms, max_jobs,
+                store, indexes, &mut tx, &mut cycle, &queues, lease_ms, max_jobs,
             ) {
                 Ok(jobs) => responders.push(Box::new(move |o| {
                     let _ = resp.send(o.clone().map(|()| jobs));
@@ -594,7 +597,7 @@ fn run_rpc_cycle(
                 job_id,
                 attempt,
                 resp,
-            } => match apply_ack(store, indexes, &mut batch, &mut cycle, &job_id, attempt) {
+            } => match apply_ack(store, indexes, &mut tx, &mut cycle, &job_id, attempt) {
                 Ok(()) => responders.push(Box::new(move |o| {
                     let _ = resp.send(o.clone());
                 })),
@@ -603,7 +606,7 @@ fn run_rpc_cycle(
                 }
             },
             Command::Nack { req, resp } => {
-                match apply_nack(store, indexes, &mut batch, &mut cycle, req) {
+                match apply_nack(store, indexes, &mut tx, &mut cycle, req) {
                     Ok(dead_lettered) => responders.push(Box::new(move |o| {
                         let _ = resp.send(o.clone().map(|()| dead_lettered));
                     })),
@@ -613,7 +616,7 @@ fn run_rpc_cycle(
                 }
             }
             Command::Extend { req, resp } => {
-                match apply_extend(store, indexes, &mut batch, &mut cycle, req) {
+                match apply_extend(store, indexes, &mut tx, &mut cycle, req) {
                     Ok(lease_expires_at) => responders.push(Box::new(move |o| {
                         let _ = resp.send(o.clone().map(|()| lease_expires_at));
                     })),
@@ -626,7 +629,7 @@ fn run_rpc_cycle(
     }
 
     let outcome = if cycle.dirty {
-        commit_and_persist(store, batch)
+        commit_and_persist(store, tx)
     } else {
         Ok(())
     };
@@ -649,10 +652,10 @@ fn run_rpc_cycle(
 
 fn run_sweep_cycle(store: &Store, indexes: &mut Indexes, notifiers: &QueueNotifiers) {
     let started = std::time::Instant::now();
-    let mut batch = store.db.batch();
+    let mut tx = store.db.write_tx();
     let mut cycle = Cycle::new(store.metrics.is_enabled());
 
-    let processed = match apply_sweep(store, indexes, &mut batch, &mut cycle) {
+    let processed = match apply_sweep(store, indexes, &mut tx, &mut cycle) {
         Ok(processed) => processed,
         Err(e) => {
             warn!(error = %e, "timer sweep aborted");
@@ -661,7 +664,7 @@ fn run_sweep_cycle(store: &Store, indexes: &mut Indexes, notifiers: &QueueNotifi
         }
     };
     let outcome = if cycle.dirty {
-        commit_and_persist(store, batch)
+        commit_and_persist(store, tx)
     } else {
         Ok(())
     };
@@ -684,9 +687,9 @@ fn run_sweep_cycle(store: &Store, indexes: &mut Indexes, notifiers: &QueueNotifi
     }
 }
 
-fn commit_and_persist(store: &Store, batch: OwnedWriteBatch) -> Result<(), Status> {
+fn commit_and_persist(store: &Store, tx: WriteTransaction<'_>) -> Result<(), Status> {
     let started = std::time::Instant::now();
-    let result = batch
+    let result = tx
         .commit()
         .and_then(|()| store.db.persist(store.params.persist_mode));
     store.metrics.record_commit(started.elapsed());
@@ -702,7 +705,7 @@ fn commit_and_persist(store: &Store, batch: OwnedWriteBatch) -> Result<(), Statu
 fn apply_enqueue(
     store: &Store,
     indexes: &mut Indexes,
-    batch: &mut OwnedWriteBatch,
+    tx: &mut WriteTransaction<'_>,
     cycle: &mut Cycle,
     jobs: Vec<EnqueueRequest>,
 ) -> Vec<PerJob> {
@@ -715,17 +718,8 @@ fn apply_enqueue(
         let mut stale_dedup_timer: Option<Vec<u8>> = None;
 
         if let Some(key) = &req.idempotency_key {
-            let dk = (req.queue.clone(), key.clone());
-            if let Some(existing) = cycle.dedup_seen.get(&dk).cloned() {
-                cycle.deduplicated(&req.queue);
-                results.push(PerJob::Settled(job_ok(EnqueueResponse {
-                    job_id: existing,
-                    deduplicated: true,
-                })));
-                continue;
-            }
             let dkey = dedup_key(&req.queue, key);
-            match store.dedup.get(&dkey) {
+            match tx.get(&store.dedup, &dkey) {
                 Ok(Some(existing)) => match decode_dedup(&existing) {
                     Some((ts, job_id)) if now - ts < limits.dedup_window_ms => {
                         cycle.deduplicated(&req.queue);
@@ -768,7 +762,7 @@ fn apply_enqueue(
             scheduled_at: req.scheduled_at,
         };
 
-        batch.insert(
+        tx.insert(
             &store.payloads,
             id.clone().into_bytes(),
             encode_job(&queue, &job),
@@ -776,7 +770,7 @@ fn apply_enqueue(
         match job.scheduled_at {
             Some(at) if at > now => {
                 let tk = timer_key(at, &id);
-                batch.insert(
+                tx.insert(
                     &store.scheduled,
                     tk.clone(),
                     job.attempt.to_be_bytes().to_vec(),
@@ -785,7 +779,7 @@ fn apply_enqueue(
             }
             _ => {
                 let rk = ready_key(&queue, job.priority, job.enqueued_at, &id);
-                batch.insert(&store.ready, rk.clone(), job.attempt.to_be_bytes().to_vec());
+                tx.insert(&store.ready, rk.clone(), job.attempt.to_be_bytes().to_vec());
                 indexes.ready.insert(rk, job.attempt);
                 cycle.new_ready.insert(queue.clone());
             }
@@ -793,14 +787,13 @@ fn apply_enqueue(
         if let Some(key) = &req.idempotency_key {
             let dkey = dedup_key(&queue, key);
             if let Some(old_timer) = stale_dedup_timer {
-                batch.remove(&store.dedup_timers, old_timer.clone());
+                tx.remove(&store.dedup_timers, old_timer.clone());
                 indexes.dedup_timers.remove(&old_timer);
             }
             let dtk = dedup_timer_key(now + limits.dedup_window_ms, &dkey);
-            batch.insert(&store.dedup_timers, dtk.clone(), Vec::new());
+            tx.insert(&store.dedup_timers, dtk.clone(), Vec::new());
             indexes.dedup_timers.insert(dtk, &queue);
-            batch.insert(&store.dedup, dkey, encode_dedup(now, &id));
-            cycle.dedup_seen.insert((queue.clone(), key.clone()), id.clone());
+            tx.insert(&store.dedup, dkey, encode_dedup(now, &id));
         }
         cycle.enqueued(&queue);
         cycle.dirty = true;
@@ -817,7 +810,7 @@ fn apply_enqueue(
 fn apply_reserve(
     store: &Store,
     indexes: &mut Indexes,
-    batch: &mut OwnedWriteBatch,
+    tx: &mut WriteTransaction<'_>,
     cycle: &mut Cycle,
     queues: &[String],
     lease_ms: u64,
@@ -838,16 +831,16 @@ fn apply_reserve(
             let job_id: String = match ready_k.get(id_offset..).map(std::str::from_utf8) {
                 Some(Ok(id)) => id.to_owned(),
                 _ => {
-                    batch.remove(&store.ready, ready_k);
+                    tx.remove(&store.ready, ready_k);
                     cycle.dirty = true;
                     continue;
                 }
             };
 
-            let stored = match store.payloads.get(job_id.as_bytes()) {
+            let stored = match tx.get(&store.payloads, job_id.as_bytes()) {
                 Ok(Some(stored)) => stored,
                 Ok(None) => {
-                    batch.remove(&store.ready, ready_k);
+                    tx.remove(&store.ready, ready_k);
                     cycle.dirty = true;
                     continue;
                 }
@@ -864,7 +857,7 @@ fn apply_reserve(
                 Ok(decoded) => decoded,
                 Err(e) => {
                     warn!(error = %e, "reserve skipping corrupt job");
-                    batch.remove(&store.ready, ready_k);
+                    tx.remove(&store.ready, ready_k);
                     cycle.dirty = true;
                     continue;
                 }
@@ -882,14 +875,14 @@ fn apply_reserve(
                 max_attempts: job.max_attempts,
                 queue: job_queue,
             };
-            batch.remove(&store.ready, ready_k);
-            batch.insert(
+            tx.remove(&store.ready, ready_k);
+            tx.insert(
                 &store.inflight,
                 job.id.clone().into_bytes(),
                 encode_inflight(&inflight),
             );
             let lease_timer = timer_key(lease_expires_at, &job.id);
-            batch.insert(&store.leases, lease_timer.clone(), Vec::new());
+            tx.insert(&store.leases, lease_timer.clone(), Vec::new());
             indexes.leases.insert(lease_timer, &inflight.queue);
             cycle.reserved(&inflight.queue);
             cycle.dirty = true;
@@ -903,24 +896,23 @@ fn apply_reserve(
 fn apply_ack(
     store: &Store,
     indexes: &mut Indexes,
-    batch: &mut OwnedWriteBatch,
+    tx: &mut WriteTransaction<'_>,
     cycle: &mut Cycle,
     job_id: &str,
     attempt: u32,
 ) -> Result<(), Status> {
-    let stored = store
-        .inflight
-        .get(job_id.as_bytes())
+    let stored = tx
+        .get(&store.inflight, job_id.as_bytes())
         .map_err(stg_err)?
         .ok_or_else(|| Status::not_found("job not found"))?;
     let inflight = decode_inflight(&stored)?;
     if inflight.attempt != attempt {
         return Err(Status::failed_precondition("attempt mismatch"));
     }
-    batch.remove(&store.payloads, job_id.as_bytes().to_vec());
-    batch.remove(&store.inflight, job_id.as_bytes().to_vec());
+    tx.remove(&store.payloads, job_id.as_bytes().to_vec());
+    tx.remove(&store.inflight, job_id.as_bytes().to_vec());
     let lease_timer = timer_key(inflight.lease_expires_at, job_id);
-    batch.remove(&store.leases, lease_timer.clone());
+    tx.remove(&store.leases, lease_timer.clone());
     indexes.leases.remove(&lease_timer);
     cycle.acked(&inflight.queue);
     cycle.dirty = true;
@@ -930,13 +922,12 @@ fn apply_ack(
 fn apply_nack(
     store: &Store,
     indexes: &mut Indexes,
-    batch: &mut OwnedWriteBatch,
+    tx: &mut WriteTransaction<'_>,
     cycle: &mut Cycle,
     req: NackRequest,
 ) -> Result<bool, Status> {
-    let stored = store
-        .inflight
-        .get(req.job_id.as_bytes())
+    let stored = tx
+        .get(&store.inflight, req.job_id.as_bytes())
         .map_err(stg_err)?
         .ok_or_else(|| Status::not_found("job not found"))?;
     let inflight = decode_inflight(&stored)?;
@@ -964,13 +955,13 @@ fn apply_nack(
         } else {
             (DeadLetterCause::AttemptsExhausted, "attempts_exhausted")
         };
-        batch.insert(
+        tx.insert(
             &store.dead_letters,
             req.job_id.clone().into_bytes(),
             encode_dead_letter(now_ms(), cause),
         );
-        batch.remove(&store.inflight, req.job_id.into_bytes());
-        batch.remove(&store.leases, lease_timer.clone());
+        tx.remove(&store.inflight, req.job_id.into_bytes());
+        tx.remove(&store.leases, lease_timer.clone());
         indexes.leases.remove(&lease_timer);
         cycle.nacked(&inflight.queue);
         cycle.dead_lettered(&inflight.queue, cause_label);
@@ -982,7 +973,7 @@ fn apply_nack(
     if retry_delay_ms > 0 {
         let deadline = now_ms().saturating_add(i64::try_from(retry_delay_ms).unwrap_or(i64::MAX));
         let tk = timer_key(deadline, &req.job_id);
-        batch.insert(&store.scheduled, tk.clone(), attempt.to_be_bytes().to_vec());
+        tx.insert(&store.scheduled, tk.clone(), attempt.to_be_bytes().to_vec());
         indexes.scheduled.insert(tk, &inflight.queue);
     } else {
         let rk = ready_key(
@@ -991,12 +982,12 @@ fn apply_nack(
             inflight.enqueued_at,
             &req.job_id,
         );
-        batch.insert(&store.ready, rk.clone(), attempt.to_be_bytes().to_vec());
+        tx.insert(&store.ready, rk.clone(), attempt.to_be_bytes().to_vec());
         indexes.ready.insert(rk, attempt);
         cycle.new_ready.insert(inflight.queue.clone());
     }
-    batch.remove(&store.inflight, req.job_id.into_bytes());
-    batch.remove(&store.leases, lease_timer.clone());
+    tx.remove(&store.inflight, req.job_id.into_bytes());
+    tx.remove(&store.leases, lease_timer.clone());
     indexes.leases.remove(&lease_timer);
     cycle.nacked(&inflight.queue);
     cycle.dirty = true;
@@ -1006,13 +997,12 @@ fn apply_nack(
 fn apply_extend(
     store: &Store,
     indexes: &mut Indexes,
-    batch: &mut OwnedWriteBatch,
+    tx: &mut WriteTransaction<'_>,
     cycle: &mut Cycle,
     req: ExtendRequest,
 ) -> Result<i64, Status> {
-    let stored = store
-        .inflight
-        .get(req.job_id.as_bytes())
+    let stored = tx
+        .get(&store.inflight, req.job_id.as_bytes())
         .map_err(stg_err)?
         .ok_or_else(|| Status::not_found("job not found"))?;
     let mut inflight = decode_inflight(&stored)?;
@@ -1028,15 +1018,15 @@ fn apply_extend(
     let lease_expires_at = now_ms() + req.lease_duration_ms.min(max_lease) as i64;
     inflight.lease_expires_at = lease_expires_at;
 
-    batch.insert(
+    tx.insert(
         &store.inflight,
         req.job_id.clone().into_bytes(),
         encode_inflight(&inflight),
     );
-    batch.remove(&store.leases, old_timer.clone());
+    tx.remove(&store.leases, old_timer.clone());
     indexes.leases.remove(&old_timer);
     let new_timer = timer_key(lease_expires_at, &req.job_id);
-    batch.insert(&store.leases, new_timer.clone(), Vec::new());
+    tx.insert(&store.leases, new_timer.clone(), Vec::new());
     indexes.leases.insert(new_timer, &inflight.queue);
     cycle.dirty = true;
     Ok(lease_expires_at)
@@ -1045,7 +1035,7 @@ fn apply_extend(
 fn apply_sweep(
     store: &Store,
     indexes: &mut Indexes,
-    batch: &mut OwnedWriteBatch,
+    tx: &mut WriteTransaction<'_>,
     cycle: &mut Cycle,
 ) -> Result<usize, Status> {
     let now = now_ms();
@@ -1061,18 +1051,17 @@ fn apply_sweep(
         };
         budget -= 1;
         processed += 1;
-        let attempt_hint = store
-            .scheduled
-            .get(&timer_k)
+        let attempt_hint = tx
+            .get(&store.scheduled, &timer_k)
             .map_err(stg_err)?
             .and_then(|v| read_u32(&v, 0));
-        batch.remove(&store.scheduled, timer_k.clone());
+        tx.remove(&store.scheduled, timer_k.clone());
         cycle.dirty = true;
 
         let Some(job_id) = timer_k.get(8..) else {
             continue;
         };
-        let Some(stored) = store.payloads.get(job_id).map_err(stg_err)? else {
+        let Some(stored) = tx.get(&store.payloads, job_id).map_err(stg_err)? else {
             continue;
         };
         let (queue, job) = match decode_job(&stored) {
@@ -1084,7 +1073,7 @@ fn apply_sweep(
         };
         let attempt = attempt_hint.unwrap_or(job.attempt);
         let rk = ready_key(&queue, job.priority, job.enqueued_at, &job.id);
-        batch.insert(&store.ready, rk.clone(), attempt.to_be_bytes().to_vec());
+        tx.insert(&store.ready, rk.clone(), attempt.to_be_bytes().to_vec());
         indexes.ready.insert(rk, attempt);
         cycle.sweep_promotion(&queue);
         cycle.new_ready.insert(queue);
@@ -1097,13 +1086,13 @@ fn apply_sweep(
         };
         budget -= 1;
         processed += 1;
-        batch.remove(&store.leases, timer_k.clone());
+        tx.remove(&store.leases, timer_k.clone());
         cycle.dirty = true;
 
         let Some(job_id) = timer_k.get(8..) else {
             continue;
         };
-        let Some(stored) = store.inflight.get(job_id).map_err(stg_err)? else {
+        let Some(stored) = tx.get(&store.inflight, job_id).map_err(stg_err)? else {
             continue;
         };
         let inflight = match decode_inflight(&stored) {
@@ -1120,12 +1109,12 @@ fn apply_sweep(
                 attempt = inflight.attempt,
                 "job dead-lettered: lease expired with attempts exhausted"
             );
-            batch.insert(
+            tx.insert(
                 &store.dead_letters,
                 job_id.to_vec(),
                 encode_dead_letter(now, DeadLetterCause::LeaseExpired),
             );
-            batch.remove(&store.inflight, job_id.to_vec());
+            tx.remove(&store.inflight, job_id.to_vec());
             cycle.dead_lettered(&inflight.queue, "lease_expired");
         } else {
             let Ok(job_id_str) = std::str::from_utf8(job_id) else {
@@ -1144,9 +1133,9 @@ fn apply_sweep(
                 inflight.enqueued_at,
                 job_id_str,
             );
-            batch.insert(&store.ready, rk.clone(), attempt.to_be_bytes().to_vec());
+            tx.insert(&store.ready, rk.clone(), attempt.to_be_bytes().to_vec());
             indexes.ready.insert(rk, attempt);
-            batch.remove(&store.inflight, job_id.to_vec());
+            tx.remove(&store.inflight, job_id.to_vec());
             cycle.sweep_lease_redelivery(&inflight.queue);
             cycle.new_ready.insert(inflight.queue);
         }
@@ -1160,9 +1149,9 @@ fn apply_sweep(
         budget -= 1;
         processed += 1;
         if let Some(dedup_k) = timer_k.get(8..) {
-            batch.remove(&store.dedup, dedup_k.to_vec());
+            tx.remove(&store.dedup, dedup_k.to_vec());
         }
-        batch.remove(&store.dedup_timers, timer_k.clone());
+        tx.remove(&store.dedup_timers, timer_k.clone());
         cycle.sweep_dedup_expiration(&queue);
         cycle.dirty = true;
     }
@@ -1241,7 +1230,7 @@ impl Storage {
         registry: SharedRegistry,
         metrics: Metrics,
     ) -> Result<Self, fjall::Error> {
-        let mut builder = Database::builder(config.server.db_path.as_str());
+        let mut builder = TxDatabase::builder(config.server.db_path.as_str());
         if let Some(bytes) = config.storage.cache_size_bytes {
             builder = builder.cache_size(bytes);
         }
