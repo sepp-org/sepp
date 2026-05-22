@@ -92,9 +92,10 @@ max_idempotency_key_bytes = 256
 max_schedule_horizon_ms = 2592000000
 
 [storage]
-# Fsync durability mode. "sync_all" is the classic fsync,
-# "sync_data" is faster but only safe on some filesystems.
-# When in doubt, use "sync_all".
+# "sync_all" guarantees that every write is flushed to disk via fsync before the server responds.
+# "sync_data" uses fdatasync under the hood, only flushing file data and not metadata.
+# "buffer" relies on the OS to flush the data but offers 4x the throughput of the other two modes.
+# When in doubt, use "sync_all"
 persist_mode = "sync_all"
 
 # Maximum time to park the committer between maintenance checks, useful

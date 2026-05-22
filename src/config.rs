@@ -13,6 +13,7 @@ const DEFAULT_CONFIG_PATH: &str = "./sepp.toml";
 pub enum PersistMode {
     SyncAll,
     SyncData,
+    Buffer,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

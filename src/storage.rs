@@ -1248,9 +1248,19 @@ impl Storage {
             persist_mode: match config.storage.persist_mode {
                 crate::config::PersistMode::SyncAll => PersistMode::SyncAll,
                 crate::config::PersistMode::SyncData => PersistMode::SyncData,
+                crate::config::PersistMode::Buffer => PersistMode::Buffer,
             },
             sweep_limit: config.storage.sweep_limit,
         };
+        if matches!(
+            config.storage.persist_mode,
+            crate::config::PersistMode::Buffer
+        ) {
+            warn!(
+                "storage is running in buffer persist mode: writes are not fsynced; \
+                 an OS crash or power loss can lose any writes the kernel has not yet flushed"
+            );
+        }
         let store = Store {
             payloads: db.keyspace("payloads", KeyspaceCreateOptions::default)?,
             inflight: db.keyspace("inflight", KeyspaceCreateOptions::default)?,
