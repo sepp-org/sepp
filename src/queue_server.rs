@@ -1,15 +1,15 @@
 use crate::config::{Config, EffectiveLimits};
 use crate::metrics::{self, Metrics};
 use crate::pb::sepp::v1::{
-    AckRequest, AckResponse, EnqueueBatchRequest, EnqueueBatchResponse, EnqueueRequest,
-    ErrorDetails, ExtendRequest, ExtendResponse, GetServerInfoRequest, GetServerInfoResponse,
-    JobResult, NackRequest, NackResponse, PrimitiveValue, ReserveRequest, ReserveResponse,
-    job_result, queue_service_server::QueueService,
+    self as pb, AckRequest, AckResponse, EnqueueAtomicResponse, EnqueueBatchRequest,
+    EnqueueBatchResponse, EnqueueRequest, ExtendRequest, ExtendResponse, GetServerInfoRequest,
+    GetServerInfoResponse, JobResult, NackRequest, NackResponse, PrimitiveValue, ReserveRequest,
+    ReserveResponse, enqueue_atomic_response, job_result, queue_service_server::QueueService,
 };
-use crate::queues::SharedRegistry;
+use crate::queues::{QueueRegistry, SharedRegistry};
 use crate::storage::{Storage, now_ms};
 use crate::telemetry;
-use std::{collections::HashMap, time::Duration, time::Instant as StdInstant};
+use std::{time::Duration, time::Instant as StdInstant};
 
 use opentelemetry::metrics::ObservableGauge;
 
@@ -75,84 +75,168 @@ impl QueueServer {
         &self,
         job: &EnqueueRequest,
         limits: &EffectiveLimits,
-    ) -> Result<(), String> {
+    ) -> Result<(), pb::JobRejection> {
+        use pb::job_rejection::Reason;
         let s = &self.server_limits;
         if job.queue.len() > s.max_queue_name_bytes as usize {
-            return Err(format!(
-                "queue name exceeds max_queue_name_bytes ({})",
-                s.max_queue_name_bytes
-            ));
+            return Err(pb::JobRejection {
+                reason: Some(Reason::QueueNameTooLong(pb::QueueNameTooLong {
+                    limit: s.max_queue_name_bytes,
+                    actual: job.queue.len() as u64,
+                })),
+            });
         }
         if job.job_type.len() > s.max_job_type_bytes as usize {
-            return Err(format!(
-                "job_type exceeds max_job_type_bytes ({})",
-                s.max_job_type_bytes
-            ));
+            return Err(pb::JobRejection {
+                reason: Some(Reason::JobTypeNameTooLong(pb::JobTypeNameTooLong {
+                    limit: s.max_job_type_bytes,
+                    actual: job.job_type.len() as u64,
+                })),
+            });
         }
         if let Some(allowed) = &limits.allowed_job_types
             && !allowed.iter().any(|t| t == &job.job_type)
         {
-            return Err(format!(
-                "job_type {:?} is not accepted by this queue",
-                job.job_type
-            ));
+            return Err(pb::JobRejection {
+                reason: Some(Reason::JobTypeNotAllowed(pb::JobTypeNotAllowed {
+                    job_type: job.job_type.clone(),
+                    allowed: allowed.clone(),
+                })),
+            });
         }
         if let Some(key) = &job.idempotency_key
             && key.len() > s.max_idempotency_key_bytes as usize
         {
-            return Err(format!(
-                "idempotency_key exceeds max_idempotency_key_bytes ({})",
-                s.max_idempotency_key_bytes
-            ));
+            return Err(pb::JobRejection {
+                reason: Some(Reason::IdempotencyKeyTooLong(pb::IdempotencyKeyTooLong {
+                    limit: s.max_idempotency_key_bytes,
+                    actual: key.len() as u64,
+                })),
+            });
         }
         if let Some(payload) = &job.payload
             && payload.data.len() as u64 > limits.max_payload_bytes
         {
-            return Err(format!(
-                "payload exceeds max_payload_bytes ({})",
-                limits.max_payload_bytes
-            ));
+            return Err(pb::JobRejection {
+                reason: Some(Reason::PayloadTooLarge(pb::PayloadTooLarge {
+                    limit: limits.max_payload_bytes,
+                    actual: payload.data.len() as u64,
+                })),
+            });
         }
         if let Some(payload) = &job.payload
             && let Some(allowed) = &limits.allowed_encodings
             && !allowed.iter().any(|e| e == &payload.encoding)
         {
-            return Err(format!(
-                "payload encoding {:?} is not accepted by this server",
-                payload.encoding
-            ));
+            return Err(pb::JobRejection {
+                reason: Some(Reason::EncodingNotAllowed(pb::EncodingNotAllowed {
+                    encoding: payload.encoding.clone(),
+                    allowed: allowed.clone(),
+                })),
+            });
         }
         if job.custom.len() as u64 > limits.max_custom_entries as u64 {
-            return Err(format!(
-                "custom map exceeds max_custom_entries ({})",
-                limits.max_custom_entries
-            ));
+            return Err(pb::JobRejection {
+                reason: Some(Reason::CustomEntriesTooMany(pb::CustomEntriesTooMany {
+                    limit: limits.max_custom_entries,
+                    actual: job.custom.len() as u32,
+                })),
+            });
         }
         let mut custom_bytes: u64 = 0;
         for (key, value) in &job.custom {
             if key.len() as u64 > limits.max_custom_key_bytes as u64 {
-                return Err(format!(
-                    "custom key exceeds max_custom_key_bytes ({})",
-                    limits.max_custom_key_bytes
-                ));
+                return Err(pb::JobRejection {
+                    reason: Some(Reason::CustomKeyTooLong(pb::CustomKeyTooLong {
+                        key: key.clone(),
+                        limit: limits.max_custom_key_bytes,
+                        actual: key.len() as u64,
+                    })),
+                });
             }
             custom_bytes += key.len() as u64 + primitive_value_bytes(value);
         }
         if custom_bytes > limits.max_custom_total_bytes {
-            return Err(format!(
-                "custom map exceeds max_custom_total_bytes ({})",
-                limits.max_custom_total_bytes
-            ));
+            return Err(pb::JobRejection {
+                reason: Some(Reason::CustomMapTooLarge(pb::CustomMapTooLarge {
+                    limit: limits.max_custom_total_bytes,
+                    actual: custom_bytes,
+                })),
+            });
         }
         if let Some(at) = job.scheduled_at
             && at > now_ms().saturating_add(limits.max_schedule_horizon_ms as i64)
         {
-            return Err(format!(
-                "scheduled_at is beyond max_schedule_horizon_ms ({})",
-                limits.max_schedule_horizon_ms
-            ));
+            return Err(pb::JobRejection {
+                reason: Some(Reason::ScheduledTooFar(pb::ScheduledTooFar {
+                    horizon_ms: limits.max_schedule_horizon_ms,
+                    actual_ms: at,
+                })),
+            });
         }
         Ok(())
+    }
+
+    fn classify_enqueue(
+        &self,
+        job: &EnqueueRequest,
+        registry: &QueueRegistry,
+    ) -> Result<(), pb::JobRejection> {
+        use pb::job_rejection::Reason;
+        if let Err(e) = self.validator.validate(job) {
+            return Err(pb::JobRejection {
+                reason: Some(Reason::InvalidRequest(pb::InvalidRequest {
+                    message: e.to_string(),
+                })),
+            });
+        }
+        if self.strict_queues && !registry.is_declared(&job.queue) {
+            return Err(pb::JobRejection {
+                reason: Some(Reason::UnknownQueue(pb::UnknownQueue {
+                    queue: job.queue.clone(),
+                })),
+            });
+        }
+        let limits = registry.effective(&job.queue);
+        self.check_enqueue_limits(job, &limits)
+    }
+
+    async fn commit_validated(
+        &self,
+        mut valid: Vec<EnqueueRequest>,
+    ) -> Result<Vec<pb::EnqueueResponse>, Status> {
+        for job in &mut valid {
+            if job.trace_context.is_none() {
+                job.trace_context = telemetry::current_trace_context();
+            }
+        }
+        let responses = self.storage.enqueue(valid).await?;
+        let job_ids: Vec<&str> = responses.iter().map(|r| r.job_id.as_str()).collect();
+        tracing::Span::current().record("job_ids", tracing::field::debug(&job_ids));
+        Ok(responses)
+    }
+}
+
+// For metrics
+fn rejection_label(rejection: &pb::JobRejection) -> &'static str {
+    use pb::job_rejection::Reason;
+    match rejection
+        .reason
+        .as_ref()
+        .expect("rejection.reason is always set at construction")
+    {
+        Reason::UnknownQueue(_) => "unknown_queue",
+        Reason::PayloadTooLarge(_) => "payload_too_large",
+        Reason::EncodingNotAllowed(_) => "encoding_not_allowed",
+        Reason::JobTypeNotAllowed(_) => "job_type_not_allowed",
+        Reason::CustomEntriesTooMany(_) => "custom_entries_too_many",
+        Reason::CustomMapTooLarge(_) => "custom_map_too_large",
+        Reason::CustomKeyTooLong(_) => "custom_key_too_long",
+        Reason::QueueNameTooLong(_) => "queue_name_too_long",
+        Reason::JobTypeNameTooLong(_) => "job_type_name_too_long",
+        Reason::IdempotencyKeyTooLong(_) => "idempotency_key_too_long",
+        Reason::ScheduledTooFar(_) => "scheduled_too_far",
+        Reason::InvalidRequest(_) => "invalid_request",
     }
 }
 
@@ -199,73 +283,36 @@ impl QueueService for QueueServer {
             let mut valid = Vec::new();
             let mut slots: Vec<Option<JobResult>> = Vec::with_capacity(req.jobs.len());
             for job in req.jobs {
-                let rejection: Option<(&'static str, &'static str, String)> =
-                    match self.validator.validate(&job) {
-                        Ok(()) => {
-                            if self.strict_queues && !registry.is_declared(&job.queue) {
-                                Some((
-                                    "UNKNOWN_QUEUE",
-                                    "unknown_queue",
-                                    format!("queue {:?} is not declared (strict mode)", job.queue),
-                                ))
-                            } else {
-                                let limits = registry.effective(&job.queue);
-                                self.check_enqueue_limits(&job, &limits)
-                                    .err()
-                                    .map(|m| ("INVALID_ARGUMENT", "invalid_argument", m))
-                            }
-                        }
-                        Err(e) => Some(("INVALID_ARGUMENT", "invalid_argument", e.to_string())),
-                    };
-                match rejection {
-                    None => {
+                match self.classify_enqueue(&job, &registry) {
+                    Ok(()) => {
                         slots.push(None);
                         valid.push(job);
                     }
-                    Some((code, reason, message)) => {
+                    Err(rejection) => {
+                        let label = rejection_label(&rejection);
                         tracing::info!(
                             queue = %job.queue,
                             job_type = %job.job_type,
-                            code,
-                            %message,
+                            reason = label,
                             "enqueue rejected",
                         );
-                        self.metrics.record_rejected(&job.queue, reason);
+                        self.metrics.record_rejected(&job.queue, label);
                         slots.push(Some(JobResult {
-                            outcome: Some(job_result::Outcome::Error(ErrorDetails {
-                                code: code.to_string(),
-                                message,
-                                context: HashMap::new(),
-                            })),
+                            outcome: Some(job_result::Outcome::Rejection(rejection)),
                         }));
                     }
                 }
             }
 
-            // Pass through a producer-supplied trace context untouched;
-            // otherwise stamp this enqueue span so the worker has a span to
-            // link to.
-            for job in &mut valid {
-                if job.trace_context.is_none() {
-                    job.trace_context = telemetry::current_trace_context();
-                }
-            }
-
-            let enqueued = self.storage.enqueue(valid).await?;
-            let job_ids: Vec<&str> = enqueued
-                .iter()
-                .filter_map(|r| match &r.outcome {
-                    Some(job_result::Outcome::Success(s)) => Some(s.job_id.as_str()),
-                    _ => None,
-                })
-                .collect();
-            tracing::Span::current().record("job_ids", tracing::field::debug(&job_ids));
-
-            let mut enqueued = enqueued.into_iter();
+            let mut enqueued = self.commit_validated(valid).await?.into_iter();
             let results = slots
                 .into_iter()
                 .map(|slot| {
-                    slot.unwrap_or_else(|| enqueued.next().expect("one result per valid job"))
+                    slot.unwrap_or_else(|| JobResult {
+                        outcome: Some(job_result::Outcome::Success(
+                            enqueued.next().expect("one result per valid job"),
+                        )),
+                    })
                 })
                 .collect();
 
@@ -275,6 +322,77 @@ impl QueueService for QueueServer {
         .await;
         self.metrics
             .observe("enqueue_batch", started, &span, &result);
+        result
+    }
+
+    async fn enqueue_atomic(
+        &self,
+        request: Request<EnqueueBatchRequest>,
+    ) -> Result<Response<EnqueueAtomicResponse>, Status> {
+        let span = tracing::info_span!(
+            "sepp.enqueue_atomic",
+            job_ids = tracing::field::Empty,
+            error = tracing::field::Empty,
+        );
+        telemetry::set_parent_from_metadata(&span, request.metadata());
+        let started = StdInstant::now();
+        let result = async move {
+            let req = request.into_inner();
+            if req.jobs.is_empty() {
+                return Err(Status::invalid_argument(
+                    "batch must contain at least one job",
+                ));
+            }
+            if req.jobs.len() as u64 > self.server_limits.max_enqueue_batch as u64 {
+                return Err(Status::invalid_argument(format!(
+                    "batch exceeds max_enqueue_batch ({})",
+                    self.server_limits.max_enqueue_batch
+                )));
+            }
+
+            let registry = self.registry.load();
+            let mut errors: Vec<pb::JobValidationError> = Vec::new();
+            let mut valid: Vec<EnqueueRequest> = Vec::with_capacity(req.jobs.len());
+            for (index, job) in req.jobs.into_iter().enumerate() {
+                match self.classify_enqueue(&job, &registry) {
+                    Ok(()) => valid.push(job),
+                    Err(rejection) => {
+                        let label = rejection_label(&rejection);
+                        tracing::info!(
+                            queue = %job.queue,
+                            job_type = %job.job_type,
+                            index = index as u32,
+                            reason = label,
+                            "enqueue_atomic rejected job",
+                        );
+                        self.metrics.record_rejected(&job.queue, label);
+                        errors.push(pb::JobValidationError {
+                            index: index as u32,
+                            rejection: Some(rejection),
+                        });
+                    }
+                }
+            }
+
+            if !errors.is_empty() {
+                return Ok(Response::new(EnqueueAtomicResponse {
+                    outcome: Some(enqueue_atomic_response::Outcome::Rejection(
+                        pb::BatchValidationFailure { errors },
+                    )),
+                }));
+            }
+
+            let responses = self.commit_validated(valid).await?;
+            Ok(Response::new(EnqueueAtomicResponse {
+                outcome: Some(enqueue_atomic_response::Outcome::Success(
+                    pb::EnqueueAtomicSuccess { responses },
+                )),
+            }))
+        }
+        .instrument(span.clone())
+        .await;
+        self.metrics
+            .observe("enqueue_atomic", started, &span, &result);
         result
     }
 
@@ -321,7 +439,7 @@ impl QueueService for QueueServer {
                     .map(String::as_str)
                     .collect();
                 if !unknown.is_empty() {
-                    return Err(Status::invalid_argument(format!(
+                    return Err(Status::failed_precondition(format!(
                         "queue(s) not declared (strict mode): {unknown:?}"
                     )));
                 }

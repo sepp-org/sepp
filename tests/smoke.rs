@@ -9,7 +9,8 @@ use std::time::{Duration, SystemTime};
 use sepp::pb::sepp::v1::{
     AckRequest, EnqueueBatchRequest, EnqueueRequest, EnqueueResponse, ExtendRequest,
     GetServerInfoRequest, Job, NackRequest, NackRetry, Payload, PrimitiveValue, ReserveRequest,
-    job_result, nack_retry, primitive_value, queue_service_client::QueueServiceClient,
+    enqueue_atomic_response, job_rejection, job_result, nack_retry, primitive_value,
+    queue_service_client::QueueServiceClient,
 };
 use tonic::transport::Channel;
 
@@ -780,17 +781,12 @@ name = "smoke-strict-emails"
 
     let bad = enqueue_one(&client, enqueue_req("smoke-strict-ghost")).await;
     match bad.outcome {
-        Some(job_result::Outcome::Error(e)) => {
-            assert_eq!(
-                e.code, "UNKNOWN_QUEUE",
-                "rejection code identifies the cause"
-            );
-            assert!(
-                e.message.contains("smoke-strict-ghost"),
-                "rejection names the queue: {:?}",
-                e.message
-            );
-        }
+        Some(job_result::Outcome::Rejection(r)) => match r.reason {
+            Some(job_rejection::Reason::UnknownQueue(uq)) => {
+                assert_eq!(uq.queue, "smoke-strict-ghost");
+            }
+            other => panic!("expected UnknownQueue rejection, got {other:?}"),
+        },
         other => panic!("undeclared queue was not rejected: {other:?}"),
     }
 
@@ -805,7 +801,7 @@ name = "smoke-strict-emails"
         })
         .await
         .expect_err("reserve from undeclared queue is rejected");
-    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
 }
 
 #[tokio::test]
@@ -831,19 +827,13 @@ max_payload_bytes = 16
     )
     .await;
     match rejected.outcome {
-        Some(job_result::Outcome::Error(e)) => {
-            assert_eq!(e.code, "INVALID_ARGUMENT");
-            assert!(
-                e.message.contains("max_payload_bytes"),
-                "rejection mentions the limit: {:?}",
-                e.message
-            );
-            assert!(
-                e.message.contains("16"),
-                "rejection reports the per-queue limit value, not the global: {:?}",
-                e.message
-            );
-        }
+        Some(job_result::Outcome::Rejection(r)) => match r.reason {
+            Some(job_rejection::Reason::PayloadTooLarge(p)) => {
+                assert_eq!(p.limit, 16, "the per-queue limit is reported, not the global");
+                assert_eq!(p.actual, 1024);
+            }
+            other => panic!("expected PayloadTooLarge rejection, got {other:?}"),
+        },
         other => panic!("per-queue payload cap did not reject: {other:?}"),
     }
 
@@ -881,14 +871,13 @@ allowed_job_types = ["send_email"]
     )
     .await;
     match rejected.outcome {
-        Some(job_result::Outcome::Error(e)) => {
-            assert_eq!(e.code, "INVALID_ARGUMENT");
-            assert!(
-                e.message.contains("render_report"),
-                "rejection names the offending job_type: {:?}",
-                e.message
-            );
-        }
+        Some(job_result::Outcome::Rejection(r)) => match r.reason {
+            Some(job_rejection::Reason::JobTypeNotAllowed(j)) => {
+                assert_eq!(j.job_type, "render_report");
+                assert_eq!(j.allowed, vec!["send_email".to_string()]);
+            }
+            other => panic!("expected JobTypeNotAllowed rejection, got {other:?}"),
+        },
         other => panic!("disallowed job_type was not rejected: {other:?}"),
     }
 
@@ -947,4 +936,107 @@ async fn durability_survives_restart() {
     assert_eq!(job.id, job_id, "the same job survives a server restart");
     assert_eq!(job.attempt, 1);
     ack(&client, &job).await;
+}
+
+#[tokio::test]
+async fn enqueue_atomic_commits_when_every_job_validates() {
+    let (_guard, client) = start_server("atomic-ok").await;
+
+    let response = client
+        .clone()
+        .enqueue_atomic(EnqueueBatchRequest {
+            jobs: vec![
+                enqueue_req("atomic-ok-q"),
+                enqueue_req("atomic-ok-q"),
+                enqueue_req("atomic-ok-q"),
+            ],
+        })
+        .await
+        .expect("enqueue_atomic RPC")
+        .into_inner();
+
+    let success = match response.outcome {
+        Some(enqueue_atomic_response::Outcome::Success(s)) => s,
+        other => panic!("expected Success outcome, got {other:?}"),
+    };
+    assert_eq!(success.responses.len(), 3, "one response per submitted job");
+    for r in &success.responses {
+        assert!(!r.job_id.is_empty());
+        assert!(!r.deduplicated);
+    }
+
+    // All three jobs are actually enqueued.
+    let reserved = reserve_batch(&client, &["atomic-ok-q"], LEASE, WAIT, Some(10)).await;
+    assert_eq!(reserved.len(), 3, "every job in the atomic batch is reservable");
+}
+
+#[tokio::test]
+async fn enqueue_atomic_rejects_whole_batch_when_any_job_fails_validation() {
+    // strict_mode catches an unknown-queue rejection; the per-queue payload
+    // cap catches a payload-too-large rejection. The first job is valid —
+    // we use it to verify that nothing was enqueued when the batch fails.
+    let cfg = r#"
+[server]
+strict_queues = true
+
+[[queues]]
+name = "atomic-good"
+max_payload_bytes = 16
+"#;
+    let (_guard, client) = start_server_with_config("atomic-rej", cfg).await;
+
+    let oversize = Payload {
+        data: vec![0u8; 1024],
+        encoding: "application/octet-stream".to_string(),
+    };
+
+    let response = client
+        .clone()
+        .enqueue_atomic(EnqueueBatchRequest {
+            jobs: vec![
+                enqueue_req("atomic-good"), // index 0 — valid
+                enqueue_req("atomic-ghost"), // index 1 — unknown queue
+                EnqueueRequest {
+                    payload: Some(oversize),
+                    ..enqueue_req("atomic-good")
+                }, // index 2 — payload too large
+            ],
+        })
+        .await
+        .expect("enqueue_atomic RPC")
+        .into_inner();
+
+    let failure = match response.outcome {
+        Some(enqueue_atomic_response::Outcome::Rejection(f)) => f,
+        other => panic!("expected Rejection outcome, got {other:?}"),
+    };
+    assert_eq!(failure.errors.len(), 2, "both invalid jobs are reported");
+
+    // Errors come back in input order with the correct indices.
+    let unknown = &failure.errors[0];
+    assert_eq!(unknown.index, 1);
+    match unknown.rejection.as_ref().and_then(|r| r.reason.as_ref()) {
+        Some(job_rejection::Reason::UnknownQueue(uq)) => {
+            assert_eq!(uq.queue, "atomic-ghost");
+        }
+        other => panic!("expected UnknownQueue at index 1, got {other:?}"),
+    }
+
+    let oversized = &failure.errors[1];
+    assert_eq!(oversized.index, 2);
+    match oversized.rejection.as_ref().and_then(|r| r.reason.as_ref()) {
+        Some(job_rejection::Reason::PayloadTooLarge(p)) => {
+            assert_eq!(p.limit, 16);
+            assert_eq!(p.actual, 1024);
+        }
+        other => panic!("expected PayloadTooLarge at index 2, got {other:?}"),
+    }
+
+    // The valid job at index 0 must NOT have been enqueued — that's the
+    // whole point of atomic semantics.
+    let reserved = reserve_batch(&client, &["atomic-good"], LEASE, NO_WAIT, Some(10)).await;
+    assert!(
+        reserved.is_empty(),
+        "atomic rejection must not enqueue any job; reservable jobs: {reserved:?}"
+    );
 }

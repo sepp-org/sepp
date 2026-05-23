@@ -20,8 +20,7 @@ use uuid::Uuid;
 use crate::config::Config;
 use crate::metrics::{CycleMetrics, Metrics, QueueDepthSnapshot};
 use crate::pb::sepp::v1::{
-    EnqueueRequest, EnqueueResponse, ErrorDetails, ExtendRequest, Job, JobResult, NackRequest,
-    job_result, nack_retry,
+    EnqueueRequest, EnqueueResponse, ExtendRequest, Job, NackRequest, nack_retry,
 };
 use crate::queues::SharedRegistry;
 
@@ -196,14 +195,6 @@ fn stg_err(e: fjall::Error) -> Status {
     Status::internal(format!("storage error: {e}"))
 }
 
-fn status_to_error(s: &Status) -> ErrorDetails {
-    ErrorDetails {
-        code: format!("{:?}", s.code()),
-        message: s.message().to_string(),
-        context: HashMap::new(),
-    }
-}
-
 fn bump_queue(map: &mut HashMap<String, u64>, queue: &str) {
     *map.entry(queue.to_string()).or_default() += 1;
 }
@@ -371,39 +362,10 @@ fn resync(store: &Store, indexes: &mut Indexes) {
     }
 }
 
-enum PerJob {
-    Settled(JobResult),
-    Pending(EnqueueResponse),
-}
-
-impl PerJob {
-    fn resolve(self, outcome: &Result<(), Status>) -> JobResult {
-        match self {
-            PerJob::Settled(result) => result,
-            PerJob::Pending(resp) => match outcome {
-                Ok(()) => job_ok(resp),
-                Err(s) => job_err(s),
-            },
-        }
-    }
-}
-
-fn job_ok(resp: EnqueueResponse) -> JobResult {
-    JobResult {
-        outcome: Some(job_result::Outcome::Success(resp)),
-    }
-}
-
-fn job_err(s: &Status) -> JobResult {
-    JobResult {
-        outcome: Some(job_result::Outcome::Error(status_to_error(s))),
-    }
-}
-
 enum Command {
     Enqueue {
         jobs: Vec<EnqueueRequest>,
-        resp: oneshot::Sender<Vec<JobResult>>,
+        resp: oneshot::Sender<Result<Vec<EnqueueResponse>, Status>>,
     },
     Reserve {
         queues: Vec<String>,
@@ -573,10 +535,14 @@ fn run_rpc_cycle(
     for cmd in rpcs {
         match cmd {
             Command::Enqueue { jobs, resp } => {
-                let per_jobs = apply_enqueue(store, indexes, &mut tx, &mut cycle, jobs);
-                responders.push(Box::new(move |o| {
-                    let _ = resp.send(per_jobs.into_iter().map(|pj| pj.resolve(o)).collect());
-                }));
+                match apply_enqueue(store, indexes, &mut tx, &mut cycle, jobs) {
+                    Ok(enqueued) => responders.push(Box::new(move |o| {
+                        let _ = resp.send(o.clone().map(|()| enqueued));
+                    })),
+                    Err(e) => {
+                        let _ = resp.send(Err(e));
+                    }
+                }
             }
             Command::Reserve {
                 queues,
@@ -708,7 +674,7 @@ fn apply_enqueue(
     tx: &mut WriteTransaction<'_>,
     cycle: &mut Cycle,
     jobs: Vec<EnqueueRequest>,
-) -> Vec<PerJob> {
+) -> Result<Vec<EnqueueResponse>, Status> {
     let now = now_ms();
     let registry = store.registry.load();
     let mut results = Vec::with_capacity(jobs.len());
@@ -719,14 +685,14 @@ fn apply_enqueue(
 
         if let Some(key) = &req.idempotency_key {
             let dkey = dedup_key(&req.queue, key);
-            match tx.get(&store.dedup, &dkey) {
-                Ok(Some(existing)) => match decode_dedup(&existing) {
+            match tx.get(&store.dedup, &dkey).map_err(stg_err)? {
+                Some(existing) => match decode_dedup(&existing) {
                     Some((ts, job_id)) if now - ts < limits.dedup_window_ms => {
                         cycle.deduplicated(&req.queue);
-                        results.push(PerJob::Settled(job_ok(EnqueueResponse {
+                        results.push(EnqueueResponse {
                             job_id: job_id.to_owned(),
                             deduplicated: true,
-                        })));
+                        });
                         continue;
                     }
                     Some((ts, _)) => {
@@ -735,11 +701,7 @@ fn apply_enqueue(
                     }
                     None => {}
                 },
-                Ok(None) => {}
-                Err(e) => {
-                    results.push(PerJob::Settled(job_err(&stg_err(e))));
-                    continue;
-                }
+                None => {}
             }
         }
 
@@ -798,13 +760,13 @@ fn apply_enqueue(
         cycle.enqueued(&queue);
         cycle.dirty = true;
 
-        results.push(PerJob::Pending(EnqueueResponse {
+        results.push(EnqueueResponse {
             job_id: id,
             deduplicated: false,
-        }));
+        });
     }
 
-    results
+    Ok(results)
 }
 
 fn apply_reserve(
@@ -1325,8 +1287,11 @@ impl Storage {
             .map_err(|_| Status::internal("storage unavailable"))
     }
 
-    pub async fn enqueue(&self, jobs: Vec<EnqueueRequest>) -> Result<Vec<JobResult>, Status> {
-        self.send(|resp| Command::Enqueue { jobs, resp }).await
+    pub async fn enqueue(
+        &self,
+        jobs: Vec<EnqueueRequest>,
+    ) -> Result<Vec<EnqueueResponse>, Status> {
+        self.send(|resp| Command::Enqueue { jobs, resp }).await?
     }
 
     pub async fn reserve_once(
