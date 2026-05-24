@@ -8,8 +8,9 @@ use std::{
 };
 
 use fjall::{
-    KeyspaceCreateOptions, PersistMode, Readable, SingleWriterTxDatabase as TxDatabase,
-    SingleWriterTxKeyspace as TxKeyspace, SingleWriterWriteTx as WriteTransaction,
+    KeyspaceCreateOptions, KvSeparationOptions, PersistMode, Readable,
+    SingleWriterTxDatabase as TxDatabase, SingleWriterTxKeyspace as TxKeyspace,
+    SingleWriterWriteTx as WriteTransaction,
 };
 use prost::Message;
 use tokio::sync::{Notify, futures::Notified, oneshot};
@@ -1253,16 +1254,23 @@ impl Storage {
                  an OS crash or power loss can lose any writes the kernel has not yet flushed"
             );
         }
+
+        // Most reads we make in the hot path will have a match
+        let hits = || KeyspaceCreateOptions::default().expect_point_read_hits(true);
         let store = Store {
-            jobs: db.keyspace("jobs", KeyspaceCreateOptions::default)?,
-            payloads: db.keyspace("payloads", KeyspaceCreateOptions::default)?,
-            inflight: db.keyspace("inflight", KeyspaceCreateOptions::default)?,
-            dead_letters: db.keyspace("dead_letters", KeyspaceCreateOptions::default)?,
-            ready: db.keyspace("ready", KeyspaceCreateOptions::default)?,
+            jobs: db.keyspace("jobs", hits)?,
+            // Payloads ≥1 KiB land in blob files outside the LSM tree, so
+            // compaction only rewrites references rather than payload bytes.
+            payloads: db.keyspace("payloads", || {
+                hits().with_kv_separation(Some(KvSeparationOptions::default()))
+            })?,
+            inflight: db.keyspace("inflight", hits)?,
+            dead_letters: db.keyspace("dead_letters", hits)?,
+            ready: db.keyspace("ready", hits)?,
             dedup: db.keyspace("dedup", KeyspaceCreateOptions::default)?,
-            dedup_timers: db.keyspace("dedup_timers", KeyspaceCreateOptions::default)?,
-            scheduled: db.keyspace("scheduled", KeyspaceCreateOptions::default)?,
-            leases: db.keyspace("leases", KeyspaceCreateOptions::default)?,
+            dedup_timers: db.keyspace("dedup_timers", hits)?,
+            scheduled: db.keyspace("scheduled", hits)?,
+            leases: db.keyspace("leases", hits)?,
             db,
             params,
             registry,
@@ -1318,10 +1326,7 @@ impl Storage {
             .map_err(|_| Status::internal("storage unavailable"))
     }
 
-    pub async fn enqueue(
-        &self,
-        jobs: Vec<EnqueueRequest>,
-    ) -> Result<Vec<EnqueueResponse>, Status> {
+    pub async fn enqueue(&self, jobs: Vec<EnqueueRequest>) -> Result<Vec<EnqueueResponse>, Status> {
         self.send(|resp| Command::Enqueue { jobs, resp }).await?
     }
 
