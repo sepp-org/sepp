@@ -12,7 +12,7 @@ use sepp::pb::sepp::v1::{
     enqueue_atomic_response, job_rejection, job_result, nack_retry, primitive_value,
     queue_service_client::QueueServiceClient,
 };
-use tonic::transport::Channel;
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 
 type Client = QueueServiceClient<Channel>;
 
@@ -1038,5 +1038,94 @@ max_payload_bytes = 16
     assert!(
         reserved.is_empty(),
         "atomic rejection must not enqueue any job; reservable jobs: {reserved:?}"
+    );
+}
+
+#[tokio::test]
+async fn tls_secures_the_connection() {
+    let rcgen::CertifiedKey { cert, key_pair } =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("generate self-signed cert for localhost");
+    let cert_pem = cert.pem();
+    let key_pem = key_pair.serialize_pem();
+
+    let unique = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let cert_path = std::env::temp_dir().join(format!("sepp-smoke-tls-{unique}.crt"));
+    let key_path = std::env::temp_dir().join(format!("sepp-smoke-tls-{unique}.key"));
+    std::fs::write(&cert_path, &cert_pem).expect("write cert");
+    std::fs::write(&key_path, &key_pem).expect("write key");
+
+    let db_path = temp_db("tls");
+    let port = free_port();
+    let child = Command::new(env!("CARGO_BIN_EXE_sepp"))
+        .env("SEPP_SERVER__LISTEN_ADDR", format!("127.0.0.1:{port}"))
+        .env("SEPP_SERVER__DB_PATH", &db_path)
+        .env("SEPP_SERVER__TLS_CERT_PATH", &cert_path)
+        .env("SEPP_SERVER__TLS_KEY_PATH", &key_path)
+        .stdout(Stdio::null())
+        .spawn()
+        .expect("spawn sepp server");
+    let _guard = ServerGuard {
+        child,
+        db_path: Some(db_path),
+    };
+
+    let tls = ClientTlsConfig::new()
+        .ca_certificate(Certificate::from_pem(cert_pem.as_bytes()))
+        .domain_name("localhost");
+    let url = format!("https://localhost:{port}");
+
+    let mut last_err: Option<tonic::transport::Error> = None;
+    let mut client: Option<Client> = None;
+    for _ in 0..100 {
+        let endpoint = Endpoint::from_shared(url.clone())
+            .expect("valid endpoint URL")
+            .tls_config(tls.clone())
+            .expect("client TLS config");
+        match endpoint.connect().await {
+            Ok(channel) => {
+                client = Some(QueueServiceClient::new(channel));
+                break;
+            }
+            Err(e) => {
+                last_err = Some(e);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&cert_path);
+    let _ = std::fs::remove_file(&key_path);
+    let mut client = client.unwrap_or_else(|| {
+        panic!("TLS server did not become reachable on {url}: {last_err:?}")
+    });
+
+    // Round-trips a request to prove the TLS channel actually works end-to-end.
+    let info = client
+        .get_server_info(GetServerInfoRequest {})
+        .await
+        .expect("get_server_info over TLS")
+        .into_inner();
+    assert!(
+        !info.server_version.is_empty(),
+        "TLS roundtrip returned a usable response"
+    );
+
+    // A plaintext client must not be able to drive RPCs against a TLS-only
+    // server. tonic only does TCP at connect time — the h2/TLS handshake
+    // happens on first request — so we have to actually issue an RPC. The
+    // timeout guards against a stalled handshake.
+    let plaintext_url = format!("http://127.0.0.1:{port}");
+    let rpc = async {
+        let mut c = QueueServiceClient::connect(plaintext_url).await?;
+        c.get_server_info(GetServerInfoRequest {}).await?;
+        Ok::<_, Box<dyn std::error::Error>>(())
+    };
+    let plain = tokio::time::timeout(Duration::from_secs(3), rpc).await;
+    assert!(
+        matches!(plain, Err(_) | Ok(Err(_))),
+        "plaintext RPC unexpectedly succeeded against a TLS-only server"
     );
 }

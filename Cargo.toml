@@ -30,3 +30,6 @@ opentelemetry-semantic-conventions = "0.31"
 tonic-prost-build = "0.14"
 prost-build = "0.14"
 prost-reflect-build = "0.16"
+
+[dev-dependencies]
+rcgen = "0.13"
