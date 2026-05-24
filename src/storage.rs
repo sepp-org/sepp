@@ -20,7 +20,7 @@ use uuid::Uuid;
 use crate::config::Config;
 use crate::metrics::{CycleMetrics, Metrics, QueueDepthSnapshot};
 use crate::pb::sepp::v1::{
-    EnqueueRequest, EnqueueResponse, ExtendRequest, Job, NackRequest, nack_retry,
+    EnqueueRequest, EnqueueResponse, ExtendRequest, Job, NackRequest, Payload, nack_retry,
 };
 use crate::queues::SharedRegistry;
 
@@ -38,6 +38,7 @@ struct StorageParams {
 
 struct Store {
     db: TxDatabase,
+    jobs: TxKeyspace,
     payloads: TxKeyspace,
     inflight: TxKeyspace,
     dead_letters: TxKeyspace,
@@ -301,7 +302,7 @@ fn warn_on_undeclared_persisted_queues(store: &Store) {
     let registry = store.registry.load();
     let mut undeclared: BTreeSet<String> = BTreeSet::new();
     let snap = store.db.read_tx();
-    for guard in snap.iter(&store.payloads) {
+    for guard in snap.iter(&store.jobs) {
         let Ok((_, value)) = guard.into_inner() else {
             continue;
         };
@@ -333,7 +334,7 @@ fn rebuild_indexes(store: &Store) -> Result<Indexes, fjall::Error> {
         let (key, _) = guard.into_inner()?;
         let queue = key
             .get(8..)
-            .and_then(|job_id| snap.get(&store.payloads, job_id).ok().flatten())
+            .and_then(|job_id| snap.get(&store.jobs, job_id).ok().flatten())
             .and_then(|stored| read_queue(&stored).map(str::to_owned))
             .unwrap_or_default();
         indexes.scheduled.insert(key.to_vec(), &queue);
@@ -707,10 +708,11 @@ fn apply_enqueue(
 
         let id = Uuid::new_v4().to_string();
         let queue = req.queue;
+        let payload = req.payload;
         let job = Job {
             id: id.clone(),
             job_type: req.job_type,
-            payload: req.payload,
+            payload: None,
             priority: req.priority.unwrap_or(limits.default_priority),
             trace_context: req.trace_context,
             enqueued_at: now,
@@ -725,10 +727,17 @@ fn apply_enqueue(
         };
 
         tx.insert(
-            &store.payloads,
+            &store.jobs,
             id.clone().into_bytes(),
             encode_job(&queue, &job),
         );
+        if let Some(payload) = payload {
+            tx.insert(
+                &store.payloads,
+                id.clone().into_bytes(),
+                payload.encode_to_vec(),
+            );
+        }
         match job.scheduled_at {
             Some(at) if at > now => {
                 let tk = timer_key(at, &id);
@@ -799,7 +808,7 @@ fn apply_reserve(
                 }
             };
 
-            let stored = match tx.get(&store.payloads, job_id.as_bytes()) {
+            let stored = match tx.get(&store.jobs, job_id.as_bytes()) {
                 Ok(Some(stored)) => stored,
                 Ok(None) => {
                     tx.remove(&store.ready, ready_k);
@@ -824,6 +833,26 @@ fn apply_reserve(
                     continue;
                 }
             };
+
+            match tx.get(&store.payloads, job_id.as_bytes()) {
+                Ok(Some(bytes)) => match Payload::decode(&*bytes) {
+                    Ok(payload) => job.payload = Some(payload),
+                    Err(e) => {
+                        warn!(error = %e, "reserve skipping corrupt payload");
+                        tx.remove(&store.ready, ready_k);
+                        cycle.dirty = true;
+                        continue;
+                    }
+                },
+                Ok(None) => {}
+                Err(e) => {
+                    indexes.ready.insert(ready_k, attempt);
+                    if jobs.is_empty() {
+                        return Err(stg_err(e));
+                    }
+                    return Ok(jobs);
+                }
+            }
 
             let lease_expires_at = now_ms() + lease_ms as i64;
             job.attempt = attempt;
@@ -871,6 +900,7 @@ fn apply_ack(
     if inflight.attempt != attempt {
         return Err(Status::failed_precondition("attempt mismatch"));
     }
+    tx.remove(&store.jobs, job_id.as_bytes().to_vec());
     tx.remove(&store.payloads, job_id.as_bytes().to_vec());
     tx.remove(&store.inflight, job_id.as_bytes().to_vec());
     let lease_timer = timer_key(inflight.lease_expires_at, job_id);
@@ -1023,7 +1053,7 @@ fn apply_sweep(
         let Some(job_id) = timer_k.get(8..) else {
             continue;
         };
-        let Some(stored) = tx.get(&store.payloads, job_id).map_err(stg_err)? else {
+        let Some(stored) = tx.get(&store.jobs, job_id).map_err(stg_err)? else {
             continue;
         };
         let (queue, job) = match decode_job(&stored) {
@@ -1224,6 +1254,7 @@ impl Storage {
             );
         }
         let store = Store {
+            jobs: db.keyspace("jobs", KeyspaceCreateOptions::default)?,
             payloads: db.keyspace("payloads", KeyspaceCreateOptions::default)?,
             inflight: db.keyspace("inflight", KeyspaceCreateOptions::default)?,
             dead_letters: db.keyspace("dead_letters", KeyspaceCreateOptions::default)?,
