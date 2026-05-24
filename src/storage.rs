@@ -28,7 +28,7 @@ use crate::queues::SharedRegistry;
 pub fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or(Duration::ZERO)
         .as_millis() as i64
 }
 
@@ -42,7 +42,6 @@ struct Store {
     jobs: TxKeyspace,
     payloads: TxKeyspace,
     inflight: TxKeyspace,
-    dead_letters: TxKeyspace,
     ready: TxKeyspace,
     dedup: TxKeyspace,
     dedup_timers: TxKeyspace,
@@ -177,20 +176,6 @@ fn decode_inflight(bytes: &[u8]) -> Result<Inflight, Status> {
         max_attempts,
         queue,
     })
-}
-
-#[derive(Clone, Copy)]
-enum DeadLetterCause {
-    Rejected = 0,
-    AttemptsExhausted = 1,
-    LeaseExpired = 2,
-}
-
-fn encode_dead_letter(dead_lettered_at: i64, cause: DeadLetterCause) -> Vec<u8> {
-    let mut v = Vec::with_capacity(9);
-    v.extend_from_slice(&dead_lettered_at.to_be_bytes());
-    v.push(cause as u8);
-    v
 }
 
 fn stg_err(e: fjall::Error) -> Status {
@@ -505,6 +490,9 @@ fn run_committer(
             match rx.recv_timeout(wait) {
                 Ok(c) => Some(c),
                 Err(flume::RecvTimeoutError::Timeout) => None,
+                // Channel closed only when every Storage handle has dropped,
+                // which means the gRPC server has already stopped accepting
+                // requests.
                 Err(flume::RecvTimeoutError::Disconnected) => break,
             }
         };
@@ -612,6 +600,10 @@ fn run_rpc_cycle(
         if let Some(m) = &cycle.metrics {
             store.metrics.flush_cycle(m);
         }
+        // Must wake *after* the commit lands. tokio::Notify only delivers to
+        // waiters armed before the wake, so a wake issued pre-commit could be
+        // followed by an arm+reserve that then fails to see the new ready
+        // entry if the commit ultimately fails or is rolled back.
         for queue in &cycle.new_ready {
             notifiers.wake(queue);
         }
@@ -643,6 +635,7 @@ fn run_sweep_cycle(store: &Store, indexes: &mut Indexes, notifiers: &QueueNotifi
     if let Some(m) = &cycle.metrics {
         store.metrics.flush_cycle(m);
     }
+    // Post-commit, same reason as in run_rpc_cycle.
     for queue in &cycle.new_ready {
         notifiers.wake(queue);
     }
@@ -788,6 +781,8 @@ fn apply_reserve(
     lease_ms: u64,
     max_jobs: usize,
 ) -> Result<Vec<Job>, Status> {
+    let now = now_ms();
+    let lease_expires_at = now.saturating_add(i64::try_from(lease_ms).unwrap_or(i64::MAX));
     let mut jobs = Vec::new();
     for queue in queues {
         if jobs.len() >= max_jobs {
@@ -828,8 +823,10 @@ fn apply_reserve(
             let (job_queue, mut job) = match decode_job(&stored) {
                 Ok(decoded) => decoded,
                 Err(e) => {
-                    warn!(error = %e, "reserve skipping corrupt job");
+                    warn!(error = %e, "reserve dropping corrupt job");
                     tx.remove(&store.ready, ready_k);
+                    tx.remove(&store.jobs, job_id.as_bytes().to_vec());
+                    tx.remove(&store.payloads, job_id.as_bytes().to_vec());
                     cycle.dirty = true;
                     continue;
                 }
@@ -839,8 +836,10 @@ fn apply_reserve(
                 Ok(Some(bytes)) => match Payload::decode(&*bytes) {
                     Ok(payload) => job.payload = Some(payload),
                     Err(e) => {
-                        warn!(error = %e, "reserve skipping corrupt payload");
+                        warn!(error = %e, "reserve dropping job with corrupt payload");
                         tx.remove(&store.ready, ready_k);
+                        tx.remove(&store.jobs, job_id.as_bytes().to_vec());
+                        tx.remove(&store.payloads, job_id.as_bytes().to_vec());
                         cycle.dirty = true;
                         continue;
                     }
@@ -855,7 +854,6 @@ fn apply_reserve(
                 }
             }
 
-            let lease_expires_at = now_ms() + lease_ms as i64;
             job.attempt = attempt;
             job.lease_expires_at = lease_expires_at;
 
@@ -919,6 +917,7 @@ fn apply_nack(
     cycle: &mut Cycle,
     req: NackRequest,
 ) -> Result<bool, Status> {
+    let now = now_ms();
     let stored = tx
         .get(&store.inflight, req.job_id.as_bytes())
         .map_err(stg_err)?
@@ -943,16 +942,13 @@ fn apply_nack(
         _ => 0,
     };
     if force_dead_letter || inflight.attempt >= inflight.max_attempts {
-        let (cause, cause_label) = if force_dead_letter {
-            (DeadLetterCause::Rejected, "rejected")
+        let cause_label = if force_dead_letter {
+            "rejected"
         } else {
-            (DeadLetterCause::AttemptsExhausted, "attempts_exhausted")
+            "attempts_exhausted"
         };
-        tx.insert(
-            &store.dead_letters,
-            req.job_id.clone().into_bytes(),
-            encode_dead_letter(now_ms(), cause),
-        );
+        tx.remove(&store.jobs, req.job_id.as_bytes().to_vec());
+        tx.remove(&store.payloads, req.job_id.as_bytes().to_vec());
         tx.remove(&store.inflight, req.job_id.into_bytes());
         tx.remove(&store.leases, lease_timer.clone());
         indexes.leases.remove(&lease_timer);
@@ -964,7 +960,7 @@ fn apply_nack(
 
     let attempt = inflight.attempt + 1;
     if retry_delay_ms > 0 {
-        let deadline = now_ms().saturating_add(i64::try_from(retry_delay_ms).unwrap_or(i64::MAX));
+        let deadline = now.saturating_add(i64::try_from(retry_delay_ms).unwrap_or(i64::MAX));
         let tk = timer_key(deadline, &req.job_id);
         tx.insert(&store.scheduled, tk.clone(), attempt.to_be_bytes().to_vec());
         indexes.scheduled.insert(tk, &inflight.queue);
@@ -1008,7 +1004,9 @@ fn apply_extend(
         .effective(&inflight.queue)
         .max_lease_duration_ms;
     let old_timer = timer_key(inflight.lease_expires_at, &req.job_id);
-    let lease_expires_at = now_ms() + req.lease_duration_ms.min(max_lease) as i64;
+    let lease_ms = req.lease_duration_ms.min(max_lease);
+    let lease_expires_at =
+        now_ms().saturating_add(i64::try_from(lease_ms).unwrap_or(i64::MAX));
     inflight.lease_expires_at = lease_expires_at;
 
     tx.insert(
@@ -1102,11 +1100,8 @@ fn apply_sweep(
                 attempt = inflight.attempt,
                 "job dead-lettered: lease expired with attempts exhausted"
             );
-            tx.insert(
-                &store.dead_letters,
-                job_id.to_vec(),
-                encode_dead_letter(now, DeadLetterCause::LeaseExpired),
-            );
+            tx.remove(&store.jobs, job_id.to_vec());
+            tx.remove(&store.payloads, job_id.to_vec());
             tx.remove(&store.inflight, job_id.to_vec());
             cycle.dead_lettered(&inflight.queue, "lease_expired");
         } else {
@@ -1265,7 +1260,6 @@ impl Storage {
                 hits().with_kv_separation(Some(KvSeparationOptions::default()))
             })?,
             inflight: db.keyspace("inflight", hits)?,
-            dead_letters: db.keyspace("dead_letters", hits)?,
             ready: db.keyspace("ready", hits)?,
             dedup: db.keyspace("dedup", KeyspaceCreateOptions::default)?,
             dedup_timers: db.keyspace("dedup_timers", hits)?,
@@ -1483,19 +1477,6 @@ mod tests {
         });
         bytes.extend_from_slice(&[0xff, 0xff]);
         assert!(decode_inflight(&bytes).is_err());
-    }
-
-    #[test]
-    fn dead_letter_marker_carries_timestamp_and_cause() {
-        let v = encode_dead_letter(123_456, DeadLetterCause::LeaseExpired);
-        assert_eq!(v.len(), 9);
-        assert_eq!(i64::from_be_bytes(v[..8].try_into().unwrap()), 123_456);
-        assert_eq!(v[8], 2);
-        assert_eq!(encode_dead_letter(0, DeadLetterCause::Rejected)[8], 0);
-        assert_eq!(
-            encode_dead_letter(0, DeadLetterCause::AttemptsExhausted)[8],
-            1
-        );
     }
 
     #[test]

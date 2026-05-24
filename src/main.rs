@@ -32,23 +32,30 @@ fn config_path_arg() -> Option<String> {
 
 fn handle_subcommand() -> Option<ExitCode> {
     let mut args = std::env::args().skip(1);
-    if args.next().as_deref() != Some("config") {
-        return None;
-    }
-
     match args.next().as_deref() {
-        Some("example") => {
-            print!("{EXAMPLE_CONFIG}");
-            Some(ExitCode::SUCCESS)
-        }
-        Some(other) => {
-            eprintln!("sepp config: unknown subcommand '{other}'\n\nusage: sepp config example");
+        Some("config") => match args.next().as_deref() {
+            Some("example") => {
+                print!("{EXAMPLE_CONFIG}");
+                Some(ExitCode::SUCCESS)
+            }
+            Some(other) => {
+                eprintln!(
+                    "sepp config: unknown subcommand '{other}'\n\nusage: sepp config example"
+                );
+                Some(ExitCode::FAILURE)
+            }
+            None => {
+                eprintln!("sepp config: missing subcommand\n\nusage: sepp config example");
+                Some(ExitCode::FAILURE)
+            }
+        },
+        Some(arg) if !arg.starts_with('-') => {
+            eprintln!(
+                "sepp: unknown subcommand '{arg}'\n\nusage: sepp [config example] [--config <path>]"
+            );
             Some(ExitCode::FAILURE)
         }
-        None => {
-            eprintln!("sepp config: missing subcommand\n\nusage: sepp config example");
-            Some(ExitCode::FAILURE)
-        }
+        _ => None,
     }
 }
 

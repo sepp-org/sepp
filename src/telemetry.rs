@@ -9,7 +9,7 @@ use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
 use tonic::metadata::MetadataMap;
 use tracing::Span;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
-use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::layer::{Layer, SubscriberExt};
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt};
 
@@ -65,10 +65,10 @@ pub fn init(
     opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
 
     let otel_layer = tracing_opentelemetry::layer().with_tracer(provider.tracer("sepp"));
-    let registry = tracing_subscriber::registry().with(filter).with(otel_layer);
+    let registry = tracing_subscriber::registry().with(otel_layer);
     match logging.format {
-        LogFormat::Text => registry.with(fmt::layer()).init(),
-        LogFormat::Json => registry.with(fmt::layer().json()).init(),
+        LogFormat::Text => registry.with(fmt::layer().with_filter(filter)).init(),
+        LogFormat::Json => registry.with(fmt::layer().json().with_filter(filter)).init(),
     }
 
     Ok(TelemetryGuard {
