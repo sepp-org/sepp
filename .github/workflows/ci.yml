@@ -79,6 +79,7 @@ jobs:
       contents: read
       packages: write
       security-events: write
+      actions: read
     steps:
       - name: Set platform pair
         run: |
