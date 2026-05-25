@@ -1,0 +1,11 @@
+target
+.git
+.github
+.gitignore
+sepp-data
+dev
+bench
+*.md
+Dockerfile
+.dockerignore
+sepp.toml
