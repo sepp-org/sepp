@@ -680,8 +680,8 @@ fn apply_enqueue(
 
         if let Some(key) = &req.idempotency_key {
             let dkey = dedup_key(&req.queue, key);
-            match tx.get(&store.dedup, &dkey).map_err(stg_err)? {
-                Some(existing) => match decode_dedup(&existing) {
+            if let Some(existing) = tx.get(&store.dedup, &dkey).map_err(stg_err)? {
+                match decode_dedup(&existing) {
                     Some((ts, job_id)) if now - ts < limits.dedup_window_ms => {
                         cycle.deduplicated(&req.queue);
                         results.push(EnqueueResponse {
@@ -695,8 +695,7 @@ fn apply_enqueue(
                             Some(dedup_timer_key(ts + limits.dedup_window_ms, &dkey));
                     }
                     None => {}
-                },
-                None => {}
+                }
             }
         }
 
@@ -1005,8 +1004,7 @@ fn apply_extend(
         .max_lease_duration_ms;
     let old_timer = timer_key(inflight.lease_expires_at, &req.job_id);
     let lease_ms = req.lease_duration_ms.min(max_lease);
-    let lease_expires_at =
-        now_ms().saturating_add(i64::try_from(lease_ms).unwrap_or(i64::MAX));
+    let lease_expires_at = now_ms().saturating_add(i64::try_from(lease_ms).unwrap_or(i64::MAX));
     inflight.lease_expires_at = lease_expires_at;
 
     tx.insert(
