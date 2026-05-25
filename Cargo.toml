@@ -9,21 +9,21 @@ tonic-prost = "0.14"
 tokio = { version = "1", features = ["full"] }
 prost = "0.14"
 prost-types = "0.14"
-prost-reflect = "0.16"
-prost-protovalidate = "0.3"
+prost-reflect = "0.16.4"
+prost-protovalidate = "0.4"
 uuid = { version = "1.23.1", features = ["v4"] }
 fjall = "3"
-flume = "0.11"
+flume = "0.12"
 serde = { version = "1", features = ["derive"] }
 figment = { version = "0.10", features = ["toml", "env"] }
 arc-swap = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-opentelemetry = { version = "0.31", default-features = false, features = ["trace", "metrics"] }
-opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace", "metrics", "rt-tokio"] }
-opentelemetry-otlp = { version = "0.31", default-features = false, features = ["grpc-tonic", "trace", "metrics"] }
-tracing-opentelemetry = "0.32.1"
-opentelemetry-semantic-conventions = "0.31"
+opentelemetry = { version = "0.32", default-features = false, features = ["trace", "metrics"] }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "metrics", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "trace", "metrics"] }
+tracing-opentelemetry = "0.33"
+opentelemetry-semantic-conventions = "0.32"
 
 
 [build-dependencies]
@@ -32,7 +32,7 @@ prost-build = "0.14"
 prost-reflect-build = "0.16"
 
 [dev-dependencies]
-rcgen = "0.13"
+rcgen = "0.14"
 
 [profile.release]
 lto = "fat"

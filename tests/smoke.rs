@@ -1050,11 +1050,11 @@ max_payload_bytes = 16
 
 #[tokio::test]
 async fn tls_secures_the_connection() {
-    let rcgen::CertifiedKey { cert, key_pair } =
+    let rcgen::CertifiedKey { cert, signing_key } =
         rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
             .expect("generate self-signed cert for localhost");
     let cert_pem = cert.pem();
-    let key_pem = key_pair.serialize_pem();
+    let key_pem = signing_key.serialize_pem();
 
     let unique = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
