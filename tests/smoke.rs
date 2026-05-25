@@ -829,7 +829,10 @@ max_payload_bytes = 16
     match rejected.outcome {
         Some(job_result::Outcome::Rejection(r)) => match r.reason {
             Some(job_rejection::Reason::PayloadTooLarge(p)) => {
-                assert_eq!(p.limit, 16, "the per-queue limit is reported, not the global");
+                assert_eq!(
+                    p.limit, 16,
+                    "the per-queue limit is reported, not the global"
+                );
                 assert_eq!(p.actual, 1024);
             }
             other => panic!("expected PayloadTooLarge rejection, got {other:?}"),
@@ -967,7 +970,11 @@ async fn enqueue_atomic_commits_when_every_job_validates() {
 
     // All three jobs are actually enqueued.
     let reserved = reserve_batch(&client, &["atomic-ok-q"], LEASE, WAIT, Some(10)).await;
-    assert_eq!(reserved.len(), 3, "every job in the atomic batch is reservable");
+    assert_eq!(
+        reserved.len(),
+        3,
+        "every job in the atomic batch is reservable"
+    );
 }
 
 #[tokio::test]
@@ -994,7 +1001,7 @@ max_payload_bytes = 16
         .clone()
         .enqueue_atomic(EnqueueBatchRequest {
             jobs: vec![
-                enqueue_req("atomic-good"), // index 0 — valid
+                enqueue_req("atomic-good"),  // index 0 — valid
                 enqueue_req("atomic-ghost"), // index 1 — unknown queue
                 EnqueueRequest {
                     payload: Some(oversize),
@@ -1098,9 +1105,8 @@ async fn tls_secures_the_connection() {
     }
     let _ = std::fs::remove_file(&cert_path);
     let _ = std::fs::remove_file(&key_path);
-    let mut client = client.unwrap_or_else(|| {
-        panic!("TLS server did not become reachable on {url}: {last_err:?}")
-    });
+    let mut client = client
+        .unwrap_or_else(|| panic!("TLS server did not become reachable on {url}: {last_err:?}"));
 
     // Round-trips a request to prove the TLS channel actually works end-to-end.
     let info = client

@@ -33,3 +33,7 @@ prost-reflect-build = "0.16"
 
 [dev-dependencies]
 rcgen = "0.13"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1

@@ -68,7 +68,9 @@ pub fn init(
     let registry = tracing_subscriber::registry().with(otel_layer);
     match logging.format {
         LogFormat::Text => registry.with(fmt::layer().with_filter(filter)).init(),
-        LogFormat::Json => registry.with(fmt::layer().json().with_filter(filter)).init(),
+        LogFormat::Json => registry
+            .with(fmt::layer().json().with_filter(filter))
+            .init(),
     }
 
     Ok(TelemetryGuard {
