@@ -214,16 +214,16 @@ dependencies = [
 
 [[package]]
 name = "cel"
-version = "0.12.0"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ca1e5eda1b0f8476181bed1bfc9232a91d62ff0b9f1bc0e48afff3cbcb5b0b5c"
+checksum = "47a40f338a8c3505921000b609279775792c07cc21f97a3011578c0c5e1738ae"
 dependencies = [
  "antlr4rust",
  "base64",
  "chrono",
  "lazy_static",
  "nom",
- "paste",
+ "pastey",
  "regex",
  "serde",
  "serde_json",
@@ -1048,10 +1048,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "paste"
-version = "1.0.15"
+name = "pastey"
+version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
+checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
 
 [[package]]
 name = "pear"
@@ -1222,9 +1222,9 @@ dependencies = [
 
 [[package]]
 name = "prost-protovalidate"
-version = "0.3.0"
+version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3807965edce2730437ec19f99eae81064d152421c4c875a3e8f9e80cf2dd234"
+checksum = "ff8209d33e8a1413ac984fb31321bb79e766d2b7d0155349d5fba548ba17fe3c"
 dependencies = [
  "cel",
  "chrono",
@@ -1240,9 +1240,9 @@ dependencies = [
 
 [[package]]
 name = "prost-protovalidate-types"
-version = "0.3.0"
+version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ddb5c8151aa3da0ea9ba5d91b170c7763b6c7c7352c3643d57b2b28de29afde9"
+checksum = "db4eb32c0c075c311ba84053bb475b5ee6930b6a142f66015e5b55fca0d3b635"
 dependencies = [
  "prost",
  "prost-build",
@@ -1254,9 +1254,9 @@ dependencies = [
 
 [[package]]
 name = "prost-reflect"
-version = "0.16.3"
+version = "0.16.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b89455ef41ed200cafc47c76c552ee7792370ac420497e551f16123a9135f76e"
+checksum = "590aa145fee8f7a26b5a6055365e7c5e89a5c1caae9869de76ec0ee73181a2f9"
 dependencies = [
  "base64",
  "prost",
