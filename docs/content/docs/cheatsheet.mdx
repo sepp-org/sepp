@@ -1,0 +1,485 @@
+---
+title: MDX cheatsheet
+description: Every Fumadocs and Sepp-themed building block on a single page — copy what you need into your own pages.
+---
+
+Lorem ipsum dolor sit amet, consectetur adipiscing elit. This page is a live
+reference for everything the docs site supports. Each section shows the
+**syntax** and the **rendered result** side by side. Copy the source verbatim
+into a new MDX file under `content/docs/` and it will render the same way.
+
+## Frontmatter
+
+Every page starts with a YAML block. The two keys actually used are `title`
+(shown in the H1, sidebar, and search) and `description` (shown as the lead
+paragraph and in `<meta>` tags).
+
+```mdx
+---
+title: My page
+description: One-line summary, also indexed by search.
+---
+```
+
+## Headings
+
+Use plain `#`, `##`, `###`. Fumadocs auto-generates ids and wraps each heading
+in an anchor link — hover any heading to see the chain icon. The right-rail
+TOC is built from H2 and H3 entries.
+
+```md
+## A second-level heading
+### A third-level heading
+#### A fourth-level heading
+```
+
+### Third-level example
+
+#### Fourth-level example
+
+## Paragraph text & inline emphasis
+
+Lorem ipsum dolor sit amet. **Bold text** carries weight; *italic text*
+whispers; ~~strikethrough~~ marks a retraction. Use `inline code` for short
+identifiers, file names like `Cargo.toml`, or short shell snippets like
+`cargo build --release`. Long passages just wrap normally — line length is
+clamped at 760 px so reading stays comfortable.
+
+```md
+**bold**, *italic*, ~~strikethrough~~, `inline code`
+```
+
+## Links
+
+Internal links use the same path the file lives at:
+
+- A [link to itself](/docs/cheatsheet) (same page)
+- A [link to the docs root](/docs) (index)
+
+External links open the same way:
+
+- [Fumadocs](https://fumadocs.dev), [Next.js](https://nextjs.org).
+
+```md
+[Internal](/docs/cheatsheet)
+[External](https://fumadocs.dev)
+```
+
+## Lists
+
+### Unordered
+
+- Lorem ipsum
+- Dolor sit amet
+- Consectetur adipiscing
+  - Nested item one
+  - Nested item two
+
+### Ordered
+
+1. First step
+2. Second step
+3. Third step
+
+### Task list
+
+- [x] Done item
+- [x] Another done item
+- [ ] Pending item
+
+```md
+- [x] done
+- [ ] todo
+```
+
+## Blockquote
+
+> "Sed ut perspiciatis unde omnis iste natus error sit voluptatem accusantium
+> doloremque laudantium." Use a blockquote for pull quotes, citations, or
+> high-signal asides.
+
+```md
+> Quote text spans multiple
+> lines with leading `>`.
+```
+
+## Horizontal rule
+
+---
+
+```md
+---
+```
+
+## Inline code & code blocks
+
+### Single code block with a filename
+
+`````md
+```rust title="src/main.rs"
+fn main() {
+    println!("Hello, world!");
+}
+```
+`````
+
+```rust title="src/main.rs"
+fn main() {
+    println!("Hello, world!");
+}
+```
+
+### Highlighted lines
+
+`````md
+```rust {2,4-5}
+fn main() {
+    let answer = 42;
+    println!("Pondering…");
+    let twice = answer * 2;
+    println!("answer is {twice}");
+}
+```
+`````
+
+```rust {2,4-5}
+fn main() {
+    let answer = 42;
+    println!("Pondering…");
+    let twice = answer * 2;
+    println!("answer is {twice}");
+}
+```
+
+### Multi-language tabs (Sepp-themed `<LangTabs>`)
+
+`````mdx
+<LangTabs items={['Rust', 'Python', 'Go']} groupId="hello">
+  ```rust
+  fn main() { println!("hello"); }
+  ```
+  ```python
+  print("hello")
+  ```
+  ```go
+  fmt.Println("hello")
+  ```
+</LangTabs>
+`````
+
+<LangTabs items={['Rust', 'Python', 'Go']} groupId="hello">
+
+```rust
+fn main() {
+    println!("hello");
+}
+```
+
+```python
+print("hello")
+```
+
+```go
+package main
+import "fmt"
+func main() { fmt.Println("hello") }
+```
+
+</LangTabs>
+
+### Plain Fumadocs `<Tabs>` (non-code variants)
+
+```mdx
+<Tabs items={['npm', 'pnpm', 'yarn']}>
+  <Tab value="npm">`npm install sepp`</Tab>
+  <Tab value="pnpm">`pnpm add sepp`</Tab>
+  <Tab value="yarn">`yarn add sepp`</Tab>
+</Tabs>
+```
+
+<Tabs items={['npm', 'pnpm', 'yarn']}>
+  <Tab value="npm">`npm install sepp`</Tab>
+  <Tab value="pnpm">`pnpm add sepp`</Tab>
+  <Tab value="yarn">`yarn add sepp`</Tab>
+</Tabs>
+
+## Callouts
+
+Three flavors, each with its own palette. The `title` prop is optional.
+
+```mdx
+<Callout type="note" title="Heads up">
+Lorem ipsum dolor sit amet.
+</Callout>
+```
+
+<Callout type="note" title="Heads up">
+Lorem ipsum dolor sit amet, consectetur adipiscing elit. Use **note** for
+neutral asides — context that's helpful but not urgent.
+</Callout>
+
+<Callout type="info" title="Good to know">
+Use **info** for tips, configuration hints, or "here's how this actually
+works" explanations.
+</Callout>
+
+<Callout type="warn" title="Be careful">
+Use **warn** for footguns, breaking changes, and irreversible operations.
+</Callout>
+
+## Cards
+
+A grid of links. Each card takes `href`, `title`, optional `description`, and
+optional `icon`.
+
+```mdx
+<Cards>
+  <Card
+    href="/docs/cheatsheet"
+    title="Cards in a grid"
+    description="2 columns by default, single column under 640 px."
+    icon={<IconLayers size={18} />}
+  />
+</Cards>
+```
+
+<Cards>
+  <Card
+    href="/docs/cheatsheet#frontmatter"
+    title="Frontmatter"
+    description="YAML at the top of every MDX file."
+    icon={<IconLayers size={18} />}
+  />
+  <Card
+    href="/docs/cheatsheet#code-blocks-and-tabs"
+    title="Code blocks"
+    description="Shiki-highlighted, filenames, line-highlighted, tabbed."
+    icon={<IconBolt size={18} />}
+  />
+  <Card
+    href="/docs/cheatsheet#callouts"
+    title="Callouts"
+    description="Note, info, warn — same anatomy, different palette."
+    icon={<IconTerminal size={18} />}
+  />
+  <Card
+    href="/docs/cheatsheet#steps"
+    title="Steps"
+    description="Numbered checklist with a connecting rail."
+    icon={<IconBook size={18} />}
+  />
+</Cards>
+
+## Steps
+
+A numbered, vertically-connected walkthrough. Each `<Step>` is one item.
+
+```mdx
+<Steps>
+  <Step>
+    ### First do this
+    Lorem ipsum…
+  </Step>
+  <Step>
+    ### Then do this
+    Dolor sit amet…
+  </Step>
+</Steps>
+```
+
+<Steps>
+  <Step>
+    ### Install
+    Pull the binary from the releases page, or `cargo install sepp`.
+  </Step>
+  <Step>
+    ### Run
+    `sepp --bind 127.0.0.1:11400`. The server logs `ready` once the WAL is
+    open.
+  </Step>
+  <Step>
+    ### Connect
+    Use your favorite client — every first-party client speaks the same
+    line protocol.
+  </Step>
+</Steps>
+
+## File tree
+
+For describing project layouts. `Folder` accepts `defaultOpen`.
+
+```mdx
+<Files>
+  <Folder name="src" defaultOpen>
+    <File name="main.rs" />
+    <File name="lib.rs" />
+  </Folder>
+  <File name="Cargo.toml" />
+</Files>
+```
+
+<Files>
+  <Folder name="src" defaultOpen>
+    <Folder name="bin">
+      <File name="server.rs" />
+      <File name="cli.rs" />
+    </Folder>
+    <File name="lib.rs" />
+    <File name="error.rs" />
+  </Folder>
+  <Folder name="tests">
+    <File name="integration.rs" />
+  </Folder>
+  <File name="Cargo.toml" />
+  <File name="README.md" />
+</Files>
+
+## Accordion
+
+Collapsible sections — useful for FAQs or "advanced configuration".
+
+```mdx
+<Accordions>
+  <Accordion title="What is Sepp?">
+    A job queue server.
+  </Accordion>
+</Accordions>
+```
+
+<Accordions>
+  <Accordion title="What does the WAL contain?">
+    Every state-changing operation in insertion order — `put`, `reserve`,
+    `ack`, `bury`, `kick`. On restart, Sepp replays the log to rebuild
+    in-memory state.
+  </Accordion>
+  <Accordion title="Can I run Sepp in a container?">
+    Yes — the multi-arch image is at `ghcr.io/sepp-org/sepp`. Mount a volume
+    at `/var/lib/sepp` to keep the WAL across restarts.
+  </Accordion>
+  <Accordion title="Is there a cluster mode?">
+    Not in the 0.x series. Run a single node behind your supervisor of choice
+    and use multiple tubes for sharding.
+  </Accordion>
+</Accordions>
+
+## Table
+
+Standard pipe-syntax. Fumadocs styles them automatically.
+
+```md
+| Column A | Column B | Column C |
+| -------- | -------- | -------- |
+| cell 1   | cell 2   | cell 3   |
+```
+
+| Verb       | Side       | What it does                                  |
+| ---------- | ---------- | --------------------------------------------- |
+| `put`      | Producer   | Append a job to the current tube.             |
+| `reserve`  | Worker     | Take the next ready job for the lease.        |
+| `ack`      | Worker     | Mark the reserved job done; remove from tube. |
+| `release`  | Worker     | Hand the reservation back voluntarily.        |
+| `bury`     | Worker     | Sideline a job for manual inspection.         |
+| `kick`     | Operator   | Move buried jobs back to ready.               |
+
+## TypeTable (prop documentation)
+
+For React component / config field docs.
+
+```mdx
+<TypeTable
+  type={{
+    bind: {
+      description: 'Address and port to listen on.',
+      type: 'string',
+      default: '"0.0.0.0:11400"',
+    },
+    wal: {
+      description: 'Path to the write-ahead log.',
+      type: 'string',
+      default: '"./sepp.wal"',
+    },
+  }}
+/>
+```
+
+<TypeTable
+  type={{
+    bind: {
+      description: 'Address and port to listen on.',
+      type: 'string',
+      default: '"0.0.0.0:11400"',
+    },
+    wal: {
+      description: 'Path to the write-ahead log.',
+      type: 'string',
+      default: '"./sepp.wal"',
+    },
+    maxJobBytes: {
+      description: 'Largest accepted job payload, in bytes.',
+      type: 'number',
+      default: '65536',
+    },
+  }}
+/>
+
+## InlineTOC
+
+A collapsible "On this page" block you can drop inline — useful at the top of
+a long article when the right-rail TOC isn't enough.
+
+```mdx
+<InlineTOC
+  items={[
+    { title: 'Frontmatter', url: '#frontmatter', depth: 2 },
+    { title: 'Headings', url: '#headings', depth: 2 },
+  ]}
+/>
+```
+
+<InlineTOC
+  items={[
+    { title: 'Frontmatter', url: '#frontmatter', depth: 2 },
+    { title: 'Headings', url: '#headings', depth: 2 },
+    { title: 'Lists', url: '#lists', depth: 2 },
+    { title: 'Code blocks and tabs', url: '#inline-code--code-blocks', depth: 2 },
+  ]}
+/>
+
+## Navigation between pages
+
+To link to another doc, use the path relative to the site root:
+
+```md
+Read [the cheatsheet](/docs/cheatsheet) for examples.
+```
+
+Sidebar order is controlled by `content/docs/meta.json`:
+
+```json title="content/docs/meta.json"
+{
+  "title": "Docs",
+  "root": true,
+  "pages": ["getting-started", "concepts", "clients"]
+}
+```
+
+Each subfolder gets its own `meta.json` with a `title` (shown as the section
+eyebrow) and a `pages` array listing the file slugs in render order.
+
+## Page footer (prev / next)
+
+Fumadocs auto-generates the prev/next pager from the sidebar tree — no
+action needed in the MDX file itself.
+
+## Lorem ipsum filler
+
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor
+incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis
+nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat.
+Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore
+eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt
+in culpa qui officia deserunt mollit anim id est laborum.
+
+Sed ut perspiciatis unde omnis iste natus error sit voluptatem accusantium
+doloremque laudantium, totam rem aperiam, eaque ipsa quae ab illo inventore
+veritatis et quasi architecto beatae vitae dicta sunt explicabo.

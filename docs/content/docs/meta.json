@@ -1,0 +1,7 @@
+{
+  "title": "Docs",
+  "root": true,
+  "pages": [
+    "cheatsheet"
+  ]
+}
