@@ -9,6 +9,7 @@ use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
 use tonic::metadata::MetadataMap;
 use tracing::Span;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
+use tracing_subscriber::filter::{LevelFilter, Targets};
 use tracing_subscriber::layer::{Layer, SubscriberExt};
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt};
@@ -64,7 +65,12 @@ pub fn init(
     // The W3C propagator is what `extract_*`/`current_trace_context` rely on.
     opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
 
-    let otel_layer = tracing_opentelemetry::layer().with_tracer(provider.tracer("sepp"));
+    let otel_filter = Targets::new()
+        .with_target("sepp", LevelFilter::TRACE)
+        .with_default(LevelFilter::OFF);
+    let otel_layer = tracing_opentelemetry::layer()
+        .with_tracer(provider.tracer("sepp"))
+        .with_filter(otel_filter);
     let registry = tracing_subscriber::registry().with(otel_layer);
     match logging.format {
         LogFormat::Text => registry.with(fmt::layer().with_filter(filter)).init(),
@@ -72,6 +78,13 @@ pub fn init(
             .with(fmt::layer().json().with_filter(filter))
             .init(),
     }
+
+    tracing::info!(
+        endpoint = %tracing_cfg.otlp_endpoint,
+        service_name = %tracing_cfg.service_name,
+        sample_ratio = tracing_cfg.sample_ratio,
+        "OTLP tracing enabled",
+    );
 
     Ok(TelemetryGuard {
         provider: Some(provider),

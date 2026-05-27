@@ -164,7 +164,7 @@ enabled = false
 otlp_endpoint = "http://localhost:4317"
 
 # How often metrics are flushed to the endpoint.
-export_interval_ms = 60000
+export_interval_ms = 5000
 
 # Per-queue declarations and overrides. Each missing field falls back to the
 # matching global default in [limits] / [storage]. Allowed even when
