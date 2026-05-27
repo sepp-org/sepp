@@ -1,4 +1,4 @@
-use std::{collections::HashSet, error::Error, path::Path};
+use std::{collections::HashSet, error::Error, net::SocketAddr, path::Path};
 
 use figment::{
     Figment,
@@ -21,8 +21,7 @@ pub enum PersistMode {
 #[serde(default)]
 #[garde(allow_unvalidated)]
 pub struct ServerConfig {
-    #[garde(custom(parse_socket_addr))]
-    pub listen_addr: String,
+    pub listen_addr: SocketAddr,
     #[garde(length(min = 1))]
     pub db_path: String,
     #[garde(inner(length(min = 1)))]
@@ -30,13 +29,6 @@ pub struct ServerConfig {
     #[garde(inner(length(min = 1)))]
     pub tls_key_path: Option<String>,
     pub strict_queues: bool,
-}
-
-fn parse_socket_addr(value: &str, _: &()) -> garde::Result {
-    value
-        .parse::<std::net::SocketAddr>()
-        .map(|_| ())
-        .map_err(|e| garde::Error::new(format!("is not a valid address: {e}")))
 }
 
 impl ServerConfig {
@@ -48,7 +40,7 @@ impl ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            listen_addr: "0.0.0.0:50051".to_string(),
+            listen_addr: SocketAddr::from(([0, 0, 0, 0], 50051)),
             db_path: "./sepp-data".to_string(),
             tls_cert_path: None,
             tls_key_path: None,

@@ -82,7 +82,7 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     );
 
     let _metrics = metrics::init(&config.metrics, &config.tracing.service_name)?;
-    let addr = config.server.listen_addr.parse()?;
+    let addr = config.server.listen_addr;
     let registry = QueueRegistry::from_config(&config);
     let declared_queues = registry.declared_count();
     if declared_queues > 0 {
