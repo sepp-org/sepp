@@ -4,6 +4,7 @@ use figment::{
     Figment,
     providers::{Env, Format, Serialized, Toml},
 };
+use garde::Validate;
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_CONFIG_PATH: &str = "./sepp.toml";
@@ -16,14 +17,26 @@ pub enum PersistMode {
     Buffer,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Validate)]
 #[serde(default)]
+#[garde(allow_unvalidated)]
 pub struct ServerConfig {
+    #[garde(custom(parse_socket_addr))]
     pub listen_addr: String,
+    #[garde(length(min = 1))]
     pub db_path: String,
+    #[garde(inner(length(min = 1)))]
     pub tls_cert_path: Option<String>,
+    #[garde(inner(length(min = 1)))]
     pub tls_key_path: Option<String>,
     pub strict_queues: bool,
+}
+
+fn parse_socket_addr(value: &str, _: &()) -> garde::Result {
+    value
+        .parse::<std::net::SocketAddr>()
+        .map(|_| ())
+        .map_err(|e| garde::Error::new(format!("is not a valid address: {e}")))
 }
 
 impl ServerConfig {
@@ -62,20 +75,42 @@ pub struct QueueConfig {
     pub dedup_window_ms: Option<i64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Validate)]
+#[garde(context(u64 as max_message_bytes))]
 pub struct EffectiveLimits {
+    #[garde(range(min = 1))]
     pub max_lease_duration_ms: u64,
+    #[garde(range(min = 1))]
     pub default_max_attempts: u32,
+    #[garde(range(min = 1))]
     pub max_attempts_ceiling: u32,
+    #[garde(range(max = 9))]
     pub default_priority: u32,
+    #[garde(range(min = 1), custom(payload_within_message_limit))]
     pub max_payload_bytes: u64,
+    #[garde(inner(inner(length(min = 1))))]
     pub allowed_encodings: Option<Vec<String>>,
+    #[garde(inner(length(min = 1), inner(length(min = 1))))]
     pub allowed_job_types: Option<Vec<String>>,
+    #[garde(range(min = 1))]
     pub max_schedule_horizon_ms: u64,
+    #[garde(range(min = 1))]
     pub max_custom_entries: u32,
+    #[garde(range(min = 1))]
     pub max_custom_total_bytes: u64,
+    #[garde(range(min = 1))]
     pub max_custom_key_bytes: u32,
+    #[garde(range(min = 1))]
     pub dedup_window_ms: i64,
+}
+
+fn payload_within_message_limit(value: &u64, max: &u64) -> garde::Result {
+    if *value > *max {
+        return Err(garde::Error::new(
+            "must not exceed limits.max_message_bytes",
+        ));
+    }
+    Ok(())
 }
 
 impl EffectiveLimits {
@@ -123,94 +158,52 @@ impl EffectiveLimits {
     }
 
     pub fn validate(&self, max_message_bytes: u64, scope: &str) -> Result<(), Box<dyn Error>> {
-        let bad =
-            |field: &str, msg: &str| -> Box<dyn Error> { format!("{scope}.{field}: {msg}").into() };
-        if self.max_lease_duration_ms == 0 {
-            return Err(bad("max_lease_duration_ms", "must be > 0"));
-        }
-        if self.default_max_attempts == 0 {
-            return Err(bad("default_max_attempts", "must be > 0"));
-        }
-        if self.max_attempts_ceiling == 0 {
-            return Err(bad("max_attempts_ceiling", "must be > 0"));
-        }
+        self.validate_with(&max_message_bytes)
+            .map_err(|e| format!("{scope}: {e}"))?;
         if self.default_max_attempts > self.max_attempts_ceiling {
-            return Err(bad(
-                "default_max_attempts",
-                "must not exceed max_attempts_ceiling",
-            ));
-        }
-        if self.default_priority > 9 {
-            return Err(bad("default_priority", "must be in [0, 9]"));
-        }
-        if self.max_payload_bytes == 0 {
-            return Err(bad("max_payload_bytes", "must be > 0"));
-        }
-        if self.max_payload_bytes > max_message_bytes {
-            return Err(bad(
-                "max_payload_bytes",
-                "must not exceed limits.max_message_bytes",
-            ));
-        }
-        if let Some(encodings) = &self.allowed_encodings
-            && encodings.iter().any(|e| e.is_empty())
-        {
-            return Err(bad("allowed_encodings", "entries must not be empty"));
-        }
-        if let Some(job_types) = &self.allowed_job_types {
-            if job_types.is_empty() {
-                return Err(bad(
-                    "allowed_job_types",
-                    "must contain at least one entry; omit the key to accept any job_type",
-                ));
-            }
-            if job_types.iter().any(|t| t.is_empty()) {
-                return Err(bad("allowed_job_types", "entries must not be empty"));
-            }
-        }
-        if self.max_schedule_horizon_ms == 0 {
-            return Err(bad("max_schedule_horizon_ms", "must be > 0"));
-        }
-        if self.max_custom_entries == 0 {
-            return Err(bad("max_custom_entries", "must be > 0"));
-        }
-        if self.max_custom_total_bytes == 0 {
-            return Err(bad("max_custom_total_bytes", "must be > 0"));
-        }
-        if self.max_custom_key_bytes == 0 {
-            return Err(bad("max_custom_key_bytes", "must be > 0"));
-        }
-        if self.dedup_window_ms <= 0 {
-            return Err(bad("dedup_window_ms", "must be > 0"));
+            return Err(format!(
+                "{scope}.default_max_attempts: must not exceed max_attempts_ceiling"
+            )
+            .into());
         }
         Ok(())
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Validate)]
 #[serde(default)]
 pub struct AuthConfig {
+    #[garde(inner(inner(length(min = 1))))]
     pub api_keys: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Validate)]
 #[serde(default)]
+#[garde(allow_unvalidated)]
 pub struct LimitsConfig {
     pub max_lease_duration_ms: u64,
     pub default_max_attempts: u32,
     pub max_attempts_ceiling: u32,
     pub default_priority: u32,
+    #[garde(range(min = 1))]
     pub max_reserve_batch: u32,
+    #[garde(range(min = 1))]
     pub max_reserve_queues: u32,
+    #[garde(range(min = 1))]
     pub max_wait_timeout_ms: u64,
+    #[garde(range(min = 1))]
     pub max_enqueue_batch: u32,
     pub max_payload_bytes: u64,
+    #[garde(range(min = 1))]
     pub max_message_bytes: u64,
     pub max_custom_entries: u32,
     pub max_custom_total_bytes: u64,
     pub max_custom_key_bytes: u32,
+    #[garde(range(min = 1, max = 65535))]
     pub max_queue_name_bytes: u32,
+    #[garde(range(min = 1))]
     pub max_job_type_bytes: u32,
+    #[garde(range(min = 1))]
     pub max_idempotency_key_bytes: u32,
     pub max_schedule_horizon_ms: u64,
     // None = unrestricted, Some(vec![]) = reject all, Some(vec!["a", "b"]) = accept only a and b
@@ -242,17 +235,25 @@ impl Default for LimitsConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Validate)]
 #[serde(default)]
+#[garde(allow_unvalidated)]
 pub struct StorageConfig {
     pub persist_mode: PersistMode,
+    #[garde(range(min = 1))]
     pub sweep_interval_ms: u64,
+    #[garde(range(min = 1))]
     pub sweep_limit: usize,
     pub dedup_window_ms: i64,
+    #[garde(range(min = 1))]
     pub command_queue_capacity: usize,
+    #[garde(inner(range(min = 1)))]
     pub cache_size_bytes: Option<u64>,
+    #[garde(inner(range(min = 64 * 1024 * 1024)))]
     pub max_journaling_size_bytes: Option<u64>,
+    #[garde(inner(range(min = 10)))]
     pub max_cached_files: Option<usize>,
+    #[garde(inner(range(min = 1)))]
     pub worker_threads: Option<usize>,
 }
 
@@ -295,12 +296,14 @@ impl Default for LoggingConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Validate)]
 #[serde(default)]
+#[garde(allow_unvalidated)]
 pub struct TracingConfig {
     pub enabled: bool,
     pub otlp_endpoint: String,
     pub service_name: String,
+    #[garde(range(min = 0.0, max = 1.0))]
     pub sample_ratio: f64,
 }
 
@@ -315,8 +318,9 @@ impl Default for TracingConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Validate)]
 #[serde(default)]
+#[garde(allow_unvalidated)]
 pub struct MetricsConfig {
     pub enabled: bool,
     pub otlp_endpoint: String,
@@ -362,13 +366,21 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), Box<dyn Error>> {
-        self.server
-            .listen_addr
-            .parse::<std::net::SocketAddr>()
-            .map_err(|e| format!("server.listen_addr is not a valid address: {e}"))?;
-        if self.server.db_path.is_empty() {
-            return Err("server.db_path must not be empty".into());
-        }
+        // Per-field rules — one garde call per sub-config (allows targeted
+        // scope prefixes in the error path).
+        self.server.validate().map_err(|e| format!("server: {e}"))?;
+        self.auth.validate().map_err(|e| format!("auth: {e}"))?;
+        self.limits.validate().map_err(|e| format!("limits: {e}"))?;
+        self.storage
+            .validate()
+            .map_err(|e| format!("storage: {e}"))?;
+        self.tracing
+            .validate()
+            .map_err(|e| format!("tracing: {e}"))?;
+        self.metrics
+            .validate()
+            .map_err(|e| format!("metrics: {e}"))?;
+        // Cross-field rules that garde can't express declaratively.
         match (&self.server.tls_cert_path, &self.server.tls_key_path) {
             (Some(_), None) => {
                 return Err(
@@ -380,78 +392,7 @@ impl Config {
                     "server.tls_key_path is set but server.tls_cert_path is not; set both or neither".into(),
                 );
             }
-            (Some(cert), Some(key)) => {
-                if cert.is_empty() || key.is_empty() {
-                    return Err(
-                        "server.tls_cert_path and server.tls_key_path must not be empty".into(),
-                    );
-                }
-            }
-            (None, None) => {}
-        }
-        if let Some(keys) = &self.auth.api_keys
-            && keys.iter().any(|k| k.is_empty())
-        {
-            return Err("auth.api_keys entries must not be empty".into());
-        }
-        // Request-shape limits — global only (not overridable per queue).
-        if self.limits.max_reserve_batch == 0 {
-            return Err("limits.max_reserve_batch must be > 0".into());
-        }
-        if self.limits.max_reserve_queues == 0 {
-            return Err("limits.max_reserve_queues must be > 0".into());
-        }
-        if self.limits.max_wait_timeout_ms == 0 {
-            return Err("limits.max_wait_timeout_ms must be > 0".into());
-        }
-        if self.limits.max_enqueue_batch == 0 {
-            return Err("limits.max_enqueue_batch must be > 0".into());
-        }
-        if self.limits.max_message_bytes == 0 {
-            return Err("limits.max_message_bytes must be > 0".into());
-        }
-        if self.limits.max_queue_name_bytes == 0
-            || self.limits.max_queue_name_bytes > u16::MAX as u32
-        {
-            return Err("limits.max_queue_name_bytes must be in [1, 65535]".into());
-        }
-        if self.limits.max_job_type_bytes == 0 {
-            return Err("limits.max_job_type_bytes must be > 0".into());
-        }
-        if self.limits.max_idempotency_key_bytes == 0 {
-            return Err("limits.max_idempotency_key_bytes must be > 0".into());
-        }
-        // Overridable per-job/per-queue limits — the same field rules apply
-        // to the global defaults and to each queue's merged effective view.
-        let defaults = EffectiveLimits::from_globals(&self.limits, &self.storage);
-        defaults.validate(self.limits.max_message_bytes, "limits")?;
-        if self.storage.sweep_interval_ms == 0 {
-            return Err("storage.sweep_interval_ms must be > 0".into());
-        }
-        if self.storage.sweep_limit == 0 {
-            return Err("storage.sweep_limit must be > 0".into());
-        }
-        if self.storage.command_queue_capacity == 0 {
-            return Err("storage.command_queue_capacity must be > 0".into());
-        }
-        if matches!(self.storage.cache_size_bytes, Some(0)) {
-            return Err("storage.cache_size_bytes must be > 0 when set".into());
-        }
-        if let Some(bytes) = self.storage.max_journaling_size_bytes
-            && bytes < 64 * 1024 * 1024
-        {
-            return Err("storage.max_journaling_size_bytes must be >= 64 MiB when set".into());
-        }
-        if let Some(n) = self.storage.max_cached_files
-            && n < 10
-        {
-            return Err("storage.max_cached_files must be >= 10 when set".into());
-        }
-        if matches!(self.storage.worker_threads, Some(0)) {
-            return Err("storage.worker_threads must be > 0 when set".into());
-        }
-        if !(0.0..=1.0).contains(&self.tracing.sample_ratio) {
-            return Err("tracing.sample_ratio must be in [0.0, 1.0]".into());
+            _ => {}
         }
         if self.tracing.enabled && self.tracing.service_name.is_empty() {
             return Err("tracing.service_name must not be empty".into());
@@ -464,6 +405,10 @@ impl Config {
                 return Err("metrics.export_interval_ms must be > 0".into());
             }
         }
+        // Overridable per-job/per-queue limits — the same field rules apply
+        // to the global defaults and to each queue's merged effective view.
+        let defaults = EffectiveLimits::from_globals(&self.limits, &self.storage);
+        defaults.validate(self.limits.max_message_bytes, "limits")?;
         self.validate_queues(&defaults)?;
         Ok(())
     }
