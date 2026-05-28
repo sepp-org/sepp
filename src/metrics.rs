@@ -381,3 +381,23 @@ where
         .with_callback(move |observer| observer.observe(depth(), &[]))
         .build()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scrape_response_serves_metrics_and_404s_other_paths() {
+        let registry = Registry::new();
+
+        let ok = scrape_response(&registry, "/metrics");
+        assert_eq!(ok.status(), hyper::StatusCode::OK);
+        assert!(
+            ok.headers().contains_key(hyper::header::CONTENT_TYPE),
+            "a metrics response advertises its content type"
+        );
+
+        let missing = scrape_response(&registry, "/anything-else");
+        assert_eq!(missing.status(), hyper::StatusCode::NOT_FOUND);
+    }
+}

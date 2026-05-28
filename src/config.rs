@@ -442,3 +442,171 @@ impl Config {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_config_is_valid() {
+        assert!(Config::default().validate().is_ok());
+    }
+
+    #[test]
+    fn tls_requires_both_cert_and_key() {
+        let mut cert_only = Config::default();
+        cert_only.server.tls_cert_path = Some("cert.pem".into());
+        assert!(
+            cert_only.validate().is_err(),
+            "a cert without a key must be rejected"
+        );
+
+        let mut key_only = Config::default();
+        key_only.server.tls_key_path = Some("key.pem".into());
+        assert!(
+            key_only.validate().is_err(),
+            "a key without a cert must be rejected"
+        );
+
+        let mut both = Config::default();
+        both.server.tls_cert_path = Some("cert.pem".into());
+        both.server.tls_key_path = Some("key.pem".into());
+        assert!(both.validate().is_ok(), "both set is the valid case");
+    }
+
+    #[test]
+    fn default_max_attempts_must_not_exceed_ceiling() {
+        let mut cfg = Config::default();
+        cfg.limits.default_max_attempts = 5;
+        cfg.limits.max_attempts_ceiling = 3;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn per_queue_max_attempts_must_not_exceed_ceiling() {
+        let cfg = Config {
+            queues: vec![QueueConfig {
+                name: "q".into(),
+                default_max_attempts: Some(50),
+                max_attempts_ceiling: Some(10),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn payload_limit_must_not_exceed_message_limit() {
+        let mut cfg = Config::default();
+        cfg.limits.max_payload_bytes = cfg.limits.max_message_bytes + 1;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn per_queue_payload_limit_must_not_exceed_message_limit() {
+        let over = LimitsConfig::default().max_message_bytes + 1;
+        let cfg = Config {
+            queues: vec![QueueConfig {
+                name: "big".into(),
+                max_payload_bytes: Some(over),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn duplicate_queue_names_are_rejected() {
+        let cfg = Config {
+            queues: vec![
+                QueueConfig {
+                    name: "dup".into(),
+                    ..Default::default()
+                },
+                QueueConfig {
+                    name: "dup".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn empty_queue_name_is_rejected() {
+        let cfg = Config {
+            queues: vec![QueueConfig {
+                name: String::new(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn queue_name_over_the_byte_limit_is_rejected() {
+        let cfg = Config {
+            limits: LimitsConfig {
+                max_queue_name_bytes: 4,
+                ..Default::default()
+            },
+            queues: vec![QueueConfig {
+                name: "toolong".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn metrics_when_enabled_need_endpoint_and_interval() {
+        let mut no_endpoint = Config::default();
+        no_endpoint.metrics.enabled = true;
+        no_endpoint.metrics.otlp_endpoint = String::new();
+        assert!(no_endpoint.validate().is_err());
+
+        let mut zero_interval = Config::default();
+        zero_interval.metrics.enabled = true;
+        zero_interval.metrics.export_interval_ms = 0;
+        assert!(zero_interval.validate().is_err());
+    }
+
+    #[test]
+    fn tracing_when_enabled_needs_a_service_name() {
+        let mut cfg = Config::default();
+        cfg.tracing.enabled = true;
+        cfg.tracing.service_name = String::new();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn a_zero_valued_field_limit_fails_validation() {
+        let mut cfg = Config::default();
+        cfg.limits.max_reserve_batch = 0;
+        assert!(
+            cfg.validate().is_err(),
+            "garde range(min = 1) rejects a zero batch cap"
+        );
+    }
+
+    #[test]
+    fn a_well_formed_queue_override_is_accepted() {
+        let cfg = Config {
+            queues: vec![QueueConfig {
+                name: "emails".into(),
+                max_lease_duration_ms: Some(60_000),
+                default_max_attempts: Some(5),
+                default_priority: Some(5),
+                allowed_job_types: Some(vec!["send_welcome".into()]),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_ok());
+    }
+}

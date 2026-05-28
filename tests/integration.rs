@@ -1,10 +1,14 @@
-//! End-to-end smoke tests that drive a real server process over gRPC, using
-//! the generated protobuf client directly (no SDK wrapper). Each test owns its
-//! own server process, port and database, so they run independently.
+//! End-to-end integration tests that drive a real server process over gRPC,
+//! using the generated protobuf client directly (no SDK wrapper). Each test
+//! owns its own server process, port and database, so they run independently.
+//!
+//! These exercise the full stack — process startup, config loading, the fjall
+//! store, gRPC transport, TLS and auth — so they are intentionally heavier than
+//! the in-crate unit tests under `src/`.
 
 use std::collections::HashMap;
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use sepp::pb::sepp::v1::{
     AckRequest, EnqueueBatchRequest, EnqueueRequest, EnqueueResponse, ExtendRequest,
@@ -51,7 +55,7 @@ fn temp_db(tag: &str) -> std::path::PathBuf {
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    std::env::temp_dir().join(format!("sepp-smoke-{tag}-{unique}"))
+    std::env::temp_dir().join(format!("sepp-it-{tag}-{unique}"))
 }
 
 async fn spawn_server(db_path: &std::path::Path) -> (Child, Client) {
@@ -104,7 +108,7 @@ fn temp_config_path(tag: &str) -> std::path::PathBuf {
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    std::env::temp_dir().join(format!("sepp-smoke-{tag}-{unique}.toml"))
+    std::env::temp_dir().join(format!("sepp-it-{tag}-{unique}.toml"))
 }
 
 async fn start_server_with_config(tag: &str, toml: &str) -> (ServerGuard, Client) {
@@ -214,7 +218,8 @@ async fn nack(client: &Client, job: &Job, retry: Retry, reason: &str) -> bool {
         .dead_lettered
 }
 
-async fn extend(client: &Client, job: &Job, lease: Duration) {
+/// Extends a job's lease and returns the new `lease_expires_at` the server reports.
+async fn extend(client: &Client, job: &Job, lease: Duration) -> i64 {
     client
         .clone()
         .extend(ExtendRequest {
@@ -224,7 +229,9 @@ async fn extend(client: &Client, job: &Job, lease: Duration) {
             worker_id: None,
         })
         .await
-        .expect("extend RPC");
+        .expect("extend RPC")
+        .into_inner()
+        .lease_expires_at
 }
 
 fn prim_str(value: &str) -> PrimitiveValue {
@@ -263,8 +270,26 @@ async fn server_advertises_its_capabilities() {
 
     assert!(!info.server_version.is_empty(), "server reports a version");
     assert!(
+        !info.supported_protocol_versions.is_empty(),
+        "server advertises at least one protocol version"
+    );
+    assert!(
+        info.server_time_ms > 0,
+        "server reports its wall-clock time for skew detection"
+    );
+    assert!(
         info.max_payload_bytes > 0,
         "server advertises a payload limit"
+    );
+    // The custom-map limits a producer needs to size its jobs are all advertised.
+    assert!(info.max_custom_entries > 0, "advertises a custom-entry cap");
+    assert!(
+        info.max_custom_total_bytes > 0,
+        "advertises a custom-map byte cap"
+    );
+    assert!(
+        info.max_custom_key_bytes > 0,
+        "advertises a custom-key byte cap"
     );
     // No `allowed_encodings` is configured, so the server restricts nothing.
     assert!(
@@ -446,7 +471,13 @@ async fn extend_keeps_lease_alive() {
         .expect("extend job reservable");
     assert_eq!(leased.attempt, 1);
 
-    extend(&client, &leased, LEASE).await;
+    let before = epoch_ms_in(Duration::ZERO);
+    let new_deadline = extend(&client, &leased, LEASE).await;
+    assert!(
+        new_deadline >= before + 25_000 && new_deadline <= before + 35_000,
+        "extend should report a deadline ~{LEASE:?} out, got {}ms from now",
+        new_deadline - before,
+    );
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     let still_held = reserve(&client, "smoke-extend", Duration::from_secs(1), NO_WAIT).await;
@@ -804,18 +835,26 @@ name = "smoke-strict-emails"
     assert_eq!(status.code(), tonic::Code::FailedPrecondition);
 }
 
-async fn scrape_metrics(port: u16) -> String {
+async fn scrape_path(port: u16, path: &str) -> String {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
         .await
         .expect("connect to metrics endpoint");
+    let request = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
     stream
-        .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .write_all(request.as_bytes())
         .await
         .expect("write scrape request");
     let mut buf = Vec::new();
-    stream.read_to_end(&mut buf).await.expect("read scrape body");
+    stream
+        .read_to_end(&mut buf)
+        .await
+        .expect("read scrape body");
     String::from_utf8_lossy(&buf).into_owned()
+}
+
+async fn scrape_metrics(port: u16) -> String {
+    scrape_path(port, "/metrics").await
 }
 
 #[tokio::test]
@@ -841,6 +880,17 @@ prometheus_listen_addr = "127.0.0.1:{met_port}"
     assert!(
         body.contains("sepp_requests") || body.contains("sepp_jobs_enqueued"),
         "expected recorded sepp metrics in the scrape, got:\n{body}"
+    );
+
+    // Any path other than /metrics is a 404 that points the caller at /metrics.
+    let other = scrape_path(met_port, "/not-metrics").await;
+    assert!(
+        other.starts_with("HTTP/1.1 404"),
+        "a non-/metrics path should 404, got:\n{other}"
+    );
+    assert!(
+        other.contains("try /metrics"),
+        "the 404 body should hint at the right path, got:\n{other}"
     );
 }
 
@@ -1152,8 +1202,8 @@ async fn tls_secures_the_connection() {
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let cert_path = std::env::temp_dir().join(format!("sepp-smoke-tls-{unique}.crt"));
-    let key_path = std::env::temp_dir().join(format!("sepp-smoke-tls-{unique}.key"));
+    let cert_path = std::env::temp_dir().join(format!("sepp-it-tls-{unique}.crt"));
+    let key_path = std::env::temp_dir().join(format!("sepp-it-tls-{unique}.key"));
     std::fs::write(&cert_path, &cert_pem).expect("write cert");
     std::fs::write(&key_path, &key_pem).expect("write key");
 
@@ -1226,4 +1276,722 @@ async fn tls_secures_the_connection() {
         matches!(plain, Err(_) | Ok(Err(_))),
         "plaintext RPC unexpectedly succeeded against a TLS-only server"
     );
+}
+
+/// A syntactically valid UUID that no enqueue ever assigns, for exercising the
+/// not-found paths. It clears request validation, so the server reaches storage.
+const FAKE_JOB_ID: &str = "00000000-0000-4000-8000-000000000000";
+
+#[tokio::test]
+async fn stale_attempt_is_fenced_off() {
+    let (_guard, client) = start_server("fence").await;
+
+    enqueue(&client, enqueue_req("smoke-fence")).await;
+    let first = reserve(&client, "smoke-fence", Duration::from_secs(1), WAIT)
+        .await
+        .expect("first delivery reservable");
+    assert_eq!(first.attempt, 1);
+
+    // Let the 1s lease expire; the sweeper redelivers the job, and re-reserving
+    // it makes the in-flight record carry attempt 2. The first worker's handle
+    // (attempt 1) is now stale.
+    let second = reserve(&client, "smoke-fence", LEASE, Duration::from_secs(15))
+        .await
+        .expect("expired lease is redelivered");
+    assert_eq!(second.attempt, 2, "redelivery bumped the attempt");
+
+    // ack / nack / extend with the stale attempt must all be fenced off with
+    // FAILED_PRECONDITION rather than silently mutating the live attempt.
+    let ack_err = client
+        .clone()
+        .ack(AckRequest {
+            job_id: first.id.clone(),
+            attempt: first.attempt,
+            worker_id: None,
+        })
+        .await
+        .expect_err("a stale ack is rejected");
+    assert_eq!(ack_err.code(), tonic::Code::FailedPrecondition);
+
+    let nack_err = client
+        .clone()
+        .nack(NackRequest {
+            job_id: first.id.clone(),
+            attempt: first.attempt,
+            reason: Some("stale".to_string()),
+            retry: Some(NackRetry {
+                strategy: Some(nack_retry::Strategy::Default(())),
+            }),
+            worker_id: None,
+        })
+        .await
+        .expect_err("a stale nack is rejected");
+    assert_eq!(nack_err.code(), tonic::Code::FailedPrecondition);
+
+    let extend_err = client
+        .clone()
+        .extend(ExtendRequest {
+            job_id: first.id.clone(),
+            attempt: first.attempt,
+            lease_duration_ms: LEASE.as_millis() as u64,
+            worker_id: None,
+        })
+        .await
+        .expect_err("a stale extend is rejected");
+    assert_eq!(extend_err.code(), tonic::Code::FailedPrecondition);
+
+    // The current holder (attempt 2) is unaffected and can complete the job.
+    ack(&client, &second).await;
+}
+
+#[tokio::test]
+async fn completing_an_unknown_job_is_not_found() {
+    let (_guard, client) = start_server("notfound").await;
+
+    // Acking a job that never existed is NOT_FOUND.
+    let err = client
+        .clone()
+        .ack(AckRequest {
+            job_id: FAKE_JOB_ID.to_string(),
+            attempt: 1,
+            worker_id: None,
+        })
+        .await
+        .expect_err("acking an unknown job is rejected");
+    assert_eq!(err.code(), tonic::Code::NotFound);
+
+    // So is nacking one.
+    let err = client
+        .clone()
+        .nack(NackRequest {
+            job_id: FAKE_JOB_ID.to_string(),
+            attempt: 1,
+            reason: None,
+            retry: Some(NackRetry {
+                strategy: Some(nack_retry::Strategy::Default(())),
+            }),
+            worker_id: None,
+        })
+        .await
+        .expect_err("nacking an unknown job is rejected");
+    assert_eq!(err.code(), tonic::Code::NotFound);
+
+    // A second ack of an already-completed job is NOT_FOUND too: the first ack
+    // removed it from the in-flight set.
+    enqueue(&client, enqueue_req("smoke-notfound")).await;
+    let job = reserve(&client, "smoke-notfound", LEASE, WAIT)
+        .await
+        .expect("job reservable");
+    ack(&client, &job).await;
+    let err = client
+        .clone()
+        .ack(AckRequest {
+            job_id: job.id.clone(),
+            attempt: job.attempt,
+            worker_id: None,
+        })
+        .await
+        .expect_err("double-ack is rejected");
+    assert_eq!(err.code(), tonic::Code::NotFound);
+}
+
+#[tokio::test]
+async fn structurally_invalid_enqueue_is_rejected() {
+    let (_guard, client) = start_server("invalid").await;
+
+    // priority must be 0..=9 (a proto buf.validate rule). An out-of-range value
+    // is surfaced as an InvalidRequest rejection carrying the violation message.
+    let rejected = enqueue_one(
+        &client,
+        EnqueueRequest {
+            priority: Some(42),
+            ..enqueue_req("smoke-invalid")
+        },
+    )
+    .await;
+    match rejected.outcome {
+        Some(job_result::Outcome::Rejection(r)) => match r.reason {
+            Some(job_rejection::Reason::InvalidRequest(inv)) => {
+                assert!(!inv.message.is_empty(), "the violation is described");
+            }
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        },
+        other => panic!("an out-of-range priority was not rejected: {other:?}"),
+    }
+
+    // An empty job_type (min_len = 1) is likewise a structural rejection.
+    let rejected = enqueue_one(
+        &client,
+        EnqueueRequest {
+            job_type: String::new(),
+            ..enqueue_req("smoke-invalid")
+        },
+    )
+    .await;
+    assert!(
+        matches!(
+            &rejected.outcome,
+            Some(job_result::Outcome::Rejection(r))
+                if matches!(r.reason, Some(job_rejection::Reason::InvalidRequest(_)))
+        ),
+        "an empty job_type is rejected: {:?}",
+        rejected.outcome
+    );
+}
+
+#[tokio::test]
+async fn a_blocked_reserve_wakes_on_enqueue() {
+    let (_guard, client) = start_server("wake").await;
+
+    // Park a reserve on an empty queue with a long timeout, then enqueue from a
+    // separate task. The waiter must be woken promptly — long-poll's whole point.
+    let waiter = {
+        let client = client.clone();
+        tokio::spawn(
+            async move { reserve(&client, "smoke-wake", LEASE, Duration::from_secs(20)).await },
+        )
+    };
+
+    // Give the reserve time to arm its waiter on the (still empty) queue.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let started = Instant::now();
+    let enqueued = enqueue(&client, enqueue_req("smoke-wake")).await;
+
+    let job = waiter
+        .await
+        .expect("reserve task joins")
+        .expect("the parked reserve returns the freshly enqueued job");
+    assert_eq!(job.id, enqueued.job_id);
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "a blocked reserve should wake on enqueue, not ride out its 20s timeout (took {:?})",
+        started.elapsed(),
+    );
+    ack(&client, &job).await;
+}
+
+#[tokio::test]
+async fn reserve_validates_its_request() {
+    let (_guard, client) = start_server("rvalid").await;
+
+    // Empty queue list (proto repeated.min_items = 1).
+    let err = client
+        .clone()
+        .reserve(ReserveRequest {
+            queues: vec![],
+            wait_timeout_ms: 0,
+            lease_duration_ms: LEASE.as_millis() as u64,
+            worker_id: None,
+            max_jobs: None,
+        })
+        .await
+        .expect_err("an empty queue list is rejected");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+    // Zero lease duration (proto uint64.gte = 1).
+    let err = client
+        .clone()
+        .reserve(ReserveRequest {
+            queues: vec!["smoke-rvalid".to_string()],
+            wait_timeout_ms: 0,
+            lease_duration_ms: 0,
+            worker_id: None,
+            max_jobs: None,
+        })
+        .await
+        .expect_err("a zero lease duration is rejected");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+    // More queues than max_reserve_queues (default 32) — a server-side cap.
+    let too_many: Vec<String> = (0..40).map(|i| format!("q{i}")).collect();
+    let err = client
+        .clone()
+        .reserve(ReserveRequest {
+            queues: too_many,
+            wait_timeout_ms: 0,
+            lease_duration_ms: LEASE.as_millis() as u64,
+            worker_id: None,
+            max_jobs: None,
+        })
+        .await
+        .expect_err("exceeding max_reserve_queues is rejected");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+}
+
+#[tokio::test]
+async fn empty_and_oversized_batches_are_rejected() {
+    let cfg = r#"
+[limits]
+max_enqueue_batch = 1
+"#;
+    let (_guard, client) = start_server_with_config("batchcap", cfg).await;
+
+    // An empty batch is rejected by both batch RPCs.
+    let err = client
+        .clone()
+        .enqueue_batch(EnqueueBatchRequest { jobs: vec![] })
+        .await
+        .expect_err("an empty EnqueueBatch is rejected");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    let err = client
+        .clone()
+        .enqueue_atomic(EnqueueBatchRequest { jobs: vec![] })
+        .await
+        .expect_err("an empty EnqueueAtomic is rejected");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+    // A batch over the configured cap of 1 is rejected by both.
+    let two = vec![enqueue_req("smoke-batchcap"), enqueue_req("smoke-batchcap")];
+    let err = client
+        .clone()
+        .enqueue_batch(EnqueueBatchRequest { jobs: two.clone() })
+        .await
+        .expect_err("a batch over max_enqueue_batch is rejected");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    let err = client
+        .clone()
+        .enqueue_atomic(EnqueueBatchRequest { jobs: two })
+        .await
+        .expect_err("an atomic batch over max_enqueue_batch is rejected");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+}
+
+#[tokio::test]
+async fn encoding_restriction_is_advertised_and_enforced() {
+    let cfg = r#"
+[limits]
+allowed_encodings = ["json"]
+"#;
+    let (_guard, client) = start_server_with_config("enc", cfg).await;
+
+    // The restriction is advertised through GetServerInfo.
+    let info = client
+        .clone()
+        .get_server_info(GetServerInfoRequest {})
+        .await
+        .expect("get_server_info RPC")
+        .into_inner();
+    assert!(
+        info.restricts_encodings,
+        "a server with allowed_encodings restricts them"
+    );
+    assert_eq!(info.allowed_encodings, vec!["json".to_string()]);
+
+    // An allowed encoding is accepted.
+    let ok = enqueue_one(
+        &client,
+        EnqueueRequest {
+            payload: Some(Payload {
+                data: b"{}".to_vec(),
+                encoding: "json".to_string(),
+            }),
+            ..enqueue_req("smoke-enc")
+        },
+    )
+    .await;
+    assert!(matches!(ok.outcome, Some(job_result::Outcome::Success(_))));
+
+    // A disallowed encoding is rejected, and the rejection names what's allowed.
+    let rejected = enqueue_one(
+        &client,
+        EnqueueRequest {
+            payload: Some(Payload {
+                data: b"<x/>".to_vec(),
+                encoding: "xml".to_string(),
+            }),
+            ..enqueue_req("smoke-enc")
+        },
+    )
+    .await;
+    match rejected.outcome {
+        Some(job_result::Outcome::Rejection(r)) => match r.reason {
+            Some(job_rejection::Reason::EncodingNotAllowed(e)) => {
+                assert_eq!(e.encoding, "xml");
+                assert_eq!(e.allowed, vec!["json".to_string()]);
+            }
+            other => panic!("expected EncodingNotAllowed, got {other:?}"),
+        },
+        other => panic!("a disallowed encoding was not rejected: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn limit_rejections_report_the_offending_value() {
+    // One server, tight on every size limit; each request below violates exactly
+    // one of them. check_enqueue_limits short-circuits on the first violation, so
+    // every other field is kept within its bound (note the 1-byte job_type).
+    let cfg = r#"
+[limits]
+max_queue_name_bytes = 8
+max_job_type_bytes = 8
+max_idempotency_key_bytes = 8
+max_custom_entries = 2
+max_custom_key_bytes = 4
+max_custom_total_bytes = 16
+max_schedule_horizon_ms = 1000
+"#;
+    let (_guard, client) = start_server_with_config("limits", cfg).await;
+
+    fn tiny(queue: &str) -> EnqueueRequest {
+        EnqueueRequest {
+            queue: queue.to_string(),
+            job_type: "j".to_string(),
+            ..Default::default()
+        }
+    }
+    fn rejection_reason(out: sepp::pb::sepp::v1::JobResult) -> job_rejection::Reason {
+        match out.outcome {
+            Some(job_result::Outcome::Rejection(r)) => {
+                r.reason.expect("a rejection always carries a reason")
+            }
+            other => panic!("expected a rejection, got {other:?}"),
+        }
+    }
+    use job_rejection::Reason;
+
+    // Queue name too long.
+    let name = "this-name-is-too-long";
+    match rejection_reason(enqueue_one(&client, tiny(name)).await) {
+        Reason::QueueNameTooLong(q) => {
+            assert_eq!(q.limit, 8);
+            assert_eq!(q.actual, name.len() as u64);
+        }
+        other => panic!("expected QueueNameTooLong, got {other:?}"),
+    }
+
+    // job_type too long.
+    let r = rejection_reason(
+        enqueue_one(
+            &client,
+            EnqueueRequest {
+                job_type: "way-too-long-type".to_string(),
+                ..tiny("ok")
+            },
+        )
+        .await,
+    );
+    assert!(matches!(r, Reason::JobTypeNameTooLong(j) if j.limit == 8));
+
+    // idempotency_key too long.
+    let r = rejection_reason(
+        enqueue_one(
+            &client,
+            EnqueueRequest {
+                idempotency_key: Some("idemp-key-too-long".to_string()),
+                ..tiny("ok")
+            },
+        )
+        .await,
+    );
+    assert!(matches!(r, Reason::IdempotencyKeyTooLong(k) if k.limit == 8));
+
+    // Too many custom entries (checked before any per-entry rule).
+    let mut many = HashMap::new();
+    many.insert("a".to_string(), prim_int(1));
+    many.insert("b".to_string(), prim_int(2));
+    many.insert("c".to_string(), prim_int(3));
+    let r = rejection_reason(
+        enqueue_one(
+            &client,
+            EnqueueRequest {
+                custom: many,
+                ..tiny("ok")
+            },
+        )
+        .await,
+    );
+    assert!(matches!(r, Reason::CustomEntriesTooMany(c) if c.limit == 2 && c.actual == 3));
+
+    // A single custom key longer than max_custom_key_bytes.
+    let mut long_key = HashMap::new();
+    long_key.insert("longkey".to_string(), prim_int(1));
+    match rejection_reason(
+        enqueue_one(
+            &client,
+            EnqueueRequest {
+                custom: long_key,
+                ..tiny("ok")
+            },
+        )
+        .await,
+    ) {
+        Reason::CustomKeyTooLong(k) => {
+            assert_eq!(k.key, "longkey");
+            assert_eq!(k.limit, 4);
+            assert_eq!(k.actual, 7);
+        }
+        other => panic!("expected CustomKeyTooLong, got {other:?}"),
+    }
+
+    // Aggregate custom bytes over the cap (key within limits; the value tips it).
+    let mut big = HashMap::new();
+    big.insert("k".to_string(), prim_str("0123456789abcdefghij")); // 1 + 20 = 21 bytes
+    match rejection_reason(
+        enqueue_one(
+            &client,
+            EnqueueRequest {
+                custom: big,
+                ..tiny("ok")
+            },
+        )
+        .await,
+    ) {
+        Reason::CustomMapTooLarge(c) => {
+            assert_eq!(c.limit, 16);
+            assert_eq!(c.actual, 21);
+        }
+        other => panic!("expected CustomMapTooLarge, got {other:?}"),
+    }
+
+    // Scheduled further out than the horizon.
+    let r = rejection_reason(
+        enqueue_one(
+            &client,
+            EnqueueRequest {
+                scheduled_at: Some(epoch_ms_in(Duration::from_secs(3600))),
+                ..tiny("ok")
+            },
+        )
+        .await,
+    );
+    assert!(matches!(r, Reason::ScheduledTooFar(s) if s.horizon_ms == 1000));
+}
+
+#[tokio::test]
+async fn dedup_lapses_after_the_window() {
+    let cfg = r#"
+[storage]
+dedup_window_ms = 800
+"#;
+    let (_guard, client) = start_server_with_config("dedup-lapse", cfg).await;
+
+    let req = || EnqueueRequest {
+        idempotency_key: Some("k".to_string()),
+        ..enqueue_req("smoke-dedup-lapse")
+    };
+
+    let first = enqueue(&client, req()).await;
+    assert!(!first.deduplicated);
+
+    // Within the window, the same key collapses onto the first job.
+    let within = enqueue(&client, req()).await;
+    assert!(within.deduplicated);
+    assert_eq!(within.job_id, first.job_id);
+
+    // Once the window lapses, the key is free again and a fresh job is created.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let after = enqueue(&client, req()).await;
+    assert!(!after.deduplicated, "the dedup key expires with its window");
+    assert_ne!(after.job_id, first.job_id);
+}
+
+#[tokio::test]
+async fn health_service_reports_serving() {
+    use tonic_health::pb::health_client::HealthClient;
+    use tonic_health::pb::{HealthCheckRequest, health_check_response::ServingStatus};
+
+    let db_path = temp_db("health");
+    let port = free_port();
+    let child = Command::new(env!("CARGO_BIN_EXE_sepp"))
+        .env("SEPP_SERVER__LISTEN_ADDR", format!("127.0.0.1:{port}"))
+        .env("SEPP_SERVER__DB_PATH", &db_path)
+        .stdout(Stdio::null())
+        .spawn()
+        .expect("spawn sepp server");
+    let _guard = ServerGuard {
+        child,
+        db_path: Some(db_path),
+    };
+
+    let addr = format!("http://127.0.0.1:{port}");
+    let mut health = None;
+    for _ in 0..100 {
+        let endpoint = Endpoint::from_shared(addr.clone()).expect("valid endpoint URL");
+        if let Ok(channel) = endpoint.connect().await {
+            health = Some(HealthClient::new(channel));
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let mut health = health.expect("health endpoint became reachable");
+
+    // The server registers the queue service as SERVING before it starts
+    // accepting connections.
+    let resp = health
+        .check(HealthCheckRequest {
+            service: "sepp.v1.QueueService".to_string(),
+        })
+        .await
+        .expect("health check RPC")
+        .into_inner();
+    assert_eq!(resp.status, ServingStatus::Serving as i32);
+}
+
+#[tokio::test]
+async fn reserve_lease_is_clamped_to_queue_max() {
+    let cfg = r#"
+[[queues]]
+name = "smoke-capped"
+max_lease_duration_ms = 2000
+"#;
+    let (_guard, client) = start_server_with_config("clamp", cfg).await;
+
+    enqueue(&client, enqueue_req("smoke-capped")).await;
+
+    // Ask for a 10-minute lease; the queue caps it at 2s.
+    let before = epoch_ms_in(Duration::ZERO);
+    let job = reserve(&client, "smoke-capped", Duration::from_secs(600), WAIT)
+        .await
+        .expect("capped job reservable");
+    assert!(
+        job.lease_expires_at <= before + 2000 + 2000,
+        "reserve clamps the lease to the queue max (got {}ms out)",
+        job.lease_expires_at - before,
+    );
+    assert!(
+        job.lease_expires_at >= before + 1000,
+        "yet the deadline is genuinely in the future"
+    );
+
+    // Extend clamps the same way.
+    let before = epoch_ms_in(Duration::ZERO);
+    let extended = extend(&client, &job, Duration::from_secs(600)).await;
+    assert!(
+        extended <= before + 2000 + 2000,
+        "extend clamps the lease to the queue max (got {}ms out)",
+        extended - before,
+    );
+
+    ack(&client, &job).await;
+}
+
+#[tokio::test]
+async fn inflight_job_survives_restart_and_is_redelivered() {
+    let db_path = temp_db("restart-inflight");
+
+    let job_id = {
+        let (child, client) = spawn_server(&db_path).await;
+        let _server = ServerGuard {
+            child,
+            db_path: None,
+        };
+        let id = enqueue(&client, enqueue_req("smoke-restart-inflight"))
+            .await
+            .job_id;
+        // Lease it (briefly) so it is in-flight when the server is dropped.
+        let job = reserve(
+            &client,
+            "smoke-restart-inflight",
+            Duration::from_secs(1),
+            WAIT,
+        )
+        .await
+        .expect("job reservable before the restart");
+        assert_eq!(job.attempt, 1);
+        id
+    };
+
+    // A fresh server on the same database rebuilds the lease timer and, once the
+    // (already expired) lease is swept, redelivers the job as attempt 2.
+    let (child, client) = spawn_server(&db_path).await;
+    let _server = ServerGuard {
+        child,
+        db_path: Some(db_path),
+    };
+
+    let job = reserve(
+        &client,
+        "smoke-restart-inflight",
+        LEASE,
+        Duration::from_secs(15),
+    )
+    .await
+    .expect("an in-flight job is redelivered after a restart");
+    assert_eq!(job.id, job_id, "the same job survives the restart");
+    assert_eq!(
+        job.attempt, 2,
+        "the post-restart redelivery bumps the attempt"
+    );
+    ack(&client, &job).await;
+}
+
+#[tokio::test]
+async fn scheduled_job_survives_restart() {
+    let db_path = temp_db("restart-sched");
+
+    let job_id = {
+        let (child, client) = spawn_server(&db_path).await;
+        let _server = ServerGuard {
+            child,
+            db_path: None,
+        };
+        enqueue(
+            &client,
+            EnqueueRequest {
+                scheduled_at: Some(epoch_ms_in(Duration::from_secs(3))),
+                ..enqueue_req("smoke-restart-sched")
+            },
+        )
+        .await
+        .job_id
+    };
+
+    let (child, client) = spawn_server(&db_path).await;
+    let _server = ServerGuard {
+        child,
+        db_path: Some(db_path),
+    };
+
+    let job = reserve(
+        &client,
+        "smoke-restart-sched",
+        LEASE,
+        Duration::from_secs(15),
+    )
+    .await
+    .expect("a scheduled job is promoted after a restart");
+    assert_eq!(
+        job.id, job_id,
+        "the same scheduled job survives the restart"
+    );
+    assert_eq!(job.attempt, 1);
+    ack(&client, &job).await;
+}
+
+#[tokio::test]
+async fn reserve_polls_queues_in_listed_order() {
+    let (_guard, client) = start_server("order").await;
+
+    let a = enqueue(&client, enqueue_req("smoke-order-a")).await;
+    let b = enqueue(&client, enqueue_req("smoke-order-b")).await;
+
+    // With both queues non-empty, a single-job reserve drains the first-listed
+    // queue before the second.
+    let first = reserve_batch(
+        &client,
+        &["smoke-order-a", "smoke-order-b"],
+        LEASE,
+        WAIT,
+        Some(1),
+    )
+    .await
+    .into_iter()
+    .next()
+    .expect("a job from the first non-empty queue");
+    assert_eq!(first.id, a.job_id, "queue at index 0 is polled first");
+    ack(&client, &first).await;
+
+    let second = reserve_batch(
+        &client,
+        &["smoke-order-a", "smoke-order-b"],
+        LEASE,
+        WAIT,
+        Some(1),
+    )
+    .await
+    .into_iter()
+    .next()
+    .expect("then the second-listed queue");
+    assert_eq!(second.id, b.job_id);
+    ack(&client, &second).await;
 }
