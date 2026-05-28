@@ -96,6 +96,11 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     let interceptor = ApiKeyInterceptor::new(&config.auth.api_keys);
     let service = InterceptedService::new(queue_service, interceptor.clone());
 
+    let (health_reporter, health_service) = tonic_health::server::health_reporter();
+    health_reporter
+        .set_serving::<QueueServiceServer<QueueServer>>()
+        .await;
+
     let tls_enabled = config.server.tls_enabled();
     let mut builder = Server::builder()
         .http2_keepalive_interval(Some(Duration::from_secs(30)))
@@ -121,6 +126,7 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     );
 
     builder
+        .add_service(health_service)
         .add_service(service)
         .serve_with_shutdown(addr, shutdown_signal())
         .await?;

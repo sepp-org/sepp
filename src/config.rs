@@ -65,6 +65,7 @@ pub struct QueueConfig {
     pub max_custom_total_bytes: Option<u64>,
     pub max_custom_key_bytes: Option<u32>,
     pub dedup_window_ms: Option<i64>,
+    pub max_queue_depth: Option<u64>,
 }
 
 #[derive(Debug, Clone, Validate)]
@@ -94,6 +95,8 @@ pub struct EffectiveLimits {
     pub max_custom_key_bytes: u32,
     #[garde(range(min = 1))]
     pub dedup_window_ms: i64,
+    #[garde(skip)]
+    pub max_queue_depth: Option<u64>,
 }
 
 fn payload_within_message_limit(value: &u64, max: &u64) -> garde::Result {
@@ -120,6 +123,7 @@ impl EffectiveLimits {
             max_custom_total_bytes: limits.max_custom_total_bytes,
             max_custom_key_bytes: limits.max_custom_key_bytes,
             dedup_window_ms: storage.dedup_window_ms,
+            max_queue_depth: limits.max_queue_depth,
         }
     }
 
@@ -146,6 +150,7 @@ impl EffectiveLimits {
                 .unwrap_or(self.max_custom_total_bytes),
             max_custom_key_bytes: q.max_custom_key_bytes.unwrap_or(self.max_custom_key_bytes),
             dedup_window_ms: q.dedup_window_ms.unwrap_or(self.dedup_window_ms),
+            max_queue_depth: q.max_queue_depth.or(self.max_queue_depth),
         }
     }
 
@@ -185,6 +190,7 @@ pub struct LimitsConfig {
     pub max_wait_timeout_ms: u64,
     #[garde(range(min = 1))]
     pub max_enqueue_batch: u32,
+    pub max_queue_depth: Option<u64>,
     pub max_payload_bytes: u64,
     #[garde(range(min = 1))]
     pub max_message_bytes: u64,
@@ -213,6 +219,7 @@ impl Default for LimitsConfig {
             max_reserve_queues: 32,
             max_wait_timeout_ms: 5 * 60 * 1000,
             max_enqueue_batch: 256,
+            max_queue_depth: None,
             max_payload_bytes: 1 << 20,
             max_message_bytes: 16 << 20,
             max_custom_entries: 64,

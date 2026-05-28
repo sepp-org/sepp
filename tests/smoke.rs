@@ -805,6 +805,58 @@ name = "smoke-strict-emails"
 }
 
 #[tokio::test]
+async fn enqueue_is_rejected_when_queue_is_full() {
+    let cfg = r#"
+[limits]
+max_queue_depth = 2
+"#;
+    let (_guard, client) = start_server_with_config("depth", cfg).await;
+
+    // The first two jobs fit within the cap.
+    enqueue(&client, enqueue_req("smoke-depth")).await;
+    enqueue(&client, enqueue_req("smoke-depth")).await;
+
+    // A third would exceed it: rejected as a whole-batch RESOURCE_EXHAUSTED.
+    let status = client
+        .clone()
+        .enqueue_batch(EnqueueBatchRequest {
+            jobs: vec![enqueue_req("smoke-depth")],
+        })
+        .await
+        .expect_err("enqueue beyond the cap is rejected");
+    assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+
+    // A different queue has its own independent budget.
+    enqueue(&client, enqueue_req("smoke-depth-other")).await;
+
+    // Completing a job frees capacity in its queue.
+    let job = reserve(&client, "smoke-depth", LEASE, NO_WAIT)
+        .await
+        .expect("a job is available");
+    ack(&client, &job).await;
+    enqueue(&client, enqueue_req("smoke-depth")).await;
+}
+
+#[tokio::test]
+async fn max_queue_depth_zero_rejects_every_enqueue() {
+    // Omitting the key means unlimited; an explicit 0 rejects everything.
+    let cfg = r#"
+[limits]
+max_queue_depth = 0
+"#;
+    let (_guard, client) = start_server_with_config("depth-zero", cfg).await;
+
+    let status = client
+        .clone()
+        .enqueue_batch(EnqueueBatchRequest {
+            jobs: vec![enqueue_req("smoke-depth-zero")],
+        })
+        .await
+        .expect_err("a 0 cap rejects every enqueue");
+    assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+}
+
+#[tokio::test]
 async fn per_queue_max_payload_overrides_global() {
     let cfg = r#"
 [[queues]]

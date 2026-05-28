@@ -296,6 +296,12 @@ struct Indexes {
 }
 
 impl Indexes {
+    fn live_depth(&self, queue: &str) -> u64 {
+        self.ready.by_queue.get(queue).copied().unwrap_or(0)
+            + self.scheduled.by_queue.get(queue).copied().unwrap_or(0)
+            + self.leases.by_queue.get(queue).copied().unwrap_or(0)
+    }
+
     fn snapshot(&self) -> QueueDepthSnapshot {
         QueueDepthSnapshot {
             ready: self.ready.by_queue.clone(),
@@ -693,6 +699,23 @@ fn apply_enqueue(
 ) -> Result<Vec<EnqueueResponse>, Status> {
     let now = now_ms();
     let registry = store.registry.load();
+
+    {
+        let mut wanted: HashMap<&str, u64> = HashMap::new();
+        for req in &jobs {
+            *wanted.entry(req.queue.as_str()).or_default() += 1;
+        }
+        for (queue, count) in wanted {
+            if let Some(cap) = registry.effective(queue).max_queue_depth
+                && indexes.live_depth(queue) + count > cap
+            {
+                return Err(Status::resource_exhausted(format!(
+                    "queue {queue:?} is at capacity (max_queue_depth={cap})"
+                )));
+            }
+        }
+    }
+
     let mut results = Vec::with_capacity(jobs.len());
 
     for req in jobs {

@@ -61,6 +61,11 @@ max_wait_timeout_ms = 300000
 # Largest number of jobs a single EnqueueBatch may carry.
 max_enqueue_batch = 256
 
+# Cap on live jobs (ready + scheduled + in-flight) per queue.
+# Omit this key to disable the cap (unlimited); 0 rejects every
+# enqueue. Can be overridden per queue under [[queues]].
+# max_queue_depth = 100000
+
 # Largest job payload accepted, in bytes.
 max_payload_bytes = 1048576
 
