@@ -78,10 +78,11 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
         sample_ratio = config.tracing.sample_ratio,
         metrics_enabled = config.metrics.enabled,
         metrics_export_interval_ms = config.metrics.export_interval_ms,
+        prometheus_enabled = config.metrics.prometheus_enabled,
         "configuration loaded",
     );
 
-    let _metrics = metrics::init(&config.metrics, &config.tracing.service_name)?;
+    let _metrics = metrics::init(&config.metrics, &config.tracing.service_name).await?;
     let addr = config.server.listen_addr;
     let registry = QueueRegistry::from_config(&config);
     let declared_queues = registry.declared_count();

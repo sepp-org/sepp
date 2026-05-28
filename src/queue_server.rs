@@ -44,7 +44,7 @@ impl QueueServer {
         config: &Config,
         registry: SharedRegistry,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let metrics = Metrics::new(config.metrics.enabled);
+        let metrics = Metrics::new(config.metrics.enabled || config.metrics.prometheus_enabled);
         let storage = Storage::open(config, registry.clone(), metrics.clone())?;
         let command_queue_gauge = {
             let storage = storage.clone();

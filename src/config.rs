@@ -324,6 +324,8 @@ pub struct MetricsConfig {
     pub enabled: bool,
     pub otlp_endpoint: String,
     pub export_interval_ms: u64,
+    pub prometheus_enabled: bool,
+    pub prometheus_listen_addr: SocketAddr,
 }
 
 impl Default for MetricsConfig {
@@ -332,6 +334,8 @@ impl Default for MetricsConfig {
             enabled: false,
             otlp_endpoint: "http://localhost:4317".to_string(),
             export_interval_ms: 60_000,
+            prometheus_enabled: false,
+            prometheus_listen_addr: SocketAddr::from(([0, 0, 0, 0], 9464)),
         }
     }
 }

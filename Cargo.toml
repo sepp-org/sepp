@@ -23,9 +23,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 opentelemetry = { version = "0.32", default-features = false, features = ["trace", "metrics"] }
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "metrics", "rt-tokio"] }
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "trace", "metrics"] }
+opentelemetry-prometheus = "0.32"
+prometheus = "0.14"
 tracing-opentelemetry = "0.33"
 opentelemetry-semantic-conventions = "0.32"
 garde = { version = "0.23.0", features = ["derive"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
 
 
 [build-dependencies]

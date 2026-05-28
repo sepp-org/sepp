@@ -804,6 +804,46 @@ name = "smoke-strict-emails"
     assert_eq!(status.code(), tonic::Code::FailedPrecondition);
 }
 
+async fn scrape_metrics(port: u16) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect to metrics endpoint");
+    stream
+        .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .expect("write scrape request");
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.expect("read scrape body");
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+#[tokio::test]
+async fn prometheus_endpoint_exposes_recorded_metrics() {
+    let met_port = free_port();
+    let cfg = format!(
+        r#"
+[metrics]
+prometheus_enabled = true
+prometheus_listen_addr = "127.0.0.1:{met_port}"
+"#
+    );
+    let (_guard, client) = start_server_with_config("prom", &cfg).await;
+
+    // Drive some activity so the request/enqueue counters have data points.
+    enqueue(&client, enqueue_req("smoke-prom")).await;
+
+    let body = scrape_metrics(met_port).await;
+    assert!(
+        body.starts_with("HTTP/1.1 200"),
+        "metrics endpoint should return 200, got:\n{body}"
+    );
+    assert!(
+        body.contains("sepp_requests") || body.contains("sepp_jobs_enqueued"),
+        "expected recorded sepp metrics in the scrape, got:\n{body}"
+    );
+}
+
 #[tokio::test]
 async fn enqueue_is_rejected_when_queue_is_full() {
     let cfg = r#"

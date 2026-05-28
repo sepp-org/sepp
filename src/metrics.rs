@@ -1,24 +1,34 @@
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
+use http_body_util::Full;
+use hyper::body::{Bytes, Incoming};
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::{Counter, Histogram, ObservableGauge};
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
+use prometheus::{Encoder, Registry, TextEncoder};
+use tokio::task::JoinHandle;
 use tonic::Status;
-use tracing::Span;
+use tracing::{Span, debug, error, info, warn};
 
 use crate::config::MetricsConfig;
 
 pub struct MetricsGuard {
     provider: Option<SdkMeterProvider>,
+    // Accept loop for the Prometheus scrape endpoint; aborted on shutdown.
+    prometheus_server: Option<JoinHandle<()>>,
 }
 
 impl Drop for MetricsGuard {
     fn drop(&mut self) {
+        if let Some(server) = self.prometheus_server.take() {
+            server.abort();
+        }
         if let Some(provider) = self.provider.take()
             && let Err(e) = provider.shutdown()
         {
@@ -27,32 +37,120 @@ impl Drop for MetricsGuard {
     }
 }
 
-pub fn init(
+pub async fn init(
     cfg: &MetricsConfig,
     service_name: &str,
 ) -> Result<MetricsGuard, Box<dyn std::error::Error>> {
-    if !cfg.enabled {
-        return Ok(MetricsGuard { provider: None });
+    if !cfg.enabled && !cfg.prometheus_enabled {
+        return Ok(MetricsGuard {
+            provider: None,
+            prometheus_server: None,
+        });
     }
-    let exporter = opentelemetry_otlp::MetricExporter::builder()
-        .with_tonic()
-        .with_endpoint(cfg.otlp_endpoint.clone())
-        .build()?;
-    let reader = PeriodicReader::builder(exporter)
-        .with_interval(Duration::from_millis(cfg.export_interval_ms))
-        .build();
-    let provider = SdkMeterProvider::builder()
-        .with_reader(reader)
-        .with_resource(
-            Resource::builder()
-                .with_service_name(service_name.to_string())
-                .build(),
-        )
-        .build();
+
+    let mut builder = SdkMeterProvider::builder().with_resource(
+        Resource::builder()
+            .with_service_name(service_name.to_string())
+            .build(),
+    );
+
+    if cfg.enabled {
+        let exporter = opentelemetry_otlp::MetricExporter::builder()
+            .with_tonic()
+            .with_endpoint(cfg.otlp_endpoint.clone())
+            .build()?;
+        let reader = PeriodicReader::builder(exporter)
+            .with_interval(Duration::from_millis(cfg.export_interval_ms))
+            .build();
+        builder = builder.with_reader(reader);
+    }
+
+    let prometheus_registry = if cfg.prometheus_enabled {
+        let registry = Registry::new();
+        let reader = opentelemetry_prometheus::exporter()
+            .with_registry(registry.clone())
+            .build()?;
+        builder = builder.with_reader(reader);
+        Some(registry)
+    } else {
+        None
+    };
+
+    let provider = builder.build();
     opentelemetry::global::set_meter_provider(provider.clone());
+
+    let prometheus_server = match prometheus_registry {
+        Some(registry) => {
+            Some(spawn_prometheus_endpoint(registry, cfg.prometheus_listen_addr).await?)
+        }
+        None => None,
+    };
+
     Ok(MetricsGuard {
         provider: Some(provider),
+        prometheus_server,
     })
+}
+
+async fn spawn_prometheus_endpoint(
+    registry: Registry,
+    addr: SocketAddr,
+) -> Result<JoinHandle<()>, Box<dyn std::error::Error>> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    info!(%addr, "prometheus metrics endpoint listening");
+    Ok(tokio::spawn(async move {
+        loop {
+            let stream = match listener.accept().await {
+                Ok((stream, _peer)) => stream,
+                Err(e) => {
+                    warn!(error = %e, "prometheus endpoint accept failed");
+                    continue;
+                }
+            };
+            let registry = registry.clone();
+            tokio::spawn(async move {
+                let io = hyper_util::rt::TokioIo::new(stream);
+                let service = hyper::service::service_fn(move |req: hyper::Request<Incoming>| {
+                    let registry = registry.clone();
+                    async move {
+                        Ok::<_, std::convert::Infallible>(scrape_response(
+                            &registry,
+                            req.uri().path(),
+                        ))
+                    }
+                });
+                if let Err(e) = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(io, service)
+                    .await
+                {
+                    debug!(error = %e, "prometheus connection closed with error");
+                }
+            });
+        }
+    }))
+}
+
+fn scrape_response(registry: &Registry, path: &str) -> hyper::Response<Full<Bytes>> {
+    if path != "/metrics" {
+        return hyper::Response::builder()
+            .status(hyper::StatusCode::NOT_FOUND)
+            .body(Full::new(Bytes::from_static(b"try /metrics\n")))
+            .expect("static response is valid");
+    }
+    let encoder = TextEncoder::new();
+    let mut buf = Vec::new();
+    if let Err(e) = encoder.encode(&registry.gather(), &mut buf) {
+        error!(error = %e, "failed to encode prometheus metrics");
+        return hyper::Response::builder()
+            .status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
+            .body(Full::new(Bytes::from_static(b"# encoding error\n")))
+            .expect("static response is valid");
+    }
+    hyper::Response::builder()
+        .status(hyper::StatusCode::OK)
+        .header(hyper::header::CONTENT_TYPE, encoder.format_type())
+        .body(Full::new(Bytes::from(buf)))
+        .expect("response with valid header is valid")
 }
 
 #[derive(Default)]

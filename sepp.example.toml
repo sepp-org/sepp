@@ -171,6 +171,14 @@ otlp_endpoint = "http://localhost:4317"
 # How often metrics are flushed to the endpoint.
 export_interval_ms = 5000
 
+# Expose a Prometheus scrape endpoint at `GET /metrics`. Independent of the
+# OTLP push exporter above, enable either, both, or neither.
+prometheus_enabled = false
+
+# Address the Prometheus scrape endpoint binds to (only used when
+# prometheus_enabled = true).
+prometheus_listen_addr = "0.0.0.0:9464"
+
 # Per-queue declarations and overrides. Each missing field falls back to the
 # matching global default in [limits] / [storage]. Allowed even when
 # server.strict_queues = false; in strict mode, only the queues listed here
