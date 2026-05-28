@@ -137,8 +137,13 @@ impl Metrics {
     ) {
         if let Err(status) = result {
             span.record("error", tracing::field::display(status));
+            let server_fault = matches!(
+                status.code(),
+                tonic::Code::Internal | tonic::Code::Unknown | tonic::Code::DataLoss
+            );
             let _enter = span.enter();
-            if status.code() == tonic::Code::Internal {
+            if server_fault {
+                span.record("otel.status_code", "error");
                 tracing::error!(method, error = %status, "request failed");
             } else {
                 tracing::debug!(method, error = %status, "request rejected");

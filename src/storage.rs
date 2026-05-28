@@ -21,9 +21,11 @@ use uuid::Uuid;
 use crate::config::Config;
 use crate::metrics::{CycleMetrics, Metrics, QueueDepthSnapshot};
 use crate::pb::sepp::v1::{
-    EnqueueRequest, EnqueueResponse, ExtendRequest, Job, NackRequest, Payload, nack_retry,
+    EnqueueRequest, EnqueueResponse, ExtendRequest, Job, NackRequest, Payload, TraceContext,
+    nack_retry,
 };
 use crate::queues::SharedRegistry;
+use crate::telemetry;
 
 pub fn now_ms() -> i64 {
     SystemTime::now()
@@ -145,37 +147,56 @@ struct Inflight {
     priority: u32,
     max_attempts: u32,
     queue: String,
+    trace_context: Option<TraceContext>,
 }
 
 fn encode_inflight(s: &Inflight) -> Vec<u8> {
-    let mut v = Vec::with_capacity(28 + s.queue.len());
+    let tc_bytes = s
+        .trace_context
+        .as_ref()
+        .map(Message::encode_to_vec)
+        .unwrap_or_default();
+    let mut v = Vec::with_capacity(30 + s.queue.len() + tc_bytes.len());
     v.extend_from_slice(&s.attempt.to_be_bytes());
     v.extend_from_slice(&s.lease_expires_at.to_be_bytes());
     v.extend_from_slice(&s.enqueued_at.to_be_bytes());
     v.extend_from_slice(&s.priority.to_be_bytes());
     v.extend_from_slice(&s.max_attempts.to_be_bytes());
+    v.extend_from_slice(&(s.queue.len() as u16).to_be_bytes());
     v.extend_from_slice(s.queue.as_bytes());
+    v.extend_from_slice(&tc_bytes);
     v
 }
 
 fn decode_inflight(bytes: &[u8]) -> Result<Inflight, Status> {
     let corrupt = || Status::internal("corrupt inflight record");
-    let attempt = read_u32(bytes, 0).ok_or_else(corrupt)?;
-    let lease_expires_at = read_i64(bytes, 4).ok_or_else(corrupt)?;
-    let enqueued_at = read_i64(bytes, 12).ok_or_else(corrupt)?;
-    let priority = read_u32(bytes, 20).ok_or_else(corrupt)?;
-    let max_attempts = read_u32(bytes, 24).ok_or_else(corrupt)?;
-    let queue = std::str::from_utf8(bytes.get(28..).ok_or_else(corrupt)?)
-        .map_err(|_| corrupt())?
-        .to_owned();
-    Ok(Inflight {
-        attempt,
-        lease_expires_at,
-        enqueued_at,
-        priority,
-        max_attempts,
-        queue,
-    })
+    let parse = || -> Option<Inflight> {
+        let attempt = read_u32(bytes, 0)?;
+        let lease_expires_at = read_i64(bytes, 4)?;
+        let enqueued_at = read_i64(bytes, 12)?;
+        let priority = read_u32(bytes, 20)?;
+        let max_attempts = read_u32(bytes, 24)?;
+        let queue_len = u16::from_be_bytes(bytes.get(28..30)?.try_into().ok()?) as usize;
+        let queue = std::str::from_utf8(bytes.get(30..30 + queue_len)?)
+            .ok()?
+            .to_owned();
+        let tc_bytes = bytes.get(30 + queue_len..)?;
+        let trace_context = if tc_bytes.is_empty() {
+            None
+        } else {
+            Some(TraceContext::decode(tc_bytes).ok()?)
+        };
+        Some(Inflight {
+            attempt,
+            lease_expires_at,
+            enqueued_at,
+            priority,
+            max_attempts,
+            queue,
+            trace_context,
+        })
+    };
+    parse().ok_or_else(corrupt)
 }
 
 fn stg_err(e: fjall::Error) -> Status {
@@ -363,15 +384,15 @@ enum Command {
     Ack {
         job_id: String,
         attempt: u32,
-        resp: oneshot::Sender<Result<(), Status>>,
+        resp: oneshot::Sender<Result<Option<TraceContext>, Status>>,
     },
     Nack {
         req: NackRequest,
-        resp: oneshot::Sender<Result<bool, Status>>,
+        resp: oneshot::Sender<Result<(bool, Option<TraceContext>), Status>>,
     },
     Extend {
         req: ExtendRequest,
-        resp: oneshot::Sender<Result<i64, Status>>,
+        resp: oneshot::Sender<Result<(i64, Option<TraceContext>), Status>>,
     },
 }
 
@@ -554,8 +575,8 @@ fn run_rpc_cycle(
                 attempt,
                 resp,
             } => match apply_ack(store, indexes, &mut tx, &mut cycle, &job_id, attempt) {
-                Ok(()) => responders.push(Box::new(move |o| {
-                    let _ = resp.send(o.clone());
+                Ok(trace_context) => responders.push(Box::new(move |o| {
+                    let _ = resp.send(o.clone().map(|()| trace_context));
                 })),
                 Err(e) => {
                     let _ = resp.send(Err(e));
@@ -563,8 +584,8 @@ fn run_rpc_cycle(
             },
             Command::Nack { req, resp } => {
                 match apply_nack(store, indexes, &mut tx, &mut cycle, req) {
-                    Ok(dead_lettered) => responders.push(Box::new(move |o| {
-                        let _ = resp.send(o.clone().map(|()| dead_lettered));
+                    Ok(outcome) => responders.push(Box::new(move |o| {
+                        let _ = resp.send(o.clone().map(|()| outcome));
                     })),
                     Err(e) => {
                         let _ = resp.send(Err(e));
@@ -573,8 +594,8 @@ fn run_rpc_cycle(
             }
             Command::Extend { req, resp } => {
                 match apply_extend(store, indexes, &mut tx, &mut cycle, req) {
-                    Ok(lease_expires_at) => responders.push(Box::new(move |o| {
-                        let _ = resp.send(o.clone().map(|()| lease_expires_at));
+                    Ok(outcome) => responders.push(Box::new(move |o| {
+                        let _ = resp.send(o.clone().map(|()| outcome));
                     })),
                     Err(e) => {
                         let _ = resp.send(Err(e));
@@ -863,6 +884,7 @@ fn apply_reserve(
                 priority: job.priority,
                 max_attempts: job.max_attempts,
                 queue: job_queue,
+                trace_context: job.trace_context.clone(),
             };
             tx.remove(&store.ready, ready_k);
             tx.insert(
@@ -889,7 +911,7 @@ fn apply_ack(
     cycle: &mut Cycle,
     job_id: &str,
     attempt: u32,
-) -> Result<(), Status> {
+) -> Result<Option<TraceContext>, Status> {
     let stored = tx
         .get(&store.inflight, job_id.as_bytes())
         .map_err(stg_err)?
@@ -906,7 +928,7 @@ fn apply_ack(
     indexes.leases.remove(&lease_timer);
     cycle.acked(&inflight.queue);
     cycle.dirty = true;
-    Ok(())
+    Ok(inflight.trace_context)
 }
 
 fn apply_nack(
@@ -915,7 +937,7 @@ fn apply_nack(
     tx: &mut WriteTransaction<'_>,
     cycle: &mut Cycle,
     req: NackRequest,
-) -> Result<bool, Status> {
+) -> Result<(bool, Option<TraceContext>), Status> {
     let now = now_ms();
     let stored = tx
         .get(&store.inflight, req.job_id.as_bytes())
@@ -954,7 +976,7 @@ fn apply_nack(
         cycle.nacked(&inflight.queue);
         cycle.dead_lettered(&inflight.queue, cause_label);
         cycle.dirty = true;
-        return Ok(true);
+        return Ok((true, inflight.trace_context));
     }
 
     let attempt = inflight.attempt + 1;
@@ -979,7 +1001,7 @@ fn apply_nack(
     indexes.leases.remove(&lease_timer);
     cycle.nacked(&inflight.queue);
     cycle.dirty = true;
-    Ok(false)
+    Ok((false, inflight.trace_context))
 }
 
 fn apply_extend(
@@ -988,7 +1010,7 @@ fn apply_extend(
     tx: &mut WriteTransaction<'_>,
     cycle: &mut Cycle,
     req: ExtendRequest,
-) -> Result<i64, Status> {
+) -> Result<(i64, Option<TraceContext>), Status> {
     let stored = tx
         .get(&store.inflight, req.job_id.as_bytes())
         .map_err(stg_err)?
@@ -1018,7 +1040,7 @@ fn apply_extend(
     tx.insert(&store.leases, new_timer.clone(), Vec::new());
     indexes.leases.insert(new_timer, &inflight.queue);
     cycle.dirty = true;
-    Ok(lease_expires_at)
+    Ok((lease_expires_at, inflight.trace_context))
 }
 
 fn apply_sweep(
@@ -1093,8 +1115,20 @@ fn apply_sweep(
         };
 
         if inflight.attempt >= inflight.max_attempts {
+            let job_id_str = String::from_utf8_lossy(job_id);
+            let _span = telemetry::enabled().then(|| {
+                let span = tracing::info_span!(
+                    "sepp.dead_letter",
+                    job_id = %job_id_str,
+                    queue = %inflight.queue,
+                    attempt = inflight.attempt,
+                    cause = "lease_expired",
+                );
+                telemetry::link_from_proto(&span, inflight.trace_context.as_ref());
+                span.entered()
+            });
             warn!(
-                job_id = %String::from_utf8_lossy(job_id),
+                job_id = %job_id_str,
                 attempt = inflight.attempt,
                 "job dead-lettered: lease expired with attempts exhausted"
             );
@@ -1107,6 +1141,17 @@ fn apply_sweep(
                 continue;
             };
             let attempt = inflight.attempt + 1;
+            let _span = telemetry::enabled().then(|| {
+                let span = tracing::info_span!(
+                    "sepp.redeliver",
+                    job_id = %job_id_str,
+                    queue = %inflight.queue,
+                    attempt,
+                    reason = "lease_expired",
+                );
+                telemetry::link_from_proto(&span, inflight.trace_context.as_ref());
+                span.entered()
+            });
             debug!(
                 job_id = %job_id_str,
                 queue = %inflight.queue,
@@ -1337,7 +1382,7 @@ impl Storage {
         .await?
     }
 
-    pub async fn ack(&self, job_id: String, attempt: u32) -> Result<(), Status> {
+    pub async fn ack(&self, job_id: String, attempt: u32) -> Result<Option<TraceContext>, Status> {
         self.send(|resp| Command::Ack {
             job_id,
             attempt,
@@ -1346,11 +1391,11 @@ impl Storage {
         .await?
     }
 
-    pub async fn nack(&self, req: NackRequest) -> Result<bool, Status> {
+    pub async fn nack(&self, req: NackRequest) -> Result<(bool, Option<TraceContext>), Status> {
         self.send(|resp| Command::Nack { req, resp }).await?
     }
 
-    pub async fn extend(&self, req: ExtendRequest) -> Result<i64, Status> {
+    pub async fn extend(&self, req: ExtendRequest) -> Result<(i64, Option<TraceContext>), Status> {
         self.send(|resp| Command::Extend { req, resp }).await?
     }
 }
@@ -1438,16 +1483,21 @@ mod tests {
         assert!(decode_job(&[0, 5, 1, 2]).is_err());
     }
 
-    #[test]
-    fn inflight_encoding_round_trips() {
-        let s = Inflight {
+    fn sample_inflight(queue: &str, trace_context: Option<TraceContext>) -> Inflight {
+        Inflight {
             attempt: 4,
             lease_expires_at: 1_700_000_999_000,
             enqueued_at: 1_700_000_000_000,
             priority: 7,
             max_attempts: 10,
-            queue: "my-queue".to_string(),
-        };
+            queue: queue.to_string(),
+            trace_context,
+        }
+    }
+
+    #[test]
+    fn inflight_encoding_round_trips() {
+        let s = sample_inflight("my-queue", None);
         let d = decode_inflight(&encode_inflight(&s)).expect("decodes");
         assert_eq!(d.attempt, s.attempt);
         assert_eq!(d.lease_expires_at, s.lease_expires_at);
@@ -1455,25 +1505,46 @@ mod tests {
         assert_eq!(d.priority, s.priority);
         assert_eq!(d.max_attempts, s.max_attempts);
         assert_eq!(d.queue, s.queue);
+        assert_eq!(d.trace_context, None);
+    }
+
+    #[test]
+    fn inflight_encoding_round_trips_with_trace_context() {
+        let tc = TraceContext {
+            traceparent: "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01".to_string(),
+            tracestate: Some("vendor=abc".to_string()),
+        };
+        let s = sample_inflight("orders", Some(tc.clone()));
+        let d = decode_inflight(&encode_inflight(&s)).expect("decodes");
+        assert_eq!(d.queue, "orders");
+        assert_eq!(d.trace_context, Some(tc));
+    }
+
+    #[test]
+    fn inflight_encoding_round_trips_empty_queue() {
+        let tc = TraceContext {
+            traceparent: "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01".to_string(),
+            tracestate: None,
+        };
+        let s = sample_inflight("", Some(tc.clone()));
+        let d = decode_inflight(&encode_inflight(&s)).expect("decodes");
+        assert_eq!(d.queue, "");
+        assert_eq!(d.trace_context, Some(tc));
     }
 
     #[test]
     fn decode_inflight_rejects_truncated_input() {
         assert!(decode_inflight(&[]).is_err());
         assert!(decode_inflight(&[0u8; 20]).is_err());
+        let bytes = encode_inflight(&sample_inflight("q", None));
+        assert!(decode_inflight(&bytes[..10]).is_err());
     }
 
     #[test]
     fn decode_inflight_rejects_invalid_queue_utf8() {
-        let mut bytes = encode_inflight(&Inflight {
-            attempt: 1,
-            lease_expires_at: 0,
-            enqueued_at: 0,
-            priority: 0,
-            max_attempts: 1,
-            queue: String::new(),
-        });
-        bytes.extend_from_slice(&[0xff, 0xff]);
+        let mut bytes = encode_inflight(&sample_inflight("ab", None));
+        bytes[30] = 0xff;
+        bytes[31] = 0xff;
         assert!(decode_inflight(&bytes).is_err());
     }
 

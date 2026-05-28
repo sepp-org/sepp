@@ -260,6 +260,8 @@ impl QueueService for QueueServer {
         // and `.instrument` the body rather than using `#[tracing::instrument]`.
         let span = tracing::info_span!(
             "sepp.enqueue",
+            otel.kind = "server",
+            otel.status_code = tracing::field::Empty,
             job_ids = tracing::field::Empty,
             error = tracing::field::Empty
         );
@@ -331,6 +333,8 @@ impl QueueService for QueueServer {
     ) -> Result<Response<EnqueueAtomicResponse>, Status> {
         let span = tracing::info_span!(
             "sepp.enqueue_atomic",
+            otel.kind = "server",
+            otel.status_code = tracing::field::Empty,
             job_ids = tracing::field::Empty,
             error = tracing::field::Empty,
         );
@@ -402,6 +406,8 @@ impl QueueService for QueueServer {
     ) -> Result<Response<ReserveResponse>, Status> {
         let span = tracing::info_span!(
             "sepp.reserve",
+            otel.kind = "server",
+            otel.status_code = tracing::field::Empty,
             job_ids = tracing::field::Empty,
             error = tracing::field::Empty,
             worker_id = request.get_ref().worker_id.as_deref().unwrap_or("<none>"),
@@ -465,22 +471,29 @@ impl QueueService for QueueServer {
             loop {
                 let armed = waiter.arm();
 
-                let jobs = self
+                let mut jobs = self
                     .storage
                     .reserve_once(req.queues.clone(), lease, max_jobs)
                     .await?;
                 if !jobs.is_empty() {
                     let job_ids: Vec<&str> = jobs.iter().map(|j| j.id.as_str()).collect();
                     tracing::Span::current().record("job_ids", tracing::field::debug(&job_ids));
-                    for job in &jobs {
-                        let deliver = tracing::info_span!(
-                            "sepp.deliver",
-                            job_id = %job.id,
-                            job_type = %job.job_type,
-                            attempt = job.attempt,
-                        );
-                        telemetry::link_from_proto(&deliver, job.trace_context.as_ref());
-                        deliver.in_scope(|| {});
+
+                    if telemetry::enabled() {
+                        for job in &mut jobs {
+                            let deliver = tracing::info_span!(
+                                "sepp.deliver",
+                                job_id = %job.id,
+                                job_type = %job.job_type,
+                                attempt = job.attempt,
+                            );
+                            telemetry::link_from_proto(&deliver, job.trace_context.as_ref());
+                            if let Some(delivery_ctx) =
+                                deliver.in_scope(telemetry::current_trace_context)
+                            {
+                                job.trace_context = Some(delivery_ctx);
+                            }
+                        }
                     }
                     return Ok(Response::new(ReserveResponse { jobs }));
                 }
@@ -508,6 +521,8 @@ impl QueueService for QueueServer {
     async fn ack(&self, request: Request<AckRequest>) -> Result<Response<AckResponse>, Status> {
         let span = tracing::info_span!(
             "sepp.ack",
+            otel.kind = "server",
+            otel.status_code = tracing::field::Empty,
             job_id = %request.get_ref().job_id,
             worker_id = request.get_ref().worker_id.as_deref().unwrap_or("<none>"),
             error = tracing::field::Empty
@@ -519,7 +534,8 @@ impl QueueService for QueueServer {
             self.validator
                 .validate(&req)
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
-            self.storage.ack(req.job_id.clone(), req.attempt).await?;
+            let trace_context = self.storage.ack(req.job_id.clone(), req.attempt).await?;
+            telemetry::link_from_proto(&tracing::Span::current(), trace_context.as_ref());
             Ok(Response::new(AckResponse { job_id: req.job_id }))
         }
         .instrument(span.clone())
@@ -531,6 +547,8 @@ impl QueueService for QueueServer {
     async fn nack(&self, request: Request<NackRequest>) -> Result<Response<NackResponse>, Status> {
         let span = tracing::info_span!(
             "sepp.nack",
+            otel.kind = "server",
+            otel.status_code = tracing::field::Empty,
             job_id = %request.get_ref().job_id,
             worker_id = request.get_ref().worker_id.as_deref().unwrap_or("<none>"),
             error = tracing::field::Empty
@@ -543,7 +561,8 @@ impl QueueService for QueueServer {
                 .validate(&req)
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
             let job_id = req.job_id.clone();
-            let dead_lettered = self.storage.nack(req).await?;
+            let (dead_lettered, trace_context) = self.storage.nack(req).await?;
+            telemetry::link_from_proto(&tracing::Span::current(), trace_context.as_ref());
             if dead_lettered {
                 tracing::info!(%job_id, "job dead-lettered via nack");
             }
@@ -564,6 +583,8 @@ impl QueueService for QueueServer {
     ) -> Result<Response<ExtendResponse>, Status> {
         let span = tracing::info_span!(
             "sepp.extend",
+            otel.kind = "server",
+            otel.status_code = tracing::field::Empty,
             job_id = %request.get_ref().job_id,
             worker_id = request.get_ref().worker_id.as_deref().unwrap_or("<none>"),
             error = tracing::field::Empty
@@ -578,7 +599,8 @@ impl QueueService for QueueServer {
             // The per-queue lease ceiling is applied inside storage where the
             // job's queue is known via its Inflight record.
             let job_id = req.job_id.clone();
-            let lease_expires_at = self.storage.extend(req).await?;
+            let (lease_expires_at, trace_context) = self.storage.extend(req).await?;
+            telemetry::link_from_proto(&tracing::Span::current(), trace_context.as_ref());
             Ok(Response::new(ExtendResponse {
                 job_id,
                 lease_expires_at,
@@ -594,6 +616,7 @@ impl QueueService for QueueServer {
         &self,
         _request: Request<GetServerInfoRequest>,
     ) -> Result<Response<GetServerInfoResponse>, Status> {
+        let _span = tracing::info_span!("sepp.get_server_info", otel.kind = "server").entered();
         let defaults = self.registry.load().effective("");
         Ok(Response::new(GetServerInfoResponse {
             server_version: env!("CARGO_PKG_VERSION").to_string(),

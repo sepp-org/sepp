@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use opentelemetry::propagation::{Extractor, Injector, TextMapPropagator};
 use opentelemetry::trace::{TraceContextExt, TracerProvider as _};
@@ -16,6 +17,12 @@ use tracing_subscriber::{EnvFilter, fmt};
 
 use crate::config::{LogFormat, LoggingConfig, TracingConfig};
 use crate::pb::sepp::v1::TraceContext;
+
+static TRACING_ENABLED: AtomicBool = AtomicBool::new(false);
+
+pub fn enabled() -> bool {
+    TRACING_ENABLED.load(Ordering::Relaxed)
+}
 
 pub struct TelemetryGuard {
     provider: Option<SdkTracerProvider>,
@@ -79,6 +86,7 @@ pub fn init(
             .init(),
     }
 
+    TRACING_ENABLED.store(true, Ordering::Relaxed);
     tracing::info!(
         endpoint = %tracing_cfg.otlp_endpoint,
         service_name = %tracing_cfg.service_name,
@@ -92,6 +100,9 @@ pub fn init(
 }
 
 pub fn set_parent_from_metadata(span: &Span, metadata: &MetadataMap) {
+    if !enabled() {
+        return;
+    }
     let parent = TraceContextPropagator::new().extract(&MetadataExtractor(metadata));
     if parent.span().span_context().is_valid() {
         let _ = span.set_parent(parent);
@@ -99,6 +110,9 @@ pub fn set_parent_from_metadata(span: &Span, metadata: &MetadataMap) {
 }
 
 pub fn link_from_proto(span: &Span, trace_context: Option<&TraceContext>) {
+    if !enabled() {
+        return;
+    }
     let Some(tc) = trace_context else {
         return;
     };
@@ -115,6 +129,9 @@ pub fn link_from_proto(span: &Span, trace_context: Option<&TraceContext>) {
 }
 
 pub fn current_trace_context() -> Option<TraceContext> {
+    if !enabled() {
+        return None;
+    }
     let cx = Span::current().context();
     if !cx.span().span_context().is_valid() {
         return None;
@@ -162,5 +179,16 @@ impl Extractor for MapExtractor<'_> {
 
     fn keys(&self) -> Vec<&str> {
         self.0.keys().map(String::as_str).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tracing_is_disabled_by_default() {
+        assert!(!enabled());
+        assert!(current_trace_context().is_none());
     }
 }
