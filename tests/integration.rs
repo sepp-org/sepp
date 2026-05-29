@@ -126,7 +126,10 @@ fn spawn_server_process(
     // Drain stdout for the child's whole life so its log writes never block on a
     // full pipe; record listening ports as they appear.
     std::thread::spawn(move || {
-        for line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
             for (key, needle) in PORT_MARKERS {
                 if line.contains(needle)
                     && let Some(port) = parse_listen_port(&line)
