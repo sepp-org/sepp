@@ -196,6 +196,7 @@ prometheus_listen_addr = "0.0.0.0:9464"
 #   max_custom_total_bytes
 #   max_custom_key_bytes
 #   dedup_window_ms
+#   max_queue_depth
 
 #[[queues]]
 #name = "emails"

@@ -17,7 +17,7 @@ pub enum PersistMode {
     Buffer,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Validate)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Validate)]
 #[serde(default)]
 #[garde(allow_unvalidated)]
 pub struct ServerConfig {
@@ -49,7 +49,7 @@ impl Default for ServerConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct QueueConfig {
     pub name: String,
@@ -167,14 +167,14 @@ impl EffectiveLimits {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Validate)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Validate)]
 #[serde(default)]
 pub struct AuthConfig {
     #[garde(inner(inner(length(min = 1))))]
     pub api_keys: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Validate)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Validate)]
 #[serde(default)]
 #[garde(allow_unvalidated)]
 pub struct LimitsConfig {
@@ -234,7 +234,7 @@ impl Default for LimitsConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Validate)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Validate)]
 #[serde(default)]
 #[garde(allow_unvalidated)]
 pub struct StorageConfig {
@@ -263,7 +263,7 @@ impl Default for StorageConfig {
             sweep_interval_ms: 1000,
             sweep_limit: 10_000,
             dedup_window_ms: 24 * 60 * 60 * 1000,
-            command_queue_capacity: 1024,
+            command_queue_capacity: 4096,
             cache_size_bytes: None,
             max_journaling_size_bytes: None,
             max_cached_files: None,
@@ -279,7 +279,7 @@ pub enum LogFormat {
     Json,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LoggingConfig {
     pub level: String,
@@ -289,13 +289,13 @@ pub struct LoggingConfig {
 impl Default for LoggingConfig {
     fn default() -> Self {
         Self {
-            level: "info".to_string(),
+            level: "info,lsm_tree=warn,fjall=warn".to_string(),
             format: LogFormat::Text,
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Validate)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Validate)]
 #[serde(default)]
 #[garde(allow_unvalidated)]
 pub struct TracingConfig {
@@ -317,7 +317,7 @@ impl Default for TracingConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Validate)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Validate)]
 #[serde(default)]
 #[garde(allow_unvalidated)]
 pub struct MetricsConfig {
@@ -333,14 +333,14 @@ impl Default for MetricsConfig {
         Self {
             enabled: false,
             otlp_endpoint: "http://localhost:4317".to_string(),
-            export_interval_ms: 60_000,
+            export_interval_ms: 5_000,
             prometheus_enabled: false,
             prometheus_listen_addr: SocketAddr::from(([0, 0, 0, 0], 9464)),
         }
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub server: ServerConfig,
@@ -450,6 +450,22 @@ mod tests {
     #[test]
     fn default_config_is_valid() {
         assert!(Config::default().validate().is_ok());
+    }
+
+    #[test]
+    fn example_config_matches_defaults() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/sepp.example.toml");
+        let from_example: Config = Figment::new()
+            .merge(Serialized::defaults(Config::default()))
+            .merge(Toml::file(path))
+            .extract()
+            .expect("sepp.example.toml should parse");
+        assert_eq!(
+            from_example,
+            Config::default(),
+            "sepp.example.toml drifted from Config::default(); \
+             update src/config.rs or sepp.example.toml so they agree"
+        );
     }
 
     #[test]
