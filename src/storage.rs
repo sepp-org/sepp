@@ -376,6 +376,24 @@ fn resync(store: &Store, indexes: &mut Indexes) {
     }
 }
 
+pub struct AckOutcome {
+    pub queue: String,
+    pub trace_context: Option<TraceContext>,
+}
+
+pub struct NackOutcome {
+    pub queue: String,
+    pub dead_lettered: bool,
+    pub retry_delay_ms: u64,
+    pub trace_context: Option<TraceContext>,
+}
+
+pub struct ExtendOutcome {
+    pub queue: String,
+    pub lease_expires_at: i64,
+    pub trace_context: Option<TraceContext>,
+}
+
 enum Command {
     Enqueue {
         jobs: Vec<EnqueueRequest>,
@@ -390,15 +408,15 @@ enum Command {
     Ack {
         job_id: String,
         attempt: u32,
-        resp: oneshot::Sender<Result<Option<TraceContext>, Status>>,
+        resp: oneshot::Sender<Result<AckOutcome, Status>>,
     },
     Nack {
         req: NackRequest,
-        resp: oneshot::Sender<Result<(bool, Option<TraceContext>), Status>>,
+        resp: oneshot::Sender<Result<NackOutcome, Status>>,
     },
     Extend {
         req: ExtendRequest,
-        resp: oneshot::Sender<Result<(i64, Option<TraceContext>), Status>>,
+        resp: oneshot::Sender<Result<ExtendOutcome, Status>>,
     },
 }
 
@@ -934,7 +952,7 @@ fn apply_ack(
     cycle: &mut Cycle,
     job_id: &str,
     attempt: u32,
-) -> Result<Option<TraceContext>, Status> {
+) -> Result<AckOutcome, Status> {
     let stored = tx
         .get(&store.inflight, job_id.as_bytes())
         .map_err(stg_err)?
@@ -951,7 +969,10 @@ fn apply_ack(
     indexes.leases.remove(&lease_timer);
     cycle.acked(&inflight.queue);
     cycle.dirty = true;
-    Ok(inflight.trace_context)
+    Ok(AckOutcome {
+        queue: inflight.queue,
+        trace_context: inflight.trace_context,
+    })
 }
 
 fn apply_nack(
@@ -960,7 +981,7 @@ fn apply_nack(
     tx: &mut WriteTransaction<'_>,
     cycle: &mut Cycle,
     req: NackRequest,
-) -> Result<(bool, Option<TraceContext>), Status> {
+) -> Result<NackOutcome, Status> {
     let now = now_ms();
     let stored = tx
         .get(&store.inflight, req.job_id.as_bytes())
@@ -999,7 +1020,12 @@ fn apply_nack(
         cycle.nacked(&inflight.queue);
         cycle.dead_lettered(&inflight.queue, cause_label);
         cycle.dirty = true;
-        return Ok((true, inflight.trace_context));
+        return Ok(NackOutcome {
+            queue: inflight.queue,
+            dead_lettered: true,
+            retry_delay_ms: 0,
+            trace_context: inflight.trace_context,
+        });
     }
 
     let attempt = inflight.attempt + 1;
@@ -1024,7 +1050,12 @@ fn apply_nack(
     indexes.leases.remove(&lease_timer);
     cycle.nacked(&inflight.queue);
     cycle.dirty = true;
-    Ok((false, inflight.trace_context))
+    Ok(NackOutcome {
+        queue: inflight.queue,
+        dead_lettered: false,
+        retry_delay_ms,
+        trace_context: inflight.trace_context,
+    })
 }
 
 fn apply_extend(
@@ -1033,7 +1064,7 @@ fn apply_extend(
     tx: &mut WriteTransaction<'_>,
     cycle: &mut Cycle,
     req: ExtendRequest,
-) -> Result<(i64, Option<TraceContext>), Status> {
+) -> Result<ExtendOutcome, Status> {
     let stored = tx
         .get(&store.inflight, req.job_id.as_bytes())
         .map_err(stg_err)?
@@ -1063,7 +1094,11 @@ fn apply_extend(
     tx.insert(&store.leases, new_timer.clone(), Vec::new());
     indexes.leases.insert(new_timer, &inflight.queue);
     cycle.dirty = true;
-    Ok((lease_expires_at, inflight.trace_context))
+    Ok(ExtendOutcome {
+        queue: inflight.queue,
+        lease_expires_at,
+        trace_context: inflight.trace_context,
+    })
 }
 
 fn apply_sweep(
@@ -1106,6 +1141,25 @@ fn apply_sweep(
             }
         };
         let attempt = attempt_hint.unwrap_or(job.attempt);
+        let _span = telemetry::enabled().then(|| {
+            let span = tracing::info_span!(
+                "sepp.promote",
+                job_id = %job.id,
+                queue = %queue,
+                job_type = %job.job_type,
+                attempt,
+                priority = job.priority,
+                scheduled_at = job.scheduled_at,
+            );
+            telemetry::link_from_proto(&span, job.trace_context.as_ref());
+            span.entered()
+        });
+        debug!(
+            job_id = %job.id,
+            queue = %queue,
+            attempt,
+            "scheduled job promoted to ready",
+        );
         let rk = ready_key(&queue, job.priority, job.enqueued_at, &job.id);
         tx.insert(&store.ready, rk.clone(), attempt.to_be_bytes().to_vec());
         indexes.ready.insert(rk, attempt);
@@ -1145,6 +1199,7 @@ fn apply_sweep(
                     job_id = %job_id_str,
                     queue = %inflight.queue,
                     attempt = inflight.attempt,
+                    max_attempts = inflight.max_attempts,
                     cause = "lease_expired",
                 );
                 telemetry::link_from_proto(&span, inflight.trace_context.as_ref());
@@ -1170,6 +1225,7 @@ fn apply_sweep(
                     job_id = %job_id_str,
                     queue = %inflight.queue,
                     attempt,
+                    max_attempts = inflight.max_attempts,
                     reason = "lease_expired",
                 );
                 telemetry::link_from_proto(&span, inflight.trace_context.as_ref());
@@ -1405,7 +1461,7 @@ impl Storage {
         .await?
     }
 
-    pub async fn ack(&self, job_id: String, attempt: u32) -> Result<Option<TraceContext>, Status> {
+    pub async fn ack(&self, job_id: String, attempt: u32) -> Result<AckOutcome, Status> {
         self.send(|resp| Command::Ack {
             job_id,
             attempt,
@@ -1414,11 +1470,11 @@ impl Storage {
         .await?
     }
 
-    pub async fn nack(&self, req: NackRequest) -> Result<(bool, Option<TraceContext>), Status> {
+    pub async fn nack(&self, req: NackRequest) -> Result<NackOutcome, Status> {
         self.send(|resp| Command::Nack { req, resp }).await?
     }
 
-    pub async fn extend(&self, req: ExtendRequest) -> Result<(i64, Option<TraceContext>), Status> {
+    pub async fn extend(&self, req: ExtendRequest) -> Result<ExtendOutcome, Status> {
         self.send(|resp| Command::Extend { req, resp }).await?
     }
 }

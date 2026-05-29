@@ -9,6 +9,7 @@ use crate::pb::sepp::v1::{
 use crate::queues::{QueueRegistry, SharedRegistry};
 use crate::storage::{Storage, now_ms};
 use crate::telemetry;
+use std::collections::BTreeSet;
 use std::{time::Duration, time::Instant as StdInstant};
 
 use opentelemetry::metrics::ObservableGauge;
@@ -212,8 +213,32 @@ impl QueueServer {
         }
         let responses = self.storage.enqueue(valid).await?;
         let job_ids: Vec<&str> = responses.iter().map(|r| r.job_id.as_str()).collect();
-        tracing::Span::current().record("job_ids", tracing::field::debug(&job_ids));
+        let deduplicated = responses.iter().filter(|r| r.deduplicated).count();
+        let span = tracing::Span::current();
+        span.record("job_ids", tracing::field::debug(&job_ids));
+        span.record("deduplicated", deduplicated as u64);
         Ok(responses)
+    }
+}
+
+// Record the distinct queues and job types a batch touched. For the common
+// single-job batch these collapse to the one queue and job type; for a fan-out
+// batch they give the full set without per-job cardinality blowup (the batch is
+// bounded by max_enqueue_batch).
+fn record_job_dimensions(span: &tracing::Span, jobs: &[EnqueueRequest]) {
+    let queues: BTreeSet<&str> = jobs.iter().map(|j| j.queue.as_str()).collect();
+    let job_types: BTreeSet<&str> = jobs.iter().map(|j| j.job_type.as_str()).collect();
+    span.record("queues", tracing::field::debug(&queues));
+    span.record("job_types", tracing::field::debug(&job_types));
+}
+
+// Label for the retry strategy a Nack requested, for the span.
+fn nack_strategy_label(req: &NackRequest) -> &'static str {
+    use pb::nack_retry::Strategy;
+    match req.retry.as_ref().and_then(|r| r.strategy.as_ref()) {
+        Some(Strategy::DelayMs(_)) => "delay",
+        Some(Strategy::DeadLetter(_)) => "dead_letter",
+        Some(Strategy::Default(_)) | None => "default",
     }
 }
 
@@ -262,6 +287,13 @@ impl QueueService for QueueServer {
             "sepp.enqueue",
             otel.kind = "server",
             otel.status_code = tracing::field::Empty,
+            batch_size = tracing::field::Empty,
+            queues = tracing::field::Empty,
+            job_types = tracing::field::Empty,
+            accepted = tracing::field::Empty,
+            rejected = tracing::field::Empty,
+            scheduled = tracing::field::Empty,
+            deduplicated = tracing::field::Empty,
             job_ids = tracing::field::Empty,
             error = tracing::field::Empty
         );
@@ -280,6 +312,10 @@ impl QueueService for QueueServer {
                     self.server_limits.max_enqueue_batch
                 )));
             }
+
+            let span = tracing::Span::current();
+            span.record("batch_size", req.jobs.len() as u64);
+            record_job_dimensions(&span, &req.jobs);
 
             let registry = self.registry.load();
             let mut valid = Vec::new();
@@ -305,6 +341,14 @@ impl QueueService for QueueServer {
                     }
                 }
             }
+
+            let accepted = valid.len();
+            span.record("accepted", accepted as u64);
+            span.record("rejected", (slots.len() - accepted) as u64);
+            span.record(
+                "scheduled",
+                valid.iter().filter(|j| j.scheduled_at.is_some()).count() as u64,
+            );
 
             let mut enqueued = self.commit_validated(valid).await?.into_iter();
             let results = slots
@@ -335,6 +379,14 @@ impl QueueService for QueueServer {
             "sepp.enqueue_atomic",
             otel.kind = "server",
             otel.status_code = tracing::field::Empty,
+            batch_size = tracing::field::Empty,
+            queues = tracing::field::Empty,
+            job_types = tracing::field::Empty,
+            accepted = tracing::field::Empty,
+            rejected = tracing::field::Empty,
+            scheduled = tracing::field::Empty,
+            deduplicated = tracing::field::Empty,
+            outcome = tracing::field::Empty,
             job_ids = tracing::field::Empty,
             error = tracing::field::Empty,
         );
@@ -353,6 +405,10 @@ impl QueueService for QueueServer {
                     self.server_limits.max_enqueue_batch
                 )));
             }
+
+            let span = tracing::Span::current();
+            span.record("batch_size", req.jobs.len() as u64);
+            record_job_dimensions(&span, &req.jobs);
 
             let registry = self.registry.load();
             let mut errors: Vec<pb::JobValidationError> = Vec::new();
@@ -378,7 +434,11 @@ impl QueueService for QueueServer {
                 }
             }
 
+            span.record("accepted", valid.len() as u64);
+            span.record("rejected", errors.len() as u64);
+
             if !errors.is_empty() {
+                span.record("outcome", "rejected");
                 return Ok(Response::new(EnqueueAtomicResponse {
                     outcome: Some(enqueue_atomic_response::Outcome::Rejection(
                         pb::BatchValidationFailure { errors },
@@ -386,6 +446,11 @@ impl QueueService for QueueServer {
                 }));
             }
 
+            span.record(
+                "scheduled",
+                valid.iter().filter(|j| j.scheduled_at.is_some()).count() as u64,
+            );
+            span.record("outcome", "committed");
             let responses = self.commit_validated(valid).await?;
             Ok(Response::new(EnqueueAtomicResponse {
                 outcome: Some(enqueue_atomic_response::Outcome::Success(
@@ -408,9 +473,15 @@ impl QueueService for QueueServer {
             "sepp.reserve",
             otel.kind = "server",
             otel.status_code = tracing::field::Empty,
+            worker_id = request.get_ref().worker_id.as_deref().unwrap_or("<none>"),
+            queues = ?request.get_ref().queues,
+            max_jobs = tracing::field::Empty,
+            lease_ms = tracing::field::Empty,
+            wait_ms = tracing::field::Empty,
+            job_count = tracing::field::Empty,
+            timed_out = tracing::field::Empty,
             job_ids = tracing::field::Empty,
             error = tracing::field::Empty,
-            worker_id = request.get_ref().worker_id.as_deref().unwrap_or("<none>"),
         );
         telemetry::set_parent_from_metadata(&span, request.metadata());
         let started = StdInstant::now();
@@ -468,6 +539,11 @@ impl QueueService for QueueServer {
             let deadline = Instant::now() + Duration::from_millis(wait);
             let waiter = self.storage.job_waiter(&req.queues);
 
+            let span = tracing::Span::current();
+            span.record("lease_ms", lease);
+            span.record("wait_ms", wait);
+            span.record("max_jobs", max_jobs as u64);
+
             loop {
                 let armed = waiter.arm();
 
@@ -477,7 +553,9 @@ impl QueueService for QueueServer {
                     .await?;
                 if !jobs.is_empty() {
                     let job_ids: Vec<&str> = jobs.iter().map(|j| j.id.as_str()).collect();
-                    tracing::Span::current().record("job_ids", tracing::field::debug(&job_ids));
+                    span.record("job_ids", tracing::field::debug(&job_ids));
+                    span.record("job_count", jobs.len() as u64);
+                    span.record("timed_out", false);
 
                     if telemetry::enabled() {
                         for job in &mut jobs {
@@ -486,6 +564,9 @@ impl QueueService for QueueServer {
                                 job_id = %job.id,
                                 job_type = %job.job_type,
                                 attempt = job.attempt,
+                                priority = job.priority,
+                                max_attempts = job.max_attempts,
+                                lease_expires_at = job.lease_expires_at,
                             );
                             telemetry::link_from_proto(&deliver, job.trace_context.as_ref());
                             if let Some(delivery_ctx) =
@@ -499,6 +580,8 @@ impl QueueService for QueueServer {
                 }
 
                 if Instant::now() >= deadline {
+                    span.record("job_count", 0u64);
+                    span.record("timed_out", true);
                     self.metrics.record_reserve_empty(&req.queues);
                     return Ok(Response::new(ReserveResponse { jobs: Vec::new() }));
                 }
@@ -506,6 +589,8 @@ impl QueueService for QueueServer {
                 tokio::select! {
                     _ = armed => {}
                     _ = sleep_until(deadline) => {
+                        span.record("job_count", 0u64);
+                        span.record("timed_out", true);
                         self.metrics.record_reserve_empty(&req.queues);
                         return Ok(Response::new(ReserveResponse { jobs: Vec::new() }));
                     }
@@ -524,7 +609,9 @@ impl QueueService for QueueServer {
             otel.kind = "server",
             otel.status_code = tracing::field::Empty,
             job_id = %request.get_ref().job_id,
+            attempt = request.get_ref().attempt,
             worker_id = request.get_ref().worker_id.as_deref().unwrap_or("<none>"),
+            queue = tracing::field::Empty,
             error = tracing::field::Empty
         );
         telemetry::set_parent_from_metadata(&span, request.metadata());
@@ -534,8 +621,10 @@ impl QueueService for QueueServer {
             self.validator
                 .validate(&req)
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
-            let trace_context = self.storage.ack(req.job_id.clone(), req.attempt).await?;
-            telemetry::link_from_proto(&tracing::Span::current(), trace_context.as_ref());
+            let outcome = self.storage.ack(req.job_id.clone(), req.attempt).await?;
+            let span = tracing::Span::current();
+            span.record("queue", outcome.queue.as_str());
+            telemetry::link_from_proto(&span, outcome.trace_context.as_ref());
             Ok(Response::new(AckResponse { job_id: req.job_id }))
         }
         .instrument(span.clone())
@@ -550,7 +639,13 @@ impl QueueService for QueueServer {
             otel.kind = "server",
             otel.status_code = tracing::field::Empty,
             job_id = %request.get_ref().job_id,
+            attempt = request.get_ref().attempt,
             worker_id = request.get_ref().worker_id.as_deref().unwrap_or("<none>"),
+            reason = request.get_ref().reason.as_deref().unwrap_or("<none>"),
+            retry = nack_strategy_label(request.get_ref()),
+            queue = tracing::field::Empty,
+            dead_lettered = tracing::field::Empty,
+            retry_delay_ms = tracing::field::Empty,
             error = tracing::field::Empty
         );
         telemetry::set_parent_from_metadata(&span, request.metadata());
@@ -561,14 +656,18 @@ impl QueueService for QueueServer {
                 .validate(&req)
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
             let job_id = req.job_id.clone();
-            let (dead_lettered, trace_context) = self.storage.nack(req).await?;
-            telemetry::link_from_proto(&tracing::Span::current(), trace_context.as_ref());
-            if dead_lettered {
-                tracing::info!(%job_id, "job dead-lettered via nack");
+            let outcome = self.storage.nack(req).await?;
+            let span = tracing::Span::current();
+            span.record("queue", outcome.queue.as_str());
+            span.record("dead_lettered", outcome.dead_lettered);
+            span.record("retry_delay_ms", outcome.retry_delay_ms);
+            telemetry::link_from_proto(&span, outcome.trace_context.as_ref());
+            if outcome.dead_lettered {
+                tracing::info!(%job_id, queue = %outcome.queue, "job dead-lettered via nack");
             }
             Ok(Response::new(NackResponse {
                 job_id,
-                dead_lettered,
+                dead_lettered: outcome.dead_lettered,
             }))
         }
         .instrument(span.clone())
@@ -586,7 +685,11 @@ impl QueueService for QueueServer {
             otel.kind = "server",
             otel.status_code = tracing::field::Empty,
             job_id = %request.get_ref().job_id,
+            attempt = request.get_ref().attempt,
             worker_id = request.get_ref().worker_id.as_deref().unwrap_or("<none>"),
+            lease_duration_ms = request.get_ref().lease_duration_ms,
+            queue = tracing::field::Empty,
+            lease_expires_at = tracing::field::Empty,
             error = tracing::field::Empty
         );
         telemetry::set_parent_from_metadata(&span, request.metadata());
@@ -599,11 +702,14 @@ impl QueueService for QueueServer {
             // The per-queue lease ceiling is applied inside storage where the
             // job's queue is known via its Inflight record.
             let job_id = req.job_id.clone();
-            let (lease_expires_at, trace_context) = self.storage.extend(req).await?;
-            telemetry::link_from_proto(&tracing::Span::current(), trace_context.as_ref());
+            let outcome = self.storage.extend(req).await?;
+            let span = tracing::Span::current();
+            span.record("queue", outcome.queue.as_str());
+            span.record("lease_expires_at", outcome.lease_expires_at);
+            telemetry::link_from_proto(&span, outcome.trace_context.as_ref());
             Ok(Response::new(ExtendResponse {
                 job_id,
-                lease_expires_at,
+                lease_expires_at: outcome.lease_expires_at,
             }))
         }
         .instrument(span.clone())
