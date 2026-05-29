@@ -618,9 +618,10 @@ impl QueueService for QueueServer {
     ) -> Result<Response<GetServerInfoResponse>, Status> {
         let _span = tracing::info_span!("sepp.get_server_info", otel.kind = "server").entered();
         let defaults = self.registry.load().effective("");
+        let s = &self.server_limits;
         Ok(Response::new(GetServerInfoResponse {
             server_version: env!("CARGO_PKG_VERSION").to_string(),
-            supported_protocol_versions: vec!["1.0".to_string()],
+            supported_protocol_versions: vec!["v1".to_string()],
             server_time_ms: now_ms(),
             restricts_encodings: defaults.allowed_encodings.is_some(),
             allowed_encodings: defaults.allowed_encodings.unwrap_or_default(),
@@ -628,6 +629,16 @@ impl QueueService for QueueServer {
             max_custom_entries: defaults.max_custom_entries,
             max_custom_total_bytes: defaults.max_custom_total_bytes,
             max_custom_key_bytes: defaults.max_custom_key_bytes,
+            max_queue_name_bytes: s.max_queue_name_bytes,
+            max_job_type_bytes: s.max_job_type_bytes,
+            max_idempotency_key_bytes: s.max_idempotency_key_bytes,
+            max_schedule_horizon_ms: defaults.max_schedule_horizon_ms,
+            max_enqueue_batch: s.max_enqueue_batch,
+            max_reserve_batch: s.max_reserve_batch,
+            max_reserve_queues: s.max_reserve_queues,
+            max_wait_timeout_ms: s.max_wait_timeout_ms,
+            max_lease_duration_ms: defaults.max_lease_duration_ms,
+            strict_queues: self.strict_queues,
         }))
     }
 }

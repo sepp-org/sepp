@@ -5,10 +5,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `.proto` files in its own build script and resolves `protoc` the same
     // way, and a build script cannot inject env vars into sibling crates.
     //
-    // Proto files are vendored into `proto/` (committed to the repo). To refresh
-    // them after an upstream change, run:
+    // Proto files are vendored into `proto/` (committed to the repo). The
+    // version below is the one currently vendored; to refresh, bump it to a
+    // newer published label/commit and re-run:
     //
-    //     buf export buf.build/sepp-org/sepp-proto -o proto
+    //     buf export buf.build/sepp-org/sepp-proto:v1.0.0 -o proto
     //
     // The build itself never invokes `buf` or touches the network, so it works
     // in offline CI and picks up local edits to `proto/queue.proto` directly.
