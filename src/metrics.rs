@@ -97,7 +97,8 @@ async fn spawn_prometheus_endpoint(
     addr: SocketAddr,
 ) -> Result<JoinHandle<()>, Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    info!(%addr, "prometheus metrics endpoint listening");
+    let local_addr = listener.local_addr()?;
+    info!(addr = %local_addr, "prometheus metrics endpoint listening");
     Ok(tokio::spawn(async move {
         loop {
             let stream = match listener.accept().await {

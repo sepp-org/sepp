@@ -7,7 +7,9 @@
 //! the in-crate unit tests under `src/`.
 
 use std::collections::HashMap;
+use std::io::BufRead;
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use sepp::pb::sepp::v1::{
@@ -42,12 +44,112 @@ impl Drop for ServerGuard {
     }
 }
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind ephemeral port")
-        .local_addr()
-        .expect("local addr")
-        .port()
+/// Startup log-line substrings we extract bound ports from, keyed by the short
+/// name tests ask for. The server binds `127.0.0.1:0` and logs the *actual*
+/// bound address, so these carry the OS-assigned port.
+const PORT_MARKERS: &[(&str, &str)] = &[
+    ("grpc", "queue server listening"),
+    ("prometheus", "prometheus metrics endpoint listening"),
+];
+
+/// How long to wait for a freshly spawned server to report its bound port.
+/// Generous on purpose: a healthy server reports in well under a second, so the
+/// large ceiling is free on the happy path but absorbs slow startups on loaded
+/// or oversubscribed machines.
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bound ports discovered from the server's stdout, filled in as it logs each
+/// "... listening" line. Shared with the stdout-draining thread.
+#[derive(Clone)]
+struct PortBook {
+    ports: Arc<Mutex<HashMap<&'static str, u16>>>,
+}
+
+/// Pulls the port out of a `127.0.0.1:<port>` substring. Works for both the
+/// text (`addr=127.0.0.1:54321`) and JSON (`"addr":"127.0.0.1:54321"`) log
+/// formats.
+fn parse_listen_port(line: &str) -> Option<u16> {
+    const NEEDLE: &str = "127.0.0.1:";
+    let start = line.find(NEEDLE)? + NEEDLE.len();
+    line[start..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .ok()
+}
+
+/// Polls `book` until `key`'s port appears, or returns `None` after `timeout`.
+async fn wait_for_port(book: &PortBook, key: &str, timeout: Duration) -> Option<u16> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(port) = book.ports.lock().expect("port book lock").get(key).copied() {
+            return Some(port);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Spawns the server binary with `extra_env`, binding `127.0.0.1:0` so the OS
+/// hands out a free, unique port. Returns the child and a [`PortBook`] the
+/// caller queries (via [`wait_for_port`]) for the actual bound port(s).
+///
+/// Letting the server own the bind closes the TOCTOU window the old
+/// `free_port()` had: it bound `:0`, closed the socket, then handed the bare
+/// number to the server to re-bind, so two concurrent tests could be assigned
+/// the same just-freed port.
+fn spawn_server_process(
+    db_path: &std::path::Path,
+    extra_env: &[(&str, &str)],
+) -> (Child, PortBook) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_sepp"));
+    command
+        .env("SEPP_SERVER__LISTEN_ADDR", "127.0.0.1:0")
+        .env("SEPP_SERVER__DB_PATH", db_path)
+        // Force info so the startup "listening" lines are always emitted,
+        // whatever level a test's config might otherwise set.
+        .env("RUST_LOG", "sepp=info")
+        .stdout(Stdio::piped());
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+    let mut child = command.spawn().expect("spawn sepp server");
+
+    let book = PortBook {
+        ports: Arc::new(Mutex::new(HashMap::new())),
+    };
+    let stdout = child.stdout.take().expect("child stdout is piped");
+    let sink = book.clone();
+    // Drain stdout for the child's whole life so its log writes never block on a
+    // full pipe; record listening ports as they appear.
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
+            for (key, needle) in PORT_MARKERS {
+                if line.contains(needle)
+                    && let Some(port) = parse_listen_port(&line)
+                {
+                    sink.ports.lock().expect("port book lock").insert(key, port);
+                }
+            }
+        }
+    });
+
+    (child, book)
+}
+
+/// Connects a gRPC client to `127.0.0.1:port`, retrying until reachable.
+async fn connect_client(port: u16) -> Client {
+    let addr = format!("http://127.0.0.1:{port}");
+    for _ in 0..100 {
+        if let Ok(client) = QueueServiceClient::connect(addr.clone()).await {
+            return client;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("server did not become reachable on {addr}");
 }
 
 fn temp_db(tag: &str) -> std::path::PathBuf {
@@ -66,27 +168,13 @@ async fn spawn_server_with_env(
     db_path: &std::path::Path,
     extra_env: &[(&str, &str)],
 ) -> (Child, Client) {
-    let port = free_port();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_sepp"));
-    command
-        .env("SEPP_SERVER__LISTEN_ADDR", format!("127.0.0.1:{port}"))
-        .env("SEPP_SERVER__DB_PATH", db_path)
-        .stdout(Stdio::null());
-    for (key, value) in extra_env {
-        command.env(key, value);
-    }
-    let mut child = command.spawn().expect("spawn sepp server");
-
-    let addr = format!("http://127.0.0.1:{port}");
-    for _ in 0..100 {
-        if let Ok(client) = QueueServiceClient::connect(addr.clone()).await {
-            return (child, client);
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-    panic!("server did not become reachable on {addr}");
+    let (mut child, book) = spawn_server_process(db_path, extra_env);
+    let Some(port) = wait_for_port(&book, "grpc", STARTUP_TIMEOUT).await else {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("server did not report a listening port within 10s");
+    };
+    (child, connect_client(port).await)
 }
 
 /// Spawns a fresh server with a throwaway database and returns a guard that
@@ -859,15 +947,30 @@ async fn scrape_metrics(port: u16) -> String {
 
 #[tokio::test]
 async fn prometheus_endpoint_exposes_recorded_metrics() {
-    let met_port = free_port();
-    let cfg = format!(
-        r#"
+    // Bind the prometheus endpoint on :0 too, and read both bound ports back
+    // from the server's startup logs.
+    let cfg = r#"
 [metrics]
 prometheus_enabled = true
-prometheus_listen_addr = "127.0.0.1:{met_port}"
-"#
-    );
-    let (_guard, client) = start_server_with_config("prom", &cfg).await;
+prometheus_listen_addr = "127.0.0.1:0"
+"#;
+    let db_path = temp_db("prom");
+    let cfg_path = temp_config_path("prom");
+    std::fs::write(&cfg_path, cfg).expect("write temp config");
+    let cfg_str = cfg_path.to_str().expect("utf-8 config path");
+    let (child, book) = spawn_server_process(&db_path, &[("SEPP_CONFIG", cfg_str)]);
+    let _guard = ServerGuard {
+        child,
+        db_path: Some(db_path),
+    };
+    let grpc_port = wait_for_port(&book, "grpc", STARTUP_TIMEOUT)
+        .await
+        .expect("server reported a grpc port");
+    let met_port = wait_for_port(&book, "prometheus", STARTUP_TIMEOUT)
+        .await
+        .expect("server reported a prometheus port");
+    let _ = std::fs::remove_file(&cfg_path);
+    let client = connect_client(grpc_port).await;
 
     // Drive some activity so the request/enqueue counters have data points.
     enqueue(&client, enqueue_req("smoke-prom")).await;
@@ -1208,19 +1311,22 @@ async fn tls_secures_the_connection() {
     std::fs::write(&key_path, &key_pem).expect("write key");
 
     let db_path = temp_db("tls");
-    let port = free_port();
-    let child = Command::new(env!("CARGO_BIN_EXE_sepp"))
-        .env("SEPP_SERVER__LISTEN_ADDR", format!("127.0.0.1:{port}"))
-        .env("SEPP_SERVER__DB_PATH", &db_path)
-        .env("SEPP_SERVER__TLS_CERT_PATH", &cert_path)
-        .env("SEPP_SERVER__TLS_KEY_PATH", &key_path)
-        .stdout(Stdio::null())
-        .spawn()
-        .expect("spawn sepp server");
+    let cert_path_str = cert_path.to_str().expect("utf-8 cert path");
+    let key_path_str = key_path.to_str().expect("utf-8 key path");
+    let (child, book) = spawn_server_process(
+        &db_path,
+        &[
+            ("SEPP_SERVER__TLS_CERT_PATH", cert_path_str),
+            ("SEPP_SERVER__TLS_KEY_PATH", key_path_str),
+        ],
+    );
     let _guard = ServerGuard {
         child,
         db_path: Some(db_path),
     };
+    let port = wait_for_port(&book, "grpc", STARTUP_TIMEOUT)
+        .await
+        .expect("server reported a listening port");
 
     let tls = ClientTlsConfig::new()
         .ca_certificate(Certificate::from_pem(cert_pem.as_bytes()))
@@ -1791,17 +1897,14 @@ async fn health_service_reports_serving() {
     use tonic_health::pb::{HealthCheckRequest, health_check_response::ServingStatus};
 
     let db_path = temp_db("health");
-    let port = free_port();
-    let child = Command::new(env!("CARGO_BIN_EXE_sepp"))
-        .env("SEPP_SERVER__LISTEN_ADDR", format!("127.0.0.1:{port}"))
-        .env("SEPP_SERVER__DB_PATH", &db_path)
-        .stdout(Stdio::null())
-        .spawn()
-        .expect("spawn sepp server");
+    let (child, book) = spawn_server_process(&db_path, &[]);
     let _guard = ServerGuard {
         child,
         db_path: Some(db_path),
     };
+    let port = wait_for_port(&book, "grpc", STARTUP_TIMEOUT)
+        .await
+        .expect("server reported a listening port");
 
     let addr = format!("http://127.0.0.1:{port}");
     let mut health = None;

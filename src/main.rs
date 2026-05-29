@@ -2,6 +2,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use tonic::service::interceptor::InterceptedService;
+use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 
 use sepp::auth::ApiKeyInterceptor;
@@ -115,9 +116,14 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
         warn!("API-key auth is enabled without TLS; keys are sent in plaintext");
     }
 
+    let incoming = TcpIncoming::bind(addr).map_err(|e| format!("binding {addr}: {e}"))?;
+    let local_addr = incoming
+        .local_addr()
+        .map_err(|e| format!("resolving bound address: {e}"))?;
+
     let on_off = |on: bool| if on { "enabled" } else { "disabled" };
     info!(
-        %addr,
+        addr = %local_addr,
         db_path = %config.server.db_path,
         tls = on_off(tls_enabled),
         auth = on_off(interceptor.is_enforcing()),
@@ -129,7 +135,7 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     builder
         .add_service(health_service)
         .add_service(service)
-        .serve_with_shutdown(addr, shutdown_signal())
+        .serve_with_incoming_shutdown(incoming, shutdown_signal())
         .await?;
 
     info!("queue server stopped");
