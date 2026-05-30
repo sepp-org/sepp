@@ -50,6 +50,7 @@ pub fn init(
             LogFormat::Text => fmt().with_env_filter(filter).init(),
             LogFormat::Json => fmt().with_env_filter(filter).json().init(),
         }
+
         return Ok(TelemetryGuard { provider: None });
     }
 
@@ -57,6 +58,7 @@ pub fn init(
         .with_tonic()
         .with_endpoint(tracing_cfg.otlp_endpoint.clone())
         .build()?;
+
     let provider = SdkTracerProvider::builder()
         .with_batch_exporter(exporter)
         .with_resource(
@@ -78,6 +80,7 @@ pub fn init(
     let otel_layer = tracing_opentelemetry::layer()
         .with_tracer(provider.tracer("sepp"))
         .with_filter(otel_filter);
+
     let registry = tracing_subscriber::registry().with(otel_layer);
     match logging.format {
         LogFormat::Text => registry.with(fmt::layer().with_filter(filter)).init(),
@@ -103,6 +106,7 @@ pub fn set_parent_from_metadata(span: &Span, metadata: &MetadataMap) {
     if !enabled() {
         return;
     }
+
     let parent = TraceContextPropagator::new().extract(&MetadataExtractor(metadata));
     if parent.span().span_context().is_valid() {
         let _ = span.set_parent(parent);
@@ -116,11 +120,13 @@ pub fn link_from_proto(span: &Span, trace_context: Option<&TraceContext>) {
     let Some(tc) = trace_context else {
         return;
     };
+
     let mut carrier = HashMap::new();
     carrier.insert("traceparent".to_string(), tc.traceparent.clone());
     if let Some(ts) = &tc.tracestate {
         carrier.insert("tracestate".to_string(), ts.clone());
     }
+
     let cx = TraceContextPropagator::new().extract(&MapExtractor(&carrier));
     let span_context = cx.span().span_context().clone();
     if span_context.is_valid() {
@@ -132,12 +138,15 @@ pub fn current_trace_context() -> Option<TraceContext> {
     if !enabled() {
         return None;
     }
+
     let cx = Span::current().context();
     if !cx.span().span_context().is_valid() {
         return None;
     }
+
     let mut carrier = HashMap::new();
     TraceContextPropagator::new().inject_context(&cx, &mut MapInjector(&mut carrier));
+
     Some(TraceContext {
         traceparent: carrier.remove("traceparent")?,
         tracestate: carrier.remove("tracestate"),

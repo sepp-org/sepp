@@ -85,14 +85,15 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
 
     let _metrics = metrics::init(&config.metrics, &config.tracing.service_name).await?;
     let addr = config.server.listen_addr;
+
     let registry = QueueRegistry::from_config(&config);
     let declared_queues = registry.declared_count();
     if declared_queues > 0 {
         let names: Vec<&str> = registry.declared_names().collect();
         info!(queues = ?names, "declared queues from config");
     }
-    let svc = QueueServer::new(&config, registry.into_shared())?;
 
+    let svc = QueueServer::new(&config, registry.into_shared())?;
     let queue_service = QueueServiceServer::new(svc)
         .max_decoding_message_size(config.limits.max_message_bytes as usize);
     let interceptor = ApiKeyInterceptor::new(&config.auth.api_keys);
@@ -187,6 +188,7 @@ async fn shutdown_signal() {
             .recv()
             .await;
     };
+
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
 

@@ -20,6 +20,7 @@ impl QueueRegistry {
             .iter()
             .map(|q| (q.name.clone(), q.clone()))
             .collect();
+
         Self { defaults, declared }
     }
 

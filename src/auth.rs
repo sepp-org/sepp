@@ -38,6 +38,7 @@ impl Interceptor for ApiKeyInterceptor {
         let Some(allowed) = policy.as_ref() else {
             return Ok(request);
         };
+
         let presented = request
             .metadata()
             .get("authorization")

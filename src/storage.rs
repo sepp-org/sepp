@@ -186,6 +186,7 @@ fn decode_inflight(bytes: &[u8]) -> Result<Inflight, Status> {
         } else {
             Some(TraceContext::decode(tc_bytes).ok()?)
         };
+
         Some(Inflight {
             attempt,
             lease_expires_at,
@@ -196,6 +197,7 @@ fn decode_inflight(bytes: &[u8]) -> Result<Inflight, Status> {
             trace_context,
         })
     };
+
     parse().ok_or_else(corrupt)
 }
 
@@ -229,6 +231,7 @@ impl ReadyIndex {
         {
             bump_queue(&mut self.by_queue, queue);
         }
+
         self.keys.insert(ready_key, attempt);
     }
 
@@ -239,10 +242,12 @@ impl ReadyIndex {
             .next()
             .filter(|(k, _)| k.starts_with(queue_prefix))
             .map(|(k, _)| k.clone())?;
+
         let attempt = self.keys.remove(&key)?;
         if let Some(queue) = read_queue(&key) {
             drop_queue(&mut self.by_queue, queue);
         }
+
         Some((key, attempt))
     }
 }
@@ -262,12 +267,14 @@ impl TimerIndex {
         if !self.keys.contains_key(&key) {
             bump_queue(&mut self.by_queue, queue);
         }
+
         self.keys.insert(key, queue.to_string());
     }
 
     fn remove(&mut self, key: &[u8]) -> Option<String> {
         let queue = self.keys.remove(key)?;
         drop_queue(&mut self.by_queue, &queue);
+
         Some(queue)
     }
 
@@ -279,6 +286,7 @@ impl TimerIndex {
         let key = key.clone();
         let queue = self.keys.remove(&key)?;
         drop_queue(&mut self.by_queue, &queue);
+
         Some((key, queue))
     }
 
@@ -326,6 +334,7 @@ fn warn_on_undeclared_persisted_queues(store: &Store) {
             undeclared.insert(queue.to_owned());
         }
     }
+
     if !undeclared.is_empty() {
         warn!(
             queues = ?undeclared,
@@ -338,11 +347,13 @@ fn warn_on_undeclared_persisted_queues(store: &Store) {
 fn rebuild_indexes(store: &Store) -> Result<Indexes, fjall::Error> {
     let mut indexes = Indexes::default();
     let snap = store.db.read_tx();
+
     for guard in snap.iter(&store.ready) {
         let (key, value) = guard.into_inner()?;
         let attempt = read_u32(&value, 0).unwrap_or(1);
         indexes.ready.insert(key.to_vec(), attempt);
     }
+
     for guard in snap.iter(&store.scheduled) {
         let (key, _) = guard.into_inner()?;
         let queue = key
@@ -352,6 +363,7 @@ fn rebuild_indexes(store: &Store) -> Result<Indexes, fjall::Error> {
             .unwrap_or_default();
         indexes.scheduled.insert(key.to_vec(), &queue);
     }
+
     for guard in snap.iter(&store.leases) {
         let (key, _) = guard.into_inner()?;
         let queue = key
@@ -361,11 +373,13 @@ fn rebuild_indexes(store: &Store) -> Result<Indexes, fjall::Error> {
             .unwrap_or_default();
         indexes.leases.insert(key.to_vec(), &queue);
     }
+
     for guard in snap.iter(&store.dedup_timers) {
         let (key, _) = guard.into_inner()?;
         let queue = key.get(8..).and_then(read_queue).unwrap_or("").to_string();
         indexes.dedup_timers.insert(key.to_vec(), &queue);
     }
+
     Ok(indexes)
 }
 
@@ -420,7 +434,41 @@ enum Command {
     },
 }
 
-type Responder = Box<dyn FnOnce(&Result<(), Status>) + Send>;
+enum Responder {
+    Enqueue(
+        oneshot::Sender<Result<Vec<EnqueueResponse>, Status>>,
+        Vec<EnqueueResponse>,
+    ),
+    Reserve(oneshot::Sender<Result<Vec<Job>, Status>>, Vec<Job>),
+    Ack(oneshot::Sender<Result<AckOutcome, Status>>, AckOutcome),
+    Nack(oneshot::Sender<Result<NackOutcome, Status>>, NackOutcome),
+    Extend(
+        oneshot::Sender<Result<ExtendOutcome, Status>>,
+        ExtendOutcome,
+    ),
+}
+
+impl Responder {
+    fn respond(self, outcome: &Result<(), Status>) {
+        match self {
+            Responder::Enqueue(resp, payload) => {
+                let _ = resp.send(outcome.clone().map(|()| payload));
+            }
+            Responder::Reserve(resp, payload) => {
+                let _ = resp.send(outcome.clone().map(|()| payload));
+            }
+            Responder::Ack(resp, payload) => {
+                let _ = resp.send(outcome.clone().map(|()| payload));
+            }
+            Responder::Nack(resp, payload) => {
+                let _ = resp.send(outcome.clone().map(|()| payload));
+            }
+            Responder::Extend(resp, payload) => {
+                let _ = resp.send(outcome.clone().map(|()| payload));
+            }
+        }
+    }
+}
 
 struct Cycle {
     dirty: bool,
@@ -532,6 +580,7 @@ fn run_committer(
                     .min(max_sweep_interval),
                 None => max_sweep_interval,
             };
+
             match rx.recv_timeout(wait) {
                 Ok(c) => Some(c),
                 Err(flume::RecvTimeoutError::Timeout) => None,
@@ -547,6 +596,7 @@ fn run_committer(
             while let Ok(c) = rx.try_recv() {
                 rpcs.push(c);
             }
+
             run_rpc_cycle(&store, &mut indexes, &notifiers, rpcs);
         }
 
@@ -554,6 +604,7 @@ fn run_committer(
             store.metrics.set_queue_depths(indexes.snapshot());
         }
     }
+
     info!("committer thread stopped; storage is no longer accepting commands");
 }
 
@@ -565,15 +616,13 @@ fn run_rpc_cycle(
 ) {
     let mut tx = store.db.write_tx();
     let mut cycle = Cycle::new(store.metrics.is_enabled());
-    let mut responders: Vec<Responder> = Vec::new();
+    let mut responders: Vec<Responder> = Vec::with_capacity(rpcs.len());
 
     for cmd in rpcs {
         match cmd {
             Command::Enqueue { jobs, resp } => {
                 match apply_enqueue(store, indexes, &mut tx, &mut cycle, jobs) {
-                    Ok(enqueued) => responders.push(Box::new(move |o| {
-                        let _ = resp.send(o.clone().map(|()| enqueued));
-                    })),
+                    Ok(enqueued) => responders.push(Responder::Enqueue(resp, enqueued)),
                     Err(e) => {
                         let _ = resp.send(Err(e));
                     }
@@ -587,9 +636,7 @@ fn run_rpc_cycle(
             } => match apply_reserve(
                 store, indexes, &mut tx, &mut cycle, &queues, lease_ms, max_jobs,
             ) {
-                Ok(jobs) => responders.push(Box::new(move |o| {
-                    let _ = resp.send(o.clone().map(|()| jobs));
-                })),
+                Ok(jobs) => responders.push(Responder::Reserve(resp, jobs)),
                 Err(e) => {
                     let _ = resp.send(Err(e));
                 }
@@ -599,18 +646,14 @@ fn run_rpc_cycle(
                 attempt,
                 resp,
             } => match apply_ack(store, indexes, &mut tx, &mut cycle, &job_id, attempt) {
-                Ok(trace_context) => responders.push(Box::new(move |o| {
-                    let _ = resp.send(o.clone().map(|()| trace_context));
-                })),
+                Ok(outcome) => responders.push(Responder::Ack(resp, outcome)),
                 Err(e) => {
                     let _ = resp.send(Err(e));
                 }
             },
             Command::Nack { req, resp } => {
                 match apply_nack(store, indexes, &mut tx, &mut cycle, req) {
-                    Ok(outcome) => responders.push(Box::new(move |o| {
-                        let _ = resp.send(o.clone().map(|()| outcome));
-                    })),
+                    Ok(outcome) => responders.push(Responder::Nack(resp, outcome)),
                     Err(e) => {
                         let _ = resp.send(Err(e));
                     }
@@ -618,9 +661,7 @@ fn run_rpc_cycle(
             }
             Command::Extend { req, resp } => {
                 match apply_extend(store, indexes, &mut tx, &mut cycle, req) {
-                    Ok(outcome) => responders.push(Box::new(move |o| {
-                        let _ = resp.send(o.clone().map(|()| outcome));
-                    })),
+                    Ok(outcome) => responders.push(Responder::Extend(resp, outcome)),
                     Err(e) => {
                         let _ = resp.send(Err(e));
                     }
@@ -639,7 +680,7 @@ fn run_rpc_cycle(
     }
 
     for responder in responders {
-        responder(&outcome);
+        responder.respond(&outcome);
     }
     if outcome.is_ok() {
         if let Some(m) = &cycle.metrics {
@@ -668,18 +709,22 @@ fn run_sweep_cycle(store: &Store, indexes: &mut Indexes, notifiers: &QueueNotifi
             return;
         }
     };
+
     let outcome = if cycle.dirty {
         commit_and_persist(store, tx)
     } else {
         Ok(())
     };
+
     if outcome.is_err() {
         resync(store, indexes);
         return;
     }
+
     if let Some(m) = &cycle.metrics {
         store.metrics.flush_cycle(m);
     }
+
     // Post-commit, same reason as in run_rpc_cycle.
     for queue in &cycle.new_ready {
         notifiers.wake(queue);
@@ -698,6 +743,7 @@ fn commit_and_persist(store: &Store, tx: WriteTransaction<'_>) -> Result<(), Sta
     let result = tx
         .commit()
         .and_then(|()| store.db.persist(store.params.persist_mode));
+
     store.metrics.record_commit(started.elapsed());
     match result {
         Ok(()) => Ok(()),
@@ -723,6 +769,7 @@ fn apply_enqueue(
         for req in &jobs {
             *wanted.entry(req.queue.as_str()).or_default() += 1;
         }
+
         for (queue, count) in wanted {
             if let Some(cap) = registry.effective(queue).max_queue_depth
                 && indexes.live_depth(queue) + count > cap
@@ -786,6 +833,7 @@ fn apply_enqueue(
             id.clone().into_bytes(),
             encode_job(&queue, &job),
         );
+
         if let Some(payload) = payload {
             tx.insert(
                 &store.payloads,
@@ -793,6 +841,7 @@ fn apply_enqueue(
                 payload.encode_to_vec(),
             );
         }
+
         match job.scheduled_at {
             Some(at) if at > now => {
                 let tk = timer_key(at, &id);
@@ -810,17 +859,20 @@ fn apply_enqueue(
                 cycle.new_ready.insert(queue.clone());
             }
         }
+
         if let Some(key) = &req.idempotency_key {
             let dkey = dedup_key(&queue, key);
             if let Some(old_timer) = stale_dedup_timer {
                 tx.remove(&store.dedup_timers, old_timer.clone());
                 indexes.dedup_timers.remove(&old_timer);
             }
+
             let dtk = dedup_timer_key(now + limits.dedup_window_ms, &dkey);
             tx.insert(&store.dedup_timers, dtk.clone(), Vec::new());
             indexes.dedup_timers.insert(dtk, &queue);
             tx.insert(&store.dedup, dkey, encode_dedup(now, &id));
         }
+
         cycle.enqueued(&queue);
         cycle.dirty = true;
 
@@ -845,17 +897,19 @@ fn apply_reserve(
     let now = now_ms();
     let lease_expires_at = now.saturating_add(i64::try_from(lease_ms).unwrap_or(i64::MAX));
     let mut jobs = Vec::new();
+
     for queue in queues {
         if jobs.len() >= max_jobs {
             break;
         }
+
         let prefix = queue_prefix(queue);
         let id_offset = ready_key_id_offset(queue);
-
         while jobs.len() < max_jobs {
             let Some((ready_k, attempt)) = indexes.ready.pop_front(&prefix) else {
                 break;
             };
+
             let job_id: String = match ready_k.get(id_offset..).map(std::str::from_utf8) {
                 Some(Ok(id)) => id.to_owned(),
                 _ => {
@@ -933,6 +987,7 @@ fn apply_reserve(
                 job.id.clone().into_bytes(),
                 encode_inflight(&inflight),
             );
+
             let lease_timer = timer_key(lease_expires_at, &job.id);
             tx.insert(&store.leases, lease_timer.clone(), Vec::new());
             indexes.leases.insert(lease_timer, &inflight.queue);
@@ -957,18 +1012,22 @@ fn apply_ack(
         .get(&store.inflight, job_id.as_bytes())
         .map_err(stg_err)?
         .ok_or_else(|| Status::not_found("job not found"))?;
+
     let inflight = decode_inflight(&stored)?;
     if inflight.attempt != attempt {
         return Err(Status::failed_precondition("attempt mismatch"));
     }
+
     tx.remove(&store.jobs, job_id.as_bytes().to_vec());
     tx.remove(&store.payloads, job_id.as_bytes().to_vec());
     tx.remove(&store.inflight, job_id.as_bytes().to_vec());
+
     let lease_timer = timer_key(inflight.lease_expires_at, job_id);
     tx.remove(&store.leases, lease_timer.clone());
     indexes.leases.remove(&lease_timer);
     cycle.acked(&inflight.queue);
     cycle.dirty = true;
+
     Ok(AckOutcome {
         queue: inflight.queue,
         trace_context: inflight.trace_context,
@@ -987,12 +1046,13 @@ fn apply_nack(
         .get(&store.inflight, req.job_id.as_bytes())
         .map_err(stg_err)?
         .ok_or_else(|| Status::not_found("job not found"))?;
+
     let inflight = decode_inflight(&stored)?;
     if inflight.attempt != req.attempt {
         return Err(Status::failed_precondition("attempt mismatch"));
     }
-    let lease_timer = timer_key(inflight.lease_expires_at, &req.job_id);
 
+    let lease_timer = timer_key(inflight.lease_expires_at, &req.job_id);
     let strategy = req.retry.as_ref().and_then(|r| r.strategy.as_ref());
     let force_dead_letter = matches!(strategy, Some(nack_retry::Strategy::DeadLetter(_)));
     let retry_delay_ms = match strategy {
@@ -1006,20 +1066,24 @@ fn apply_nack(
         }
         _ => 0,
     };
+
     if force_dead_letter || inflight.attempt >= inflight.max_attempts {
         let cause_label = if force_dead_letter {
             "rejected"
         } else {
             "attempts_exhausted"
         };
+
         tx.remove(&store.jobs, req.job_id.as_bytes().to_vec());
         tx.remove(&store.payloads, req.job_id.as_bytes().to_vec());
         tx.remove(&store.inflight, req.job_id.into_bytes());
         tx.remove(&store.leases, lease_timer.clone());
+
         indexes.leases.remove(&lease_timer);
         cycle.nacked(&inflight.queue);
         cycle.dead_lettered(&inflight.queue, cause_label);
         cycle.dirty = true;
+
         return Ok(NackOutcome {
             queue: inflight.queue,
             dead_lettered: true,
@@ -1041,15 +1105,19 @@ fn apply_nack(
             inflight.enqueued_at,
             &req.job_id,
         );
+
         tx.insert(&store.ready, rk.clone(), attempt.to_be_bytes().to_vec());
         indexes.ready.insert(rk, attempt);
         cycle.new_ready.insert(inflight.queue.clone());
     }
+
     tx.remove(&store.inflight, req.job_id.into_bytes());
     tx.remove(&store.leases, lease_timer.clone());
     indexes.leases.remove(&lease_timer);
+
     cycle.nacked(&inflight.queue);
     cycle.dirty = true;
+
     Ok(NackOutcome {
         queue: inflight.queue,
         dead_lettered: false,
@@ -1069,10 +1137,12 @@ fn apply_extend(
         .get(&store.inflight, req.job_id.as_bytes())
         .map_err(stg_err)?
         .ok_or_else(|| Status::not_found("job not found"))?;
+
     let mut inflight = decode_inflight(&stored)?;
     if inflight.attempt != req.attempt {
         return Err(Status::failed_precondition("attempt mismatch"));
     }
+
     let max_lease = store
         .registry
         .load()
@@ -1088,12 +1158,15 @@ fn apply_extend(
         req.job_id.clone().into_bytes(),
         encode_inflight(&inflight),
     );
+
     tx.remove(&store.leases, old_timer.clone());
     indexes.leases.remove(&old_timer);
+
     let new_timer = timer_key(lease_expires_at, &req.job_id);
     tx.insert(&store.leases, new_timer.clone(), Vec::new());
     indexes.leases.insert(new_timer, &inflight.queue);
     cycle.dirty = true;
+
     Ok(ExtendOutcome {
         queue: inflight.queue,
         lease_expires_at,
@@ -1118,21 +1191,25 @@ fn apply_sweep(
         let Some((timer_k, _)) = indexes.scheduled.pop_due(now) else {
             break;
         };
+
         budget -= 1;
         processed += 1;
         let attempt_hint = tx
             .get(&store.scheduled, &timer_k)
             .map_err(stg_err)?
             .and_then(|v| read_u32(&v, 0));
+
         tx.remove(&store.scheduled, timer_k.clone());
         cycle.dirty = true;
 
         let Some(job_id) = timer_k.get(8..) else {
             continue;
         };
+
         let Some(stored) = tx.get(&store.jobs, job_id).map_err(stg_err)? else {
             continue;
         };
+
         let (queue, job) = match decode_job(&stored) {
             Ok(decoded) => decoded,
             Err(e) => {
@@ -1140,6 +1217,7 @@ fn apply_sweep(
                 continue;
             }
         };
+
         let attempt = attempt_hint.unwrap_or(job.attempt);
         let _span = telemetry::enabled().then(|| {
             let span = tracing::info_span!(
@@ -1154,12 +1232,14 @@ fn apply_sweep(
             telemetry::link_from_proto(&span, job.trace_context.as_ref());
             span.entered()
         });
+
         debug!(
             job_id = %job.id,
             queue = %queue,
             attempt,
             "scheduled job promoted to ready",
         );
+
         let rk = ready_key(&queue, job.priority, job.enqueued_at, &job.id);
         tx.insert(&store.ready, rk.clone(), attempt.to_be_bytes().to_vec());
         indexes.ready.insert(rk, attempt);
@@ -1172,6 +1252,7 @@ fn apply_sweep(
         let Some((timer_k, _)) = indexes.leases.pop_due(now) else {
             break;
         };
+
         budget -= 1;
         processed += 1;
         tx.remove(&store.leases, timer_k.clone());
@@ -1180,9 +1261,11 @@ fn apply_sweep(
         let Some(job_id) = timer_k.get(8..) else {
             continue;
         };
+
         let Some(stored) = tx.get(&store.inflight, job_id).map_err(stg_err)? else {
             continue;
         };
+
         let inflight = match decode_inflight(&stored) {
             Ok(decoded) => decoded,
             Err(e) => {
@@ -1205,11 +1288,13 @@ fn apply_sweep(
                 telemetry::link_from_proto(&span, inflight.trace_context.as_ref());
                 span.entered()
             });
+
             warn!(
                 job_id = %job_id_str,
                 attempt = inflight.attempt,
                 "job dead-lettered: lease expired with attempts exhausted"
             );
+
             tx.remove(&store.jobs, job_id.to_vec());
             tx.remove(&store.payloads, job_id.to_vec());
             tx.remove(&store.inflight, job_id.to_vec());
@@ -1218,6 +1303,7 @@ fn apply_sweep(
             let Ok(job_id_str) = std::str::from_utf8(job_id) else {
                 continue;
             };
+
             let attempt = inflight.attempt + 1;
             let _span = telemetry::enabled().then(|| {
                 let span = tracing::info_span!(
@@ -1231,18 +1317,21 @@ fn apply_sweep(
                 telemetry::link_from_proto(&span, inflight.trace_context.as_ref());
                 span.entered()
             });
+
             debug!(
                 job_id = %job_id_str,
                 queue = %inflight.queue,
                 attempt,
                 "lease expired; requeueing job",
             );
+
             let rk = ready_key(
                 &inflight.queue,
                 inflight.priority,
                 inflight.enqueued_at,
                 job_id_str,
             );
+
             tx.insert(&store.ready, rk.clone(), attempt.to_be_bytes().to_vec());
             indexes.ready.insert(rk, attempt);
             tx.remove(&store.inflight, job_id.to_vec());
@@ -1256,11 +1345,13 @@ fn apply_sweep(
         let Some((timer_k, queue)) = indexes.dedup_timers.pop_due(now) else {
             break;
         };
+
         budget -= 1;
         processed += 1;
         if let Some(dedup_k) = timer_k.get(8..) {
             tx.remove(&store.dedup, dedup_k.to_vec());
         }
+
         tx.remove(&store.dedup_timers, timer_k.clone());
         cycle.sweep_dedup_expiration(&queue);
         cycle.dirty = true;
@@ -1307,6 +1398,7 @@ impl JobWaiter {
                 waiter
             })
             .collect();
+
         Armed { waiters }
     }
 }
@@ -1324,6 +1416,7 @@ impl Future for Armed<'_> {
                 return Poll::Ready(());
             }
         }
+
         Poll::Pending
     }
 }
@@ -1341,18 +1434,23 @@ impl Storage {
         metrics: Metrics,
     ) -> Result<Self, fjall::Error> {
         let mut builder = TxDatabase::builder(config.server.db_path.as_str());
+
         if let Some(bytes) = config.storage.cache_size_bytes {
             builder = builder.cache_size(bytes);
         }
+
         if let Some(bytes) = config.storage.max_journaling_size_bytes {
             builder = builder.max_journaling_size(bytes);
         }
+
         if let Some(n) = config.storage.max_cached_files {
             builder = builder.max_cached_files(Some(n));
         }
+
         if let Some(n) = config.storage.worker_threads {
             builder = builder.worker_threads(n);
         }
+
         let db = builder.open()?;
         let params = StorageParams {
             persist_mode: match config.storage.persist_mode {
@@ -1362,6 +1460,7 @@ impl Storage {
             },
             sweep_limit: config.storage.sweep_limit,
         };
+
         if matches!(
             config.storage.persist_mode,
             crate::config::PersistMode::Buffer

@@ -52,6 +52,7 @@ impl QueueServer {
             metrics::register_command_queue_gauge(move || storage.command_queue_depth() as u64)
         };
         let queue_depth_gauges = metrics.register_queue_depth_gauges();
+
         Ok(Self {
             validator: Validator::default(),
             storage,
@@ -79,6 +80,7 @@ impl QueueServer {
     ) -> Result<(), pb::JobRejection> {
         use pb::job_rejection::Reason;
         let s = &self.server_limits;
+
         if job.queue.len() > s.max_queue_name_bytes as usize {
             return Err(pb::JobRejection {
                 reason: Some(Reason::QueueNameTooLong(pb::QueueNameTooLong {
@@ -87,6 +89,7 @@ impl QueueServer {
                 })),
             });
         }
+
         if job.job_type.len() > s.max_job_type_bytes as usize {
             return Err(pb::JobRejection {
                 reason: Some(Reason::JobTypeNameTooLong(pb::JobTypeNameTooLong {
@@ -95,6 +98,7 @@ impl QueueServer {
                 })),
             });
         }
+
         if let Some(allowed) = &limits.allowed_job_types
             && !allowed.iter().any(|t| t == &job.job_type)
         {
@@ -105,6 +109,7 @@ impl QueueServer {
                 })),
             });
         }
+
         if let Some(key) = &job.idempotency_key
             && key.len() > s.max_idempotency_key_bytes as usize
         {
@@ -115,6 +120,7 @@ impl QueueServer {
                 })),
             });
         }
+
         if let Some(payload) = &job.payload
             && payload.data.len() as u64 > limits.max_payload_bytes
         {
@@ -125,6 +131,7 @@ impl QueueServer {
                 })),
             });
         }
+
         if let Some(payload) = &job.payload
             && let Some(allowed) = &limits.allowed_encodings
             && !allowed.iter().any(|e| e == &payload.encoding)
@@ -136,6 +143,7 @@ impl QueueServer {
                 })),
             });
         }
+
         if job.custom.len() as u64 > limits.max_custom_entries as u64 {
             return Err(pb::JobRejection {
                 reason: Some(Reason::CustomEntriesTooMany(pb::CustomEntriesTooMany {
@@ -144,6 +152,7 @@ impl QueueServer {
                 })),
             });
         }
+
         let mut custom_bytes: u64 = 0;
         for (key, value) in &job.custom {
             if key.len() as u64 > limits.max_custom_key_bytes as u64 {
@@ -157,6 +166,7 @@ impl QueueServer {
             }
             custom_bytes += key.len() as u64 + primitive_value_bytes(value);
         }
+
         if custom_bytes > limits.max_custom_total_bytes {
             return Err(pb::JobRejection {
                 reason: Some(Reason::CustomMapTooLarge(pb::CustomMapTooLarge {
@@ -165,6 +175,7 @@ impl QueueServer {
                 })),
             });
         }
+
         if let Some(at) = job.scheduled_at
             && at > now_ms().saturating_add(limits.max_schedule_horizon_ms as i64)
         {
@@ -175,6 +186,7 @@ impl QueueServer {
                 })),
             });
         }
+
         Ok(())
     }
 
@@ -191,6 +203,7 @@ impl QueueServer {
                 })),
             });
         }
+
         if self.strict_queues && !registry.is_declared(&job.queue) {
             return Err(pb::JobRejection {
                 reason: Some(Reason::UnknownQueue(pb::UnknownQueue {
@@ -198,6 +211,7 @@ impl QueueServer {
                 })),
             });
         }
+
         let limits = registry.effective(&job.queue);
         self.check_enqueue_limits(job, &limits)
     }
@@ -211,12 +225,15 @@ impl QueueServer {
                 job.trace_context = telemetry::current_trace_context();
             }
         }
+
         let responses = self.storage.enqueue(valid).await?;
         let job_ids: Vec<&str> = responses.iter().map(|r| r.job_id.as_str()).collect();
         let deduplicated = responses.iter().filter(|r| r.deduplicated).count();
+
         let span = tracing::Span::current();
         span.record("job_ids", tracing::field::debug(&job_ids));
         span.record("deduplicated", deduplicated as u64);
+
         Ok(responses)
     }
 }
@@ -228,6 +245,7 @@ impl QueueServer {
 fn record_job_dimensions(span: &tracing::Span, jobs: &[EnqueueRequest]) {
     let queues: BTreeSet<&str> = jobs.iter().map(|j| j.queue.as_str()).collect();
     let job_types: BTreeSet<&str> = jobs.iter().map(|j| j.job_type.as_str()).collect();
+
     span.record("queues", tracing::field::debug(&queues));
     span.record("job_types", tracing::field::debug(&job_types));
 }
@@ -298,6 +316,7 @@ impl QueueService for QueueServer {
             error = tracing::field::Empty
         );
         telemetry::set_parent_from_metadata(&span, request.metadata());
+
         let started = StdInstant::now();
         let result = async move {
             let req = request.into_inner();
@@ -306,6 +325,7 @@ impl QueueService for QueueServer {
                     "batch must contain at least one job",
                 ));
             }
+
             if req.jobs.len() as u64 > self.server_limits.max_enqueue_batch as u64 {
                 return Err(Status::invalid_argument(format!(
                     "batch exceeds max_enqueue_batch ({})",
@@ -366,8 +386,10 @@ impl QueueService for QueueServer {
         }
         .instrument(span.clone())
         .await;
+
         self.metrics
             .observe("enqueue_batch", started, &span, &result);
+
         result
     }
 
@@ -391,6 +413,7 @@ impl QueueService for QueueServer {
             error = tracing::field::Empty,
         );
         telemetry::set_parent_from_metadata(&span, request.metadata());
+
         let started = StdInstant::now();
         let result = async move {
             let req = request.into_inner();
@@ -399,6 +422,7 @@ impl QueueService for QueueServer {
                     "batch must contain at least one job",
                 ));
             }
+
             if req.jobs.len() as u64 > self.server_limits.max_enqueue_batch as u64 {
                 return Err(Status::invalid_argument(format!(
                     "batch exceeds max_enqueue_batch ({})",
@@ -425,6 +449,7 @@ impl QueueService for QueueServer {
                             reason = label,
                             "enqueue_atomic rejected job",
                         );
+
                         self.metrics.record_rejected(&job.queue, label);
                         errors.push(pb::JobValidationError {
                             index: index as u32,
@@ -451,6 +476,7 @@ impl QueueService for QueueServer {
                 valid.iter().filter(|j| j.scheduled_at.is_some()).count() as u64,
             );
             span.record("outcome", "committed");
+
             let responses = self.commit_validated(valid).await?;
             Ok(Response::new(EnqueueAtomicResponse {
                 outcome: Some(enqueue_atomic_response::Outcome::Success(
@@ -460,8 +486,10 @@ impl QueueService for QueueServer {
         }
         .instrument(span.clone())
         .await;
+
         self.metrics
             .observe("enqueue_atomic", started, &span, &result);
+
         result
     }
 
@@ -484,18 +512,21 @@ impl QueueService for QueueServer {
             error = tracing::field::Empty,
         );
         telemetry::set_parent_from_metadata(&span, request.metadata());
+
         let started = StdInstant::now();
         let result = async move {
             let req = request.into_inner();
             self.validator
                 .validate(&req)
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
+
             if req.queues.len() as u64 > self.server_limits.max_reserve_queues as u64 {
                 return Err(Status::invalid_argument(format!(
                     "reserve exceeds max_reserve_queues ({})",
                     self.server_limits.max_reserve_queues
                 )));
             }
+
             if let Some(q) = req
                 .queues
                 .iter()
@@ -515,6 +546,7 @@ impl QueueService for QueueServer {
                     .filter(|q| !registry.is_declared(q))
                     .map(String::as_str)
                     .collect();
+
                 if !unknown.is_empty() {
                     return Err(Status::failed_precondition(format!(
                         "queue(s) not declared (strict mode): {unknown:?}"
@@ -529,10 +561,12 @@ impl QueueService for QueueServer {
                 .min()
                 .unwrap_or(u64::MAX);
             let lease = req.lease_duration_ms.min(max_lease);
+
             let max_jobs = req
                 .max_jobs
                 .unwrap_or(1)
                 .clamp(1, self.server_limits.max_reserve_batch) as usize;
+
             let wait = req
                 .wait_timeout_ms
                 .min(self.server_limits.max_wait_timeout_ms);
@@ -551,6 +585,7 @@ impl QueueService for QueueServer {
                     .storage
                     .reserve_once(req.queues.clone(), lease, max_jobs)
                     .await?;
+
                 if !jobs.is_empty() {
                     let job_ids: Vec<&str> = jobs.iter().map(|j| j.id.as_str()).collect();
                     span.record("job_ids", tracing::field::debug(&job_ids));
@@ -569,6 +604,7 @@ impl QueueService for QueueServer {
                                 lease_expires_at = job.lease_expires_at,
                             );
                             telemetry::link_from_proto(&deliver, job.trace_context.as_ref());
+
                             if let Some(delivery_ctx) =
                                 deliver.in_scope(telemetry::current_trace_context)
                             {
@@ -576,6 +612,7 @@ impl QueueService for QueueServer {
                             }
                         }
                     }
+
                     return Ok(Response::new(ReserveResponse { jobs }));
                 }
 
@@ -583,6 +620,7 @@ impl QueueService for QueueServer {
                     span.record("job_count", 0u64);
                     span.record("timed_out", true);
                     self.metrics.record_reserve_empty(&req.queues);
+
                     return Ok(Response::new(ReserveResponse { jobs: Vec::new() }));
                 }
 
@@ -592,6 +630,7 @@ impl QueueService for QueueServer {
                         span.record("job_count", 0u64);
                         span.record("timed_out", true);
                         self.metrics.record_reserve_empty(&req.queues);
+
                         return Ok(Response::new(ReserveResponse { jobs: Vec::new() }));
                     }
                 }
@@ -599,7 +638,9 @@ impl QueueService for QueueServer {
         }
         .instrument(span.clone())
         .await;
+
         self.metrics.observe("reserve", started, &span, &result);
+
         result
     }
 
@@ -615,21 +656,26 @@ impl QueueService for QueueServer {
             error = tracing::field::Empty
         );
         telemetry::set_parent_from_metadata(&span, request.metadata());
+
         let started = StdInstant::now();
         let result = async move {
             let req = request.into_inner();
             self.validator
                 .validate(&req)
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
+
             let outcome = self.storage.ack(req.job_id.clone(), req.attempt).await?;
             let span = tracing::Span::current();
             span.record("queue", outcome.queue.as_str());
             telemetry::link_from_proto(&span, outcome.trace_context.as_ref());
+
             Ok(Response::new(AckResponse { job_id: req.job_id }))
         }
         .instrument(span.clone())
         .await;
+
         self.metrics.observe("ack", started, &span, &result);
+
         result
     }
 
@@ -649,22 +695,27 @@ impl QueueService for QueueServer {
             error = tracing::field::Empty
         );
         telemetry::set_parent_from_metadata(&span, request.metadata());
+
         let started = StdInstant::now();
         let result = async move {
             let req = request.into_inner();
             self.validator
                 .validate(&req)
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
+
             let job_id = req.job_id.clone();
             let outcome = self.storage.nack(req).await?;
             let span = tracing::Span::current();
+
             span.record("queue", outcome.queue.as_str());
             span.record("dead_lettered", outcome.dead_lettered);
             span.record("retry_delay_ms", outcome.retry_delay_ms);
             telemetry::link_from_proto(&span, outcome.trace_context.as_ref());
+
             if outcome.dead_lettered {
                 tracing::info!(%job_id, queue = %outcome.queue, "job dead-lettered via nack");
             }
+
             Ok(Response::new(NackResponse {
                 job_id,
                 dead_lettered: outcome.dead_lettered,
@@ -672,7 +723,9 @@ impl QueueService for QueueServer {
         }
         .instrument(span.clone())
         .await;
+
         self.metrics.observe("nack", started, &span, &result);
+
         result
     }
 
@@ -693,20 +746,24 @@ impl QueueService for QueueServer {
             error = tracing::field::Empty
         );
         telemetry::set_parent_from_metadata(&span, request.metadata());
+
         let started = StdInstant::now();
         let result = async move {
             let req = request.into_inner();
             self.validator
                 .validate(&req)
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
+
             // The per-queue lease ceiling is applied inside storage where the
             // job's queue is known via its Inflight record.
             let job_id = req.job_id.clone();
             let outcome = self.storage.extend(req).await?;
             let span = tracing::Span::current();
+
             span.record("queue", outcome.queue.as_str());
             span.record("lease_expires_at", outcome.lease_expires_at);
             telemetry::link_from_proto(&span, outcome.trace_context.as_ref());
+
             Ok(Response::new(ExtendResponse {
                 job_id,
                 lease_expires_at: outcome.lease_expires_at,
@@ -714,7 +771,9 @@ impl QueueService for QueueServer {
         }
         .instrument(span.clone())
         .await;
+
         self.metrics.observe("extend", started, &span, &result);
+
         result
     }
 
@@ -725,6 +784,7 @@ impl QueueService for QueueServer {
         let _span = tracing::info_span!("sepp.get_server_info", otel.kind = "server").entered();
         let defaults = self.registry.load().effective("");
         let s = &self.server_limits;
+
         Ok(Response::new(GetServerInfoResponse {
             server_version: env!("CARGO_PKG_VERSION").to_string(),
             supported_protocol_versions: vec!["v1".to_string()],

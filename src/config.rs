@@ -105,6 +105,7 @@ fn payload_within_message_limit(value: &u64, max: &u64) -> garde::Result {
             "must not exceed limits.max_message_bytes",
         ));
     }
+
     Ok(())
 }
 
@@ -157,12 +158,14 @@ impl EffectiveLimits {
     pub fn validate(&self, max_message_bytes: u64, scope: &str) -> Result<(), Box<dyn Error>> {
         self.validate_with(&max_message_bytes)
             .map_err(|e| format!("{scope}: {e}"))?;
+
         if self.default_max_attempts > self.max_attempts_ceiling {
             return Err(format!(
                 "{scope}.default_max_attempts: must not exceed max_attempts_ceiling"
             )
             .into());
         }
+
         Ok(())
     }
 }
@@ -359,18 +362,18 @@ impl Config {
         if explicit_path.is_some() && !Path::new(path).exists() {
             return Err(format!("config file not found: {path}").into());
         }
+
         let config: Config = Figment::new()
             .merge(Serialized::defaults(Config::default()))
             .merge(Toml::file(path))
             .merge(Env::prefixed("SEPP_").split("__"))
             .extract()?;
         config.validate()?;
+
         Ok(config)
     }
 
     fn validate(&self) -> Result<(), Box<dyn Error>> {
-        // Per-field rules — one garde call per sub-config (allows targeted
-        // scope prefixes in the error path).
         self.server.validate().map_err(|e| format!("server: {e}"))?;
         self.auth.validate().map_err(|e| format!("auth: {e}"))?;
         self.limits.validate().map_err(|e| format!("limits: {e}"))?;
@@ -383,6 +386,7 @@ impl Config {
         self.metrics
             .validate()
             .map_err(|e| format!("metrics: {e}"))?;
+
         // Cross-field rules that garde can't express declaratively.
         match (&self.server.tls_cert_path, &self.server.tls_key_path) {
             (Some(_), None) => {
@@ -397,9 +401,11 @@ impl Config {
             }
             _ => {}
         }
+
         if self.tracing.enabled && self.tracing.service_name.is_empty() {
             return Err("tracing.service_name must not be empty".into());
         }
+
         if self.metrics.enabled {
             if self.metrics.otlp_endpoint.is_empty() {
                 return Err("metrics.otlp_endpoint must not be empty when enabled".into());
@@ -408,8 +414,7 @@ impl Config {
                 return Err("metrics.export_interval_ms must be > 0".into());
             }
         }
-        // Overridable per-job/per-queue limits — the same field rules apply
-        // to the global defaults and to each queue's merged effective view.
+
         let defaults = EffectiveLimits::from_globals(&self.limits, &self.storage);
         defaults.validate(self.limits.max_message_bytes, "limits")?;
         self.validate_queues(&defaults)?;
@@ -429,6 +434,7 @@ impl Config {
                 )
                 .into());
             }
+
             if !seen.insert(q.name.as_str()) {
                 return Err(format!("queues[] contains duplicate name {:?}", q.name).into());
             }

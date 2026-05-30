@@ -59,9 +59,11 @@ pub async fn init(
             .with_tonic()
             .with_endpoint(cfg.otlp_endpoint.clone())
             .build()?;
+
         let reader = PeriodicReader::builder(exporter)
             .with_interval(Duration::from_millis(cfg.export_interval_ms))
             .build();
+
         builder = builder.with_reader(reader);
     }
 
@@ -70,6 +72,7 @@ pub async fn init(
         let reader = opentelemetry_prometheus::exporter()
             .with_registry(registry.clone())
             .build()?;
+
         builder = builder.with_reader(reader);
         Some(registry)
     } else {
@@ -99,6 +102,7 @@ async fn spawn_prometheus_endpoint(
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let local_addr = listener.local_addr()?;
     info!(addr = %local_addr, "prometheus metrics endpoint listening");
+
     Ok(tokio::spawn(async move {
         loop {
             let stream = match listener.accept().await {
@@ -108,6 +112,7 @@ async fn spawn_prometheus_endpoint(
                     continue;
                 }
             };
+
             let registry = registry.clone();
             tokio::spawn(async move {
                 let io = hyper_util::rt::TokioIo::new(stream);
@@ -120,6 +125,7 @@ async fn spawn_prometheus_endpoint(
                         ))
                     }
                 });
+
                 if let Err(e) = hyper::server::conn::http1::Builder::new()
                     .serve_connection(io, service)
                     .await
@@ -138,6 +144,7 @@ fn scrape_response(registry: &Registry, path: &str) -> hyper::Response<Full<Byte
             .body(Full::new(Bytes::from_static(b"try /metrics\n")))
             .expect("static response is valid");
     }
+
     let encoder = TextEncoder::new();
     let mut buf = Vec::new();
     if let Err(e) = encoder.encode(&registry.gather(), &mut buf) {
@@ -147,6 +154,7 @@ fn scrape_response(registry: &Registry, path: &str) -> hyper::Response<Full<Byte
             .body(Full::new(Bytes::from_static(b"# encoding error\n")))
             .expect("static response is valid");
     }
+
     hyper::Response::builder()
         .status(hyper::StatusCode::OK)
         .header(hyper::header::CONTENT_TYPE, encoder.format_type())
@@ -240,6 +248,7 @@ impl Metrics {
                 status.code(),
                 tonic::Code::Internal | tonic::Code::Unknown | tonic::Code::DataLoss
             );
+
             let _enter = span.enter();
             if server_fault {
                 span.record("otel.status_code", "error");
@@ -248,9 +257,11 @@ impl Metrics {
                 tracing::debug!(method, error = %status, "request rejected");
             }
         }
+
         if !self.enabled {
             return;
         }
+
         let outcome = if result.is_ok() { "ok" } else { "error" };
         self.requests.add(
             1,
@@ -259,6 +270,7 @@ impl Metrics {
                 KeyValue::new("outcome", outcome),
             ],
         );
+
         self.request_duration_ms.record(
             started.elapsed().as_secs_f64() * 1000.0,
             &[KeyValue::new("method", method)],
@@ -269,6 +281,7 @@ impl Metrics {
         if !self.enabled {
             return;
         }
+
         add_by_queue(&self.jobs_enqueued, &m.enqueued_by_queue);
         add_by_queue(&self.jobs_reserved, &m.reserved_by_queue);
         add_by_queue(&self.jobs_acked, &m.acked_by_queue);
@@ -283,6 +296,7 @@ impl Metrics {
             &self.sweep_dedup_expirations,
             &m.sweep_dedup_expirations_by_queue,
         );
+
         for ((queue, cause), n) in &m.dead_lettered_by_queue_cause {
             self.jobs_dead_lettered.add(
                 *n,
