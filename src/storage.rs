@@ -21,8 +21,8 @@ use uuid::Uuid;
 use crate::config::Config;
 use crate::metrics::{CycleMetrics, Metrics, QueueDepthSnapshot};
 use crate::pb::sepp::v1::{
-    EnqueueRequest, EnqueueResponse, ExtendRequest, Job, NackRequest, Payload, TraceContext,
-    nack_retry,
+    DeadLetterCause, DeadLetterRecord, EnqueueRequest, EnqueueResponse, ExtendRequest, Job,
+    NackRequest, Payload, TraceContext, nack_retry,
 };
 use crate::queues::SharedRegistry;
 use crate::telemetry;
@@ -37,6 +37,7 @@ pub fn now_ms() -> i64 {
 struct StorageParams {
     persist_mode: PersistMode,
     sweep_limit: usize,
+    dead_letter_retention_ms: u64,
 }
 
 struct Store {
@@ -49,6 +50,7 @@ struct Store {
     dedup_timers: TxKeyspace,
     scheduled: TxKeyspace,
     leases: TxKeyspace,
+    dead_letter: TxKeyspace,
     params: StorageParams,
     registry: SharedRegistry,
     metrics: Metrics,
@@ -114,6 +116,14 @@ fn timer_key(deadline: i64, job_id: &str) -> Vec<u8> {
 
 fn deadline_of(key: &[u8]) -> i64 {
     i64::from_be_bytes(key.first_chunk::<8>().copied().unwrap_or([0; 8]))
+}
+
+fn dead_letter_key(failed_at: i64, queue: &str, job_id: &[u8]) -> Vec<u8> {
+    let mut k = Vec::with_capacity(8 + 2 + queue.len() + job_id.len());
+    k.extend_from_slice(&failed_at.to_be_bytes());
+    k.extend_from_slice(&queue_prefix(queue));
+    k.extend_from_slice(job_id);
+    k
 }
 
 fn dedup_timer_key(deadline: i64, dedup_key: &[u8]) -> Vec<u8> {
@@ -293,6 +303,10 @@ impl TimerIndex {
     fn earliest(&self) -> Option<i64> {
         self.keys.keys().next().map(|k| deadline_of(k))
     }
+
+    fn iter_oldest(&self) -> impl Iterator<Item = (&[u8], &str)> {
+        self.keys.iter().map(|(k, v)| (k.as_slice(), v.as_str()))
+    }
 }
 
 #[derive(Default)]
@@ -301,6 +315,7 @@ struct Indexes {
     scheduled: TimerIndex,
     leases: TimerIndex,
     dedup_timers: TimerIndex,
+    dead_letter: TimerIndex,
 }
 
 impl Indexes {
@@ -380,6 +395,12 @@ fn rebuild_indexes(store: &Store) -> Result<Indexes, fjall::Error> {
         indexes.dedup_timers.insert(key.to_vec(), &queue);
     }
 
+    for guard in snap.iter(&store.dead_letter) {
+        let key = guard.key()?;
+        let queue = key.get(8..).and_then(read_queue).unwrap_or("").to_string();
+        indexes.dead_letter.insert(key.to_vec(), &queue);
+    }
+
     Ok(indexes)
 }
 
@@ -432,6 +453,11 @@ enum Command {
         req: ExtendRequest,
         resp: oneshot::Sender<Result<ExtendOutcome, Status>>,
     },
+    DrainDeadLetters {
+        queue: Option<String>,
+        max: usize,
+        resp: oneshot::Sender<Result<Vec<DeadLetterRecord>, Status>>,
+    },
 }
 
 enum Responder {
@@ -445,6 +471,10 @@ enum Responder {
     Extend(
         oneshot::Sender<Result<ExtendOutcome, Status>>,
         ExtendOutcome,
+    ),
+    Drain(
+        oneshot::Sender<Result<Vec<DeadLetterRecord>, Status>>,
+        Vec<DeadLetterRecord>,
     ),
 }
 
@@ -464,6 +494,9 @@ impl Responder {
                 let _ = resp.send(outcome.clone().map(|()| payload));
             }
             Responder::Extend(resp, payload) => {
+                let _ = resp.send(outcome.clone().map(|()| payload));
+            }
+            Responder::Drain(resp, payload) => {
                 let _ = resp.send(outcome.clone().map(|()| payload));
             }
         }
@@ -542,13 +575,30 @@ impl Cycle {
             bump_queue(&mut m.sweep_dedup_expirations_by_queue, queue);
         }
     }
+
+    fn dead_letter_expired(&mut self, n: u64) {
+        if let Some(m) = self.metrics.as_mut() {
+            m.dead_letters_expired += n;
+        }
+    }
+
+    fn dead_letter_drained(&mut self, n: u64) {
+        if let Some(m) = self.metrics.as_mut() {
+            m.dead_letters_drained += n;
+        }
+    }
 }
 
-fn next_deadline(indexes: &Indexes) -> Option<i64> {
+fn next_deadline(indexes: &Indexes, retention_ms: u64) -> Option<i64> {
+    let dead_letter = (retention_ms > 0)
+        .then(|| indexes.dead_letter.earliest())
+        .flatten()
+        .map(|f| f.saturating_add(i64::try_from(retention_ms).unwrap_or(i64::MAX)));
     [
         indexes.scheduled.earliest(),
         indexes.leases.earliest(),
         indexes.dedup_timers.earliest(),
+        dead_letter,
     ]
     .into_iter()
     .flatten()
@@ -562,8 +612,9 @@ fn run_committer(
     notifiers: QueueNotifiers,
     max_sweep_interval: Duration,
 ) {
+    let retention_ms = store.params.dead_letter_retention_ms;
     loop {
-        let sweep_due = next_deadline(&indexes).is_some_and(|d| d <= now_ms());
+        let sweep_due = next_deadline(&indexes, retention_ms).is_some_and(|d| d <= now_ms());
         if sweep_due {
             run_sweep_cycle(&store, &mut indexes, &notifiers);
         }
@@ -575,7 +626,7 @@ fn run_committer(
                 Err(flume::TryRecvError::Disconnected) => break,
             }
         } else {
-            let wait = match next_deadline(&indexes) {
+            let wait = match next_deadline(&indexes, retention_ms) {
                 Some(deadline) => Duration::from_millis((deadline - now_ms()).max(0) as u64)
                     .min(max_sweep_interval),
                 None => max_sweep_interval,
@@ -662,6 +713,14 @@ fn run_rpc_cycle(
             Command::Extend { req, resp } => {
                 match apply_extend(store, indexes, &mut tx, &mut cycle, req) {
                     Ok(outcome) => responders.push(Responder::Extend(resp, outcome)),
+                    Err(e) => {
+                        let _ = resp.send(Err(e));
+                    }
+                }
+            }
+            Command::DrainDeadLetters { queue, max, resp } => {
+                match apply_drain(store, indexes, &mut tx, &mut cycle, queue, max) {
+                    Ok(records) => responders.push(Responder::Drain(resp, records)),
                     Err(e) => {
                         let _ = resp.send(Err(e));
                     }
@@ -826,6 +885,7 @@ fn apply_enqueue(
             lease_expires_at: 0,
             custom: req.custom,
             scheduled_at: req.scheduled_at,
+            queue: String::new(),
         };
 
         tx.insert(
@@ -946,6 +1006,7 @@ fn apply_reserve(
                     continue;
                 }
             };
+            job.queue = job_queue.clone();
 
             match tx.get(&store.payloads, job_id.as_bytes()) {
                 Ok(Some(bytes)) => match Payload::decode(&*bytes) {
@@ -1034,6 +1095,121 @@ fn apply_ack(
     })
 }
 
+fn read_dead_letter_job(
+    store: &Store,
+    tx: &mut WriteTransaction<'_>,
+    job_id: &[u8],
+) -> Result<Option<Job>, Status> {
+    let Some(stored) = tx.get(&store.jobs, job_id).map_err(stg_err)? else {
+        return Ok(None);
+    };
+
+    let (queue, mut job) = match decode_job(&stored) {
+        Ok(decoded) => decoded,
+        Err(e) => {
+            warn!(error = %e, "dead-letter: skipping record for corrupt job");
+            return Ok(None);
+        }
+    };
+
+    if let Some(bytes) = tx.get(&store.payloads, job_id).map_err(stg_err)? {
+        match Payload::decode(&*bytes) {
+            Ok(payload) => job.payload = Some(payload),
+            Err(e) => warn!(error = %e, "dead-letter: dropping corrupt payload from record"),
+        }
+    }
+
+    job.queue = queue;
+    Ok(Some(job))
+}
+
+struct DeadLetterMeta {
+    cause: DeadLetterCause,
+    failed_at: i64,
+    attempt: u32,
+    last_reason: Option<String>,
+}
+
+// Depending on if the retention is set or not
+fn maybe_store_dead_letter(
+    store: &Store,
+    indexes: &mut Indexes,
+    tx: &mut WriteTransaction<'_>,
+    job_id: &[u8],
+    meta: DeadLetterMeta,
+) -> Result<(), Status> {
+    if store.params.dead_letter_retention_ms == 0 {
+        return Ok(());
+    }
+
+    let Some(mut job) = read_dead_letter_job(store, tx, job_id)? else {
+        return Ok(());
+    };
+
+    job.attempt = meta.attempt;
+    let key = dead_letter_key(meta.failed_at, &job.queue, job_id);
+    indexes.dead_letter.insert(key.clone(), &job.queue);
+
+    let record = DeadLetterRecord {
+        job: Some(job),
+        cause: meta.cause as i32,
+        failed_at: meta.failed_at,
+        final_attempt: meta.attempt,
+        last_reason: meta.last_reason,
+    };
+
+    tx.insert(&store.dead_letter, key, record.encode_to_vec());
+    Ok(())
+}
+
+fn apply_drain(
+    store: &Store,
+    indexes: &mut Indexes,
+    tx: &mut WriteTransaction<'_>,
+    cycle: &mut Cycle,
+    queue: Option<String>,
+    max: usize,
+) -> Result<Vec<DeadLetterRecord>, Status> {
+    let mut chosen: Vec<Vec<u8>> = Vec::new();
+    for (examined, (key, q)) in indexes.dead_letter.iter_oldest().enumerate() {
+        if chosen.len() >= max || examined >= store.params.sweep_limit {
+            break;
+        }
+
+        if queue.as_deref().is_some_and(|want| want != q) {
+            continue;
+        }
+
+        chosen.push(key.to_vec());
+    }
+
+    let mut records = Vec::with_capacity(chosen.len());
+    for key in &chosen {
+        match tx.get(&store.dead_letter, key).map_err(stg_err)? {
+            Some(value) => match DeadLetterRecord::decode(&*value) {
+                Ok(record) => {
+                    records.push(record);
+                    indexes.dead_letter.remove(key);
+                    tx.remove(&store.dead_letter, key.clone());
+                }
+                Err(e) => {
+                    warn!(error = %e, "drain leaving corrupt dead-letter record for retention");
+                }
+            },
+            None => {
+                indexes.dead_letter.remove(key);
+            }
+        }
+    }
+
+    if !records.is_empty() {
+        cycle.dead_letter_drained(records.len() as u64);
+        cycle.dirty = true;
+    }
+
+    Ok(records)
+}
+
 fn apply_nack(
     store: &Store,
     indexes: &mut Indexes,
@@ -1068,11 +1244,24 @@ fn apply_nack(
     };
 
     if force_dead_letter || inflight.attempt >= inflight.max_attempts {
-        let cause_label = if force_dead_letter {
-            "rejected"
+        let (cause_label, cause) = if force_dead_letter {
+            ("rejected", DeadLetterCause::Rejected)
         } else {
-            "attempts_exhausted"
+            ("attempts_exhausted", DeadLetterCause::AttemptsExhausted)
         };
+
+        maybe_store_dead_letter(
+            store,
+            indexes,
+            tx,
+            req.job_id.as_bytes(),
+            DeadLetterMeta {
+                cause,
+                failed_at: now,
+                attempt: inflight.attempt,
+                last_reason: req.reason.clone(),
+            },
+        )?;
 
         tx.remove(&store.jobs, req.job_id.as_bytes().to_vec());
         tx.remove(&store.payloads, req.job_id.as_bytes().to_vec());
@@ -1295,6 +1484,19 @@ fn apply_sweep(
                 "job dead-lettered: lease expired with attempts exhausted"
             );
 
+            maybe_store_dead_letter(
+                store,
+                indexes,
+                tx,
+                job_id,
+                DeadLetterMeta {
+                    cause: DeadLetterCause::LeaseExpired,
+                    failed_at: now,
+                    attempt: inflight.attempt,
+                    last_reason: None,
+                },
+            )?;
+
             tx.remove(&store.jobs, job_id.to_vec());
             tx.remove(&store.payloads, job_id.to_vec());
             tx.remove(&store.inflight, job_id.to_vec());
@@ -1355,6 +1557,29 @@ fn apply_sweep(
         tx.remove(&store.dedup_timers, timer_k.clone());
         cycle.sweep_dedup_expiration(&queue);
         cycle.dirty = true;
+    }
+
+    if store.params.dead_letter_retention_ms > 0 {
+        let cutoff = now.saturating_sub(
+            i64::try_from(store.params.dead_letter_retention_ms).unwrap_or(i64::MAX),
+        );
+        let mut budget = store.params.sweep_limit;
+        let mut expired = 0u64;
+
+        while budget > 0 {
+            let Some((key, _queue)) = indexes.dead_letter.pop_due(cutoff) else {
+                break;
+            };
+            budget -= 1;
+            processed += 1;
+            expired += 1;
+            tx.remove(&store.dead_letter, key);
+            cycle.dirty = true;
+        }
+
+        if expired > 0 {
+            cycle.dead_letter_expired(expired);
+        }
     }
 
     Ok(processed)
@@ -1459,6 +1684,7 @@ impl Storage {
                 crate::config::PersistMode::Buffer => PersistMode::Buffer,
             },
             sweep_limit: config.storage.sweep_limit,
+            dead_letter_retention_ms: config.storage.dead_letter_retention_ms,
         };
 
         if matches!(
@@ -1486,6 +1712,9 @@ impl Storage {
             dedup_timers: db.keyspace("dedup_timers", hits)?,
             scheduled: db.keyspace("scheduled", hits)?,
             leases: db.keyspace("leases", hits)?,
+            dead_letter: db.keyspace("dead_letter", || {
+                hits().with_kv_separation(Some(KvSeparationOptions::default()))
+            })?,
             db,
             params,
             registry,
@@ -1513,6 +1742,7 @@ impl Storage {
             persist_mode = ?config.storage.persist_mode,
             sweep_interval_ms = config.storage.sweep_interval_ms,
             sweep_limit = config.storage.sweep_limit,
+            dead_letter_retention_ms = config.storage.dead_letter_retention_ms,
             command_queue_capacity = config.storage.command_queue_capacity,
             "storage opened",
         );
@@ -1576,6 +1806,15 @@ impl Storage {
     pub async fn extend(&self, req: ExtendRequest) -> Result<ExtendOutcome, Status> {
         self.send(|resp| Command::Extend { req, resp }).await?
     }
+
+    pub async fn drain_dead_letters(
+        &self,
+        queue: Option<String>,
+        max: usize,
+    ) -> Result<Vec<DeadLetterRecord>, Status> {
+        self.send(|resp| Command::DrainDeadLetters { queue, max, resp })
+            .await?
+    }
 }
 
 #[cfg(test)]
@@ -1629,6 +1868,33 @@ mod tests {
         let k = dedup_timer_key(777, b"the-dedup-key");
         assert_eq!(deadline_of(&k), 777);
         assert_eq!(&k[8..], b"the-dedup-key");
+    }
+
+    #[test]
+    fn dead_letter_key_embeds_failed_at_and_queue() {
+        let k = dead_letter_key(777, "orders", b"job-9");
+        assert_eq!(deadline_of(&k), 777);
+        assert_eq!(
+            read_queue(&k[8..]),
+            Some("orders"),
+            "the queue is recoverable from the key for index rebuild"
+        );
+        // failed_at leads, so ascending key order is oldest-first regardless of
+        // queue or job id.
+        assert!(dead_letter_key(100, "zzz", b"zzz") < dead_letter_key(200, "aaa", b"aaa"));
+    }
+
+    #[test]
+    fn timer_index_iter_oldest_walks_in_order() {
+        let mut idx = TimerIndex::default();
+        idx.insert(dead_letter_key(300, "qb", b"c"), "qb");
+        idx.insert(dead_letter_key(100, "qa", b"a"), "qa");
+        idx.insert(dead_letter_key(200, "qa", b"b"), "qa");
+        let order: Vec<(i64, &str)> = idx
+            .iter_oldest()
+            .map(|(k, q)| (deadline_of(k), q))
+            .collect();
+        assert_eq!(order, vec![(100, "qa"), (200, "qa"), (300, "qb")]);
     }
 
     #[test]
@@ -1854,17 +2120,29 @@ mod tests {
     }
 
     #[test]
-    fn next_deadline_is_the_minimum_across_every_timer_index() {
+    fn next_deadline_is_the_minimum_across_every_index() {
         let mut indexes = Indexes::default();
-        assert_eq!(next_deadline(&indexes), None);
+        assert_eq!(next_deadline(&indexes, 0), None);
 
         indexes.scheduled.insert(timer_key(500, "s"), "q");
         indexes.leases.insert(timer_key(200, "l"), "q");
         indexes.dedup_timers.insert(dedup_timer_key(800, b"d"), "q");
-        assert_eq!(next_deadline(&indexes), Some(200));
+        assert_eq!(next_deadline(&indexes, 0), Some(200));
 
         indexes.leases.remove(&timer_key(200, "l"));
-        assert_eq!(next_deadline(&indexes), Some(500));
+        assert_eq!(next_deadline(&indexes, 0), Some(500));
+
+        // The oldest dead-letter contributes failed_at + retention to the min.
+        indexes
+            .dead_letter
+            .insert(dead_letter_key(100, "q", b"d"), "q");
+        assert_eq!(
+            next_deadline(&indexes, 50),
+            Some(150),
+            "oldest failed_at (100) + retention (50) becomes the minimum"
+        );
+        // With retention disabled, the dead-letter term drops out entirely.
+        assert_eq!(next_deadline(&indexes, 0), Some(500));
     }
 
     #[test]

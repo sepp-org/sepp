@@ -5,10 +5,10 @@
 #
 # buf is not part of the build — prost/tonic compile the vendored files directly
 # (see build.rs), so the build is offline and picks up local edits to
-# proto/queue.proto. This file exists only so editor tooling can resolve the
-# vendored imports, and to document how to refresh the snapshot:
+# proto/sepp/v1/queue.proto. This file exists only so editor tooling can resolve
+# the vendored imports, and to document how to refresh the snapshot:
 #
-#     buf export buf.build/sepp-org/sepp-proto:v1.0.0 -o proto
+#     buf export buf.build/sepp-org/sepp-proto:v1.0.1 -o proto
 version: v2
 modules:
   - path: proto

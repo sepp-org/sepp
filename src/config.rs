@@ -247,6 +247,7 @@ pub struct StorageConfig {
     #[garde(range(min = 1))]
     pub sweep_limit: usize,
     pub dedup_window_ms: i64,
+    pub dead_letter_retention_ms: u64,
     #[garde(range(min = 1))]
     pub command_queue_capacity: usize,
     #[garde(inner(range(min = 1)))]
@@ -266,6 +267,7 @@ impl Default for StorageConfig {
             sweep_interval_ms: 1000,
             sweep_limit: 10_000,
             dedup_window_ms: 24 * 60 * 60 * 1000,
+            dead_letter_retention_ms: 0,
             command_queue_capacity: 4096,
             cache_size_bytes: None,
             max_journaling_size_bytes: None,

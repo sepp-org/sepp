@@ -180,6 +180,8 @@ pub struct CycleMetrics {
     pub sweep_promotions_by_queue: HashMap<String, u64>,
     pub sweep_lease_redeliveries_by_queue: HashMap<String, u64>,
     pub sweep_dedup_expirations_by_queue: HashMap<String, u64>,
+    pub dead_letters_expired: u64,
+    pub dead_letters_drained: u64,
 }
 
 #[derive(Clone)]
@@ -198,6 +200,8 @@ pub struct Metrics {
     sweep_promotions: Counter<u64>,
     sweep_lease_redeliveries: Counter<u64>,
     sweep_dedup_expirations: Counter<u64>,
+    dead_letters_expired: Counter<u64>,
+    dead_letters_drained: Counter<u64>,
     commit_duration_ms: Histogram<f64>,
     queue_depths: Arc<ArcSwap<QueueDepthSnapshot>>,
 }
@@ -223,6 +227,8 @@ impl Metrics {
             sweep_promotions: meter.u64_counter("sepp.sweep.promotions").build(),
             sweep_lease_redeliveries: meter.u64_counter("sepp.sweep.lease_redeliveries").build(),
             sweep_dedup_expirations: meter.u64_counter("sepp.sweep.dedup_expirations").build(),
+            dead_letters_expired: meter.u64_counter("sepp.dead_letters.expired").build(),
+            dead_letters_drained: meter.u64_counter("sepp.dead_letters.drained").build(),
             commit_duration_ms: meter
                 .f64_histogram("sepp.commit.duration")
                 .with_unit("ms")
@@ -305,6 +311,13 @@ impl Metrics {
                     KeyValue::new("cause", *cause),
                 ],
             );
+        }
+
+        if m.dead_letters_expired > 0 {
+            self.dead_letters_expired.add(m.dead_letters_expired, &[]);
+        }
+        if m.dead_letters_drained > 0 {
+            self.dead_letters_drained.add(m.dead_letters_drained, &[]);
         }
     }
 

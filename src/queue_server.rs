@@ -1,10 +1,11 @@
 use crate::config::{Config, EffectiveLimits};
 use crate::metrics::{self, Metrics};
 use crate::pb::sepp::v1::{
-    self as pb, AckRequest, AckResponse, EnqueueAtomicResponse, EnqueueBatchRequest,
-    EnqueueBatchResponse, EnqueueRequest, ExtendRequest, ExtendResponse, GetServerInfoRequest,
-    GetServerInfoResponse, JobResult, NackRequest, NackResponse, PrimitiveValue, ReserveRequest,
-    ReserveResponse, enqueue_atomic_response, job_result, queue_service_server::QueueService,
+    self as pb, AckRequest, AckResponse, DrainDeadLettersRequest, DrainDeadLettersResponse,
+    EnqueueAtomicResponse, EnqueueBatchRequest, EnqueueBatchResponse, EnqueueRequest,
+    ExtendRequest, ExtendResponse, GetServerInfoRequest, GetServerInfoResponse, JobResult,
+    NackRequest, NackResponse, PrimitiveValue, ReserveRequest, ReserveResponse,
+    enqueue_atomic_response, job_result, queue_service_server::QueueService,
 };
 use crate::queues::{QueueRegistry, SharedRegistry};
 use crate::storage::{Storage, now_ms};
@@ -34,6 +35,7 @@ pub struct QueueServer {
     storage: Storage,
     registry: SharedRegistry,
     strict_queues: bool,
+    dead_letter_retention_enabled: bool,
     server_limits: ServerLimits,
     metrics: Metrics,
     _command_queue_gauge: ObservableGauge<u64>,
@@ -58,6 +60,7 @@ impl QueueServer {
             storage,
             registry,
             strict_queues: config.server.strict_queues,
+            dead_letter_retention_enabled: config.storage.dead_letter_retention_ms > 0,
             server_limits: ServerLimits {
                 max_reserve_batch: config.limits.max_reserve_batch,
                 max_reserve_queues: config.limits.max_reserve_queues,
@@ -777,6 +780,61 @@ impl QueueService for QueueServer {
         result
     }
 
+    async fn drain_dead_letters(
+        &self,
+        request: Request<DrainDeadLettersRequest>,
+    ) -> Result<Response<DrainDeadLettersResponse>, Status> {
+        let span = tracing::info_span!(
+            "sepp.drain_dead_letters",
+            otel.kind = "server",
+            otel.status_code = tracing::field::Empty,
+            queue = request.get_ref().queue.as_deref().unwrap_or("<all>"),
+            max = tracing::field::Empty,
+            drained = tracing::field::Empty,
+            error = tracing::field::Empty,
+        );
+        telemetry::set_parent_from_metadata(&span, request.metadata());
+
+        let started = StdInstant::now();
+        let result = async move {
+            let req = request.into_inner();
+            self.validator
+                .validate(&req)
+                .map_err(|e| Status::invalid_argument(e.to_string()))?;
+
+            let max = req
+                .max
+                .unwrap_or(1)
+                .clamp(1, self.server_limits.max_reserve_batch) as usize;
+
+            let records = self
+                .storage
+                .drain_dead_letters(req.queue.clone(), max)
+                .await?;
+
+            let span = tracing::Span::current();
+            span.record("max", max as u64);
+            span.record("drained", records.len() as u64);
+
+            // Drain is destructive — the records are removed before this response
+            // is sent — so always leave an audit line.
+            tracing::warn!(
+                queue = req.queue.as_deref().unwrap_or("<all>"),
+                drained = records.len(),
+                "drained dead-letter records",
+            );
+
+            Ok(Response::new(DrainDeadLettersResponse { records }))
+        }
+        .instrument(span.clone())
+        .await;
+
+        self.metrics
+            .observe("drain_dead_letters", started, &span, &result);
+
+        result
+    }
+
     async fn get_server_info(
         &self,
         _request: Request<GetServerInfoRequest>,
@@ -805,6 +863,7 @@ impl QueueService for QueueServer {
             max_wait_timeout_ms: s.max_wait_timeout_ms,
             max_lease_duration_ms: defaults.max_lease_duration_ms,
             strict_queues: self.strict_queues,
+            dead_letter_retention_enabled: self.dead_letter_retention_enabled,
         }))
     }
 }

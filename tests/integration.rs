@@ -13,10 +13,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use sepp::pb::sepp::v1::{
-    AckRequest, EnqueueBatchRequest, EnqueueRequest, EnqueueResponse, ExtendRequest,
-    GetServerInfoRequest, Job, NackRequest, NackRetry, Payload, PrimitiveValue, ReserveRequest,
-    enqueue_atomic_response, job_rejection, job_result, nack_retry, primitive_value,
-    queue_service_client::QueueServiceClient,
+    AckRequest, DeadLetterCause, DeadLetterRecord, DrainDeadLettersRequest, EnqueueBatchRequest,
+    EnqueueRequest, EnqueueResponse, ExtendRequest, GetServerInfoRequest, Job, NackRequest,
+    NackRetry, Payload, PrimitiveValue, ReserveRequest, enqueue_atomic_response, job_rejection,
+    job_result, nack_retry, primitive_value, queue_service_client::QueueServiceClient,
 };
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 
@@ -733,6 +733,359 @@ async fn dead_letter_directive_drops_job_immediately() {
     assert!(
         gone.is_none(),
         "a force-dead-lettered job is not redelivered"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Dead-letter retention + drain
+// ---------------------------------------------------------------------------
+
+// Retention long enough that a test always drains its records before the
+// sweeper could reclaim them.
+const RETAIN_CFG: &str = r#"
+[storage]
+dead_letter_retention_ms = 600000
+"#;
+
+async fn drain(client: &Client, queue: Option<&str>, max: u32) -> Vec<DeadLetterRecord> {
+    client
+        .clone()
+        .drain_dead_letters(DrainDeadLettersRequest {
+            queue: queue.map(str::to_string),
+            max: Some(max),
+        })
+        .await
+        .expect("drain_dead_letters RPC")
+        .into_inner()
+        .records
+}
+
+/// Enqueues a job to `queue`, reserves it, and force-dead-letters it via a
+/// `DeadLetter` nack. Returns the job id.
+async fn dead_letter_one(client: &Client, queue: &str, reason: &str) -> String {
+    let resp = enqueue(client, enqueue_req(queue)).await;
+    let job = reserve(client, queue, LEASE, WAIT)
+        .await
+        .expect("job reservable before dead-lettering");
+    assert!(
+        nack(client, &job, Retry::DeadLetter, reason).await,
+        "a DeadLetter nack dead-letters the job"
+    );
+    resp.job_id
+}
+
+#[tokio::test]
+async fn dead_letters_are_retained_and_drained() {
+    let (_guard, client) = start_server_with_config("dl-drain", RETAIN_CFG).await;
+
+    // A job that exhausts its attempts via nacks, carrying a payload to replay.
+    enqueue(
+        &client,
+        EnqueueRequest {
+            max_attempts: Some(2),
+            payload: Some(Payload {
+                data: b"to-replay".to_vec(),
+                encoding: "text/plain".to_string(),
+            }),
+            ..enqueue_req("dl-drain-q")
+        },
+    )
+    .await;
+
+    let a1 = reserve(&client, "dl-drain-q", LEASE, WAIT)
+        .await
+        .expect("attempt 1");
+    assert!(!nack(&client, &a1, Retry::Default, "fail 1").await);
+    let a2 = reserve(&client, "dl-drain-q", LEASE, WAIT)
+        .await
+        .expect("attempt 2");
+    let job_id = a2.id.clone();
+    assert!(
+        nack(&client, &a2, Retry::Default, "fail 2").await,
+        "the final nack dead-letters the job"
+    );
+
+    let records = drain(&client, None, 10).await;
+    assert_eq!(
+        records.len(),
+        1,
+        "the dead-lettered job is retained and drainable"
+    );
+    let r = &records[0];
+    assert_eq!(r.cause, DeadLetterCause::AttemptsExhausted as i32);
+    assert_eq!(r.final_attempt, 2);
+    assert_eq!(
+        r.last_reason.as_deref(),
+        Some("fail 2"),
+        "the last nack reason is captured"
+    );
+    let job = r.job.as_ref().expect("the record carries the job");
+    assert_eq!(job.id, job_id);
+    assert_eq!(
+        job.queue, "dl-drain-q",
+        "the record carries the origin queue"
+    );
+    assert_eq!(
+        job.payload.as_ref().map(|p| p.data.as_slice()),
+        Some(&b"to-replay"[..]),
+        "the payload is preserved for replay",
+    );
+
+    // Drain is destructive: a second drain returns nothing.
+    assert!(
+        drain(&client, None, 10).await.is_empty(),
+        "drained records are removed"
+    );
+}
+
+#[tokio::test]
+async fn force_dead_letter_is_drained_with_its_reason() {
+    let (_guard, client) = start_server_with_config("dl-force-drain", RETAIN_CFG).await;
+
+    let job_id = dead_letter_one(&client, "dl-force-q", "drop it").await;
+
+    let records = drain(&client, None, 10).await;
+    assert_eq!(records.len(), 1);
+    let r = &records[0];
+    assert_eq!(
+        r.cause,
+        DeadLetterCause::Rejected as i32,
+        "a DeadLetter nack records the REJECTED cause"
+    );
+    assert_eq!(r.final_attempt, 1);
+    assert_eq!(r.last_reason.as_deref(), Some("drop it"));
+    assert_eq!(r.job.as_ref().unwrap().id, job_id);
+}
+
+#[tokio::test]
+async fn lease_expiry_dead_letter_is_drainable() {
+    let (_guard, client) = start_server_with_config("dl-lease", RETAIN_CFG).await;
+
+    // max_attempts = 1: the first lease expiry dead-letters rather than redelivers.
+    enqueue(
+        &client,
+        EnqueueRequest {
+            max_attempts: Some(1),
+            ..enqueue_req("dl-lease-q")
+        },
+    )
+    .await;
+    let job = reserve(&client, "dl-lease-q", Duration::from_secs(1), WAIT)
+        .await
+        .expect("reservable");
+    let job_id = job.id.clone();
+
+    // Let the 1s lease expire; the sweeper dead-letters the exhausted job.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let records = drain(&client, None, 10).await;
+    assert_eq!(records.len(), 1, "a lease-expiry dead-letter is retained");
+    let r = &records[0];
+    assert_eq!(r.cause, DeadLetterCause::LeaseExpired as i32);
+    assert_eq!(
+        r.last_reason, None,
+        "a lease-expiry death has no worker-reported reason"
+    );
+    assert_eq!(r.job.as_ref().unwrap().id, job_id);
+}
+
+#[tokio::test]
+async fn drain_is_empty_without_retention() {
+    // Default config: retention is 0, so dead jobs are deleted, not stored.
+    let (_guard, client) = start_server("dl-off").await;
+
+    let info = client
+        .clone()
+        .get_server_info(GetServerInfoRequest {})
+        .await
+        .expect("get_server_info RPC")
+        .into_inner();
+    assert!(
+        !info.dead_letter_retention_enabled,
+        "retention is disabled by default"
+    );
+
+    dead_letter_one(&client, "dl-off-q", "gone").await;
+    assert!(
+        drain(&client, None, 10).await.is_empty(),
+        "with retention off there is nothing to drain"
+    );
+}
+
+#[tokio::test]
+async fn server_advertises_dead_letter_retention_when_enabled() {
+    let (_guard, client) = start_server_with_config("dl-info", RETAIN_CFG).await;
+    let info = client
+        .clone()
+        .get_server_info(GetServerInfoRequest {})
+        .await
+        .expect("get_server_info RPC")
+        .into_inner();
+    assert!(
+        info.dead_letter_retention_enabled,
+        "a server configured with retention advertises it"
+    );
+}
+
+#[tokio::test]
+async fn drain_respects_max_and_returns_oldest_first() {
+    let (_guard, client) = start_server_with_config("dl-max", RETAIN_CFG).await;
+
+    // Dead-letter three jobs in order, with gaps so their failed_at differs.
+    let mut ids = Vec::new();
+    for i in 0..3 {
+        ids.push(dead_letter_one(&client, "dl-max-q", &format!("f{i}")).await);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // max bounds the batch; the oldest two come back first, in order.
+    let first = drain(&client, None, 2).await;
+    let got: Vec<&str> = first
+        .iter()
+        .map(|r| r.job.as_ref().unwrap().id.as_str())
+        .collect();
+    assert_eq!(
+        got,
+        vec![ids[0].as_str(), ids[1].as_str()],
+        "drain returns the oldest records first, capped at max"
+    );
+
+    let rest = drain(&client, None, 2).await;
+    assert_eq!(rest.len(), 1, "the next drain returns the remainder");
+    assert_eq!(rest[0].job.as_ref().unwrap().id, ids[2]);
+
+    assert!(drain(&client, None, 2).await.is_empty());
+}
+
+#[tokio::test]
+async fn drain_filters_by_queue() {
+    let (_guard, client) = start_server_with_config("dl-filter", RETAIN_CFG).await;
+
+    let a1 = dead_letter_one(&client, "dl-filter-a", "a1").await;
+    let _b1 = dead_letter_one(&client, "dl-filter-b", "b1").await;
+    let a2 = dead_letter_one(&client, "dl-filter-a", "a2").await;
+
+    let a = drain(&client, Some("dl-filter-a"), 10).await;
+    let a_ids: std::collections::HashSet<&str> = a
+        .iter()
+        .map(|r| r.job.as_ref().unwrap().id.as_str())
+        .collect();
+    assert_eq!(a.len(), 2, "only queue a's dead-letters are drained");
+    assert!(a_ids.contains(a1.as_str()) && a_ids.contains(a2.as_str()));
+    assert!(
+        a.iter()
+            .all(|r| r.job.as_ref().unwrap().queue == "dl-filter-a"),
+        "every drained record is from the filtered queue"
+    );
+
+    // Queue b's record was untouched by the filtered drain.
+    let b = drain(&client, Some("dl-filter-b"), 10).await;
+    assert_eq!(b.len(), 1);
+    assert_eq!(b[0].job.as_ref().unwrap().queue, "dl-filter-b");
+}
+
+#[tokio::test]
+async fn retention_reclaims_expired_dead_letters_while_idle() {
+    // Short retention so the sweeper reclaims within the test, and no further
+    // RPCs after the dead-letter, to exercise the idle-tick reclaim path.
+    let cfg = r#"
+[storage]
+dead_letter_retention_ms = 1500
+"#;
+    let (_guard, client) = start_server_with_config("dl-reclaim", cfg).await;
+
+    dead_letter_one(&client, "dl-reclaim-q", "old").await;
+
+    // Wait past the retention window plus a sweep interval, doing nothing else.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    assert!(
+        drain(&client, None, 10).await.is_empty(),
+        "an expired dead-letter is reclaimed by the retention sweep even while idle"
+    );
+}
+
+#[tokio::test]
+async fn reserve_populates_the_job_queue() {
+    let (_guard, client) = start_server("q-field").await;
+
+    enqueue(&client, enqueue_req("q-field-single")).await;
+    let job = reserve(&client, "q-field-single", LEASE, WAIT)
+        .await
+        .expect("reservable");
+    assert_eq!(
+        job.queue, "q-field-single",
+        "a reserved job carries its queue"
+    );
+    ack(&client, &job).await;
+
+    // A multi-queue reserve lets the worker tell which queue a job came from.
+    enqueue(&client, enqueue_req("q-field-b")).await;
+    let job = reserve_batch(&client, &["q-field-a", "q-field-b"], LEASE, WAIT, None)
+        .await
+        .into_iter()
+        .next()
+        .expect("a job from the non-empty queue");
+    assert_eq!(job.queue, "q-field-b");
+    ack(&client, &job).await;
+}
+
+#[tokio::test]
+async fn dead_letter_record_survives_restart() {
+    // After a restart, the dead_letter in-memory index is rebuilt from the
+    // persisted keys (rebuild_indexes reads them key-only), and the record body
+    // is read back from the keyspace. Only a restart-then-drain proves both the
+    // index repopulation and that the value survived the reopen.
+    let db_path = temp_db("dl-restart");
+    let cfg_path = temp_config_path("dl-restart");
+    std::fs::write(&cfg_path, RETAIN_CFG).expect("write temp config");
+    let cfg_str = cfg_path.to_str().expect("utf-8 config path").to_string();
+
+    // First process: dead-letter a job with a payload, then die.
+    let job_id = {
+        let (child, client) = spawn_server_with_env(&db_path, &[("SEPP_CONFIG", &cfg_str)]).await;
+        let _server = ServerGuard {
+            child,
+            db_path: None,
+        };
+        enqueue(
+            &client,
+            EnqueueRequest {
+                payload: Some(Payload {
+                    data: b"survive".to_vec(),
+                    encoding: "text/plain".to_string(),
+                }),
+                ..enqueue_req("dl-restart-q")
+            },
+        )
+        .await;
+        let job = reserve(&client, "dl-restart-q", LEASE, WAIT)
+            .await
+            .expect("reservable");
+        let id = job.id.clone();
+        assert!(nack(&client, &job, Retry::DeadLetter, "before restart").await);
+        id
+    };
+
+    // Second process on the same db: the record must drain off persisted data.
+    let (child, client) = spawn_server_with_env(&db_path, &[("SEPP_CONFIG", &cfg_str)]).await;
+    let _server = ServerGuard {
+        child,
+        db_path: Some(db_path),
+    };
+    let _ = std::fs::remove_file(&cfg_path);
+
+    let records = drain(&client, None, 10).await;
+    assert_eq!(records.len(), 1, "a dead-letter record survives a restart");
+    let job = records[0].job.as_ref().expect("record carries the job");
+    assert_eq!(job.id, job_id);
+    assert_eq!(records[0].cause, DeadLetterCause::Rejected as i32);
+    assert_eq!(records[0].last_reason.as_deref(), Some("before restart"));
+    assert_eq!(job.queue, "dl-restart-q");
+    assert_eq!(
+        job.payload.as_ref().map(|p| p.data.as_slice()),
+        Some(&b"survive"[..]),
+        "the payload survives the restart",
     );
 }
 
