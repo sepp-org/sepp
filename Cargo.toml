@@ -18,6 +18,7 @@ flume = "0.12"
 serde = { version = "1", features = ["derive"] }
 figment = { version = "0.10", features = ["toml", "env"] }
 arc-swap = "1"
+notify = "8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 opentelemetry = { version = "0.32", default-features = false, features = ["trace", "metrics"] }

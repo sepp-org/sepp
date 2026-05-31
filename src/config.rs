@@ -7,7 +7,7 @@ use figment::{
 use garde::Validate;
 use serde::{Deserialize, Serialize};
 
-const DEFAULT_CONFIG_PATH: &str = "./sepp.toml";
+pub const DEFAULT_CONFIG_PATH: &str = "./sepp.toml";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

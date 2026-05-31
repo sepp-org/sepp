@@ -1,12 +1,15 @@
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 
 use sepp::auth::ApiKeyInterceptor;
-use sepp::config::Config;
+use sepp::config::{Config, DEFAULT_CONFIG_PATH};
+use sepp::config_watch::{self, ReloadState};
 use sepp::metrics;
 use sepp::pb::sepp::v1::queue_service_server::QueueServiceServer;
 use sepp::queue_server::QueueServer;
@@ -66,7 +69,8 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
         return Ok(code);
     }
 
-    let config = Config::load(config_path_arg().as_deref())?;
+    let config_path = config_path_arg();
+    let config = Config::load(config_path.as_deref())?;
     let _telemetry = telemetry::init(&config.logging, &config.tracing)?;
 
     install_panic_hook();
@@ -93,7 +97,8 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
         info!(queues = ?names, "declared queues from config");
     }
 
-    let svc = QueueServer::new(&config, registry.into_shared())?;
+    let registry = registry.into_shared();
+    let svc = QueueServer::new(&config, registry.clone())?;
     let queue_service = QueueServiceServer::new(svc)
         .max_decoding_message_size(config.limits.max_message_bytes as usize);
     let interceptor = ApiKeyInterceptor::new(&config.auth.api_keys);
@@ -132,6 +137,21 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
         declared_queues,
         "queue server listening",
     );
+
+    let watch_path = config_path.as_deref().unwrap_or(DEFAULT_CONFIG_PATH);
+    if std::path::Path::new(watch_path).exists() {
+        let state = ReloadState {
+            config: Arc::new(ArcSwap::from_pointee(config.clone())),
+            registry: registry.clone(),
+            interceptor: interceptor.clone(),
+        };
+        match config_watch::spawn(watch_path.into(), state) {
+            Ok(()) => info!(path = %watch_path, "watching config file for hot reload"),
+            Err(e) => warn!(error = %e, "could not start config watcher; hot reload disabled"),
+        }
+    } else {
+        debug!(path = %watch_path, "no config file on disk; hot reload disabled");
+    }
 
     builder
         .add_service(health_service)
