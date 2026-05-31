@@ -1236,6 +1236,127 @@ async fn enqueue_one(client: &Client, req: EnqueueRequest) -> sepp::pb::sepp::v1
         .expect("one result per submitted job")
 }
 
+/// Like [`start_server_with_config`], but leaves the config file on disk and
+/// returns its path so the test can rewrite it and exercise hot reloading.
+async fn start_server_reloadable(
+    tag: &str,
+    toml: &str,
+) -> (ServerGuard, Client, std::path::PathBuf) {
+    let db_path = temp_db(tag);
+    let cfg_path = temp_config_path(tag);
+    std::fs::write(&cfg_path, toml).expect("write temp config");
+    let cfg_str = cfg_path.to_str().expect("utf-8 config path");
+    let (child, client) = spawn_server_with_env(&db_path, &[("SEPP_CONFIG", cfg_str)]).await;
+    (
+        ServerGuard {
+            child,
+            db_path: Some(db_path),
+        },
+        client,
+        cfg_path,
+    )
+}
+
+/// Enqueues one job to `queue` and reports whether it was rejected as an unknown
+/// queue (the strict-mode rejection).
+async fn rejected_as_unknown_queue(client: &Client, queue: &str) -> bool {
+    let result = enqueue_one(client, enqueue_req(queue)).await;
+    matches!(
+        result.outcome,
+        Some(job_result::Outcome::Rejection(r))
+            if matches!(r.reason, Some(job_rejection::Reason::UnknownQueue(_)))
+    )
+}
+
+/// Submits an `n`-job batch and reports whether the server accepted it (i.e. the
+/// batch did not exceed `max_enqueue_batch`).
+async fn enqueue_batch_accepted(client: &Client, n: usize) -> bool {
+    let jobs = (0..n).map(|_| enqueue_req("hotreload-batch-q")).collect();
+    client
+        .clone()
+        .enqueue_batch(EnqueueBatchRequest { jobs })
+        .await
+        .is_ok()
+}
+
+#[tokio::test]
+async fn hot_reload_relaxes_strict_queues_live() {
+    // Start strict: an undeclared queue is rejected up front.
+    let strict = r#"
+[server]
+strict_queues = true
+
+[[queues]]
+name = "hotreload-declared"
+"#;
+    let (_guard, client, cfg_path) = start_server_reloadable("hotreload-strict", strict).await;
+    assert!(
+        rejected_as_unknown_queue(&client, "hotreload-ghost").await,
+        "strict mode should reject an undeclared queue before reload"
+    );
+
+    // Relax strict mode on disk and wait for the watcher to apply it. We rewrite
+    // periodically so a single missed filesystem event cannot wedge the test.
+    let relaxed = r#"
+[server]
+strict_queues = false
+
+[[queues]]
+name = "hotreload-declared"
+"#;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut applied = false;
+    while Instant::now() < deadline && !applied {
+        std::fs::write(&cfg_path, relaxed).expect("rewrite config");
+        let window = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < window {
+            if !rejected_as_unknown_queue(&client, "hotreload-ghost").await {
+                applied = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    assert!(
+        applied,
+        "relaxing strict_queues never took effect via hot reload"
+    );
+
+    let _ = std::fs::remove_file(&cfg_path);
+}
+
+#[tokio::test]
+async fn hot_reload_changes_max_enqueue_batch_live() {
+    // Start permissive: a 3-job batch is comfortably under the cap of 5.
+    let (_guard, client, cfg_path) =
+        start_server_reloadable("hotreload-batch", "[limits]\nmax_enqueue_batch = 5\n").await;
+    assert!(
+        enqueue_batch_accepted(&client, 3).await,
+        "a 3-job batch is within the initial cap of 5"
+    );
+
+    // Tighten the cap below the batch size and wait for the reload to bite.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut applied = false;
+    while Instant::now() < deadline && !applied {
+        std::fs::write(&cfg_path, "[limits]\nmax_enqueue_batch = 2\n").expect("rewrite config");
+        let window = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < window {
+            if !enqueue_batch_accepted(&client, 3).await {
+                applied = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    assert!(
+        applied,
+        "tightening max_enqueue_batch never took effect via hot reload"
+    );
+
+    let _ = std::fs::remove_file(&cfg_path);
+}
+
 #[tokio::test]
 async fn strict_mode_rejects_undeclared_queues() {
     let cfg = r#"

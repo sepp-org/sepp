@@ -1,8 +1,6 @@
 use std::process::ExitCode;
-use std::sync::Arc;
 use std::time::Duration;
 
-use arc_swap::ArcSwap;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
@@ -98,7 +96,8 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     }
 
     let registry = registry.into_shared();
-    let svc = QueueServer::new(&config, registry.clone())?;
+    let shared_config = config.clone().into_shared();
+    let svc = QueueServer::new(shared_config.clone(), registry.clone())?;
     let queue_service = QueueServiceServer::new(svc)
         .max_decoding_message_size(config.limits.max_message_bytes as usize);
     let interceptor = ApiKeyInterceptor::new(&config.auth.api_keys);
@@ -141,7 +140,7 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     let watch_path = config_path.as_deref().unwrap_or(DEFAULT_CONFIG_PATH);
     if std::path::Path::new(watch_path).exists() {
         let state = ReloadState {
-            config: Arc::new(ArcSwap::from_pointee(config.clone())),
+            config: shared_config.clone(),
             registry: registry.clone(),
             interceptor: interceptor.clone(),
         };

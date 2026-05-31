@@ -4,12 +4,11 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use arc_swap::ArcSwap;
 use notify::{RecursiveMode, Watcher};
 use tracing::{debug, error, info, warn};
 
 use crate::auth::ApiKeyInterceptor;
-use crate::config::Config;
+use crate::config::{Config, SharedConfig};
 use crate::queues::{QueueRegistry, SharedRegistry};
 
 // Each save can trigger multiple events
@@ -17,8 +16,7 @@ const DEBOUNCE: Duration = Duration::from_millis(500);
 
 #[derive(Clone)]
 pub struct ReloadState {
-    // Any consumers of the live config must clone this Arc
-    pub config: Arc<ArcSwap<Config>>,
+    pub config: SharedConfig,
     pub registry: SharedRegistry,
     pub interceptor: ApiKeyInterceptor,
 }
@@ -109,6 +107,7 @@ fn apply_reload(state: &ReloadState, path: &Path) {
         );
     }
 
+    // Theoretically there is a small window in which a request could observe the new registry but the old keys
     state
         .registry
         .store(Arc::new(QueueRegistry::from_config(&new)));
@@ -121,37 +120,25 @@ fn apply_reload(state: &ReloadState, path: &Path) {
 fn restart_only_changes(old: &Config, new: &Config) -> Vec<&'static str> {
     let mut changed = Vec::new();
 
-    // Bind address, db path, TLS, and strict-queue mode are all consumed once
-    // during startup wiring.
-    if old.server != new.server {
-        changed.push("server");
+    // Bind address, db path, and TLS are consumed once during startup wiring.
+    // `strict_queues` is read live per request, so it is intentionally absent.
+    let (a, b) = (&old.server, &new.server);
+    if a.listen_addr != b.listen_addr {
+        changed.push("server.listen_addr");
+    }
+    if a.db_path != b.db_path {
+        changed.push("server.db_path");
+    }
+    if a.tls_cert_path != b.tls_cert_path {
+        changed.push("server.tls_cert_path");
+    }
+    if a.tls_key_path != b.tls_key_path {
+        changed.push("server.tls_key_path");
     }
 
-    // The limits captured into the gRPC server and the per-call `ServerLimits`.
-    let (a, b) = (&old.limits, &new.limits);
-    if a.max_message_bytes != b.max_message_bytes {
+    // This applies to the actual gRPC server
+    if old.limits.max_message_bytes != new.limits.max_message_bytes {
         changed.push("limits.max_message_bytes");
-    }
-    if a.max_reserve_batch != b.max_reserve_batch {
-        changed.push("limits.max_reserve_batch");
-    }
-    if a.max_reserve_queues != b.max_reserve_queues {
-        changed.push("limits.max_reserve_queues");
-    }
-    if a.max_wait_timeout_ms != b.max_wait_timeout_ms {
-        changed.push("limits.max_wait_timeout_ms");
-    }
-    if a.max_enqueue_batch != b.max_enqueue_batch {
-        changed.push("limits.max_enqueue_batch");
-    }
-    if a.max_queue_name_bytes != b.max_queue_name_bytes {
-        changed.push("limits.max_queue_name_bytes");
-    }
-    if a.max_job_type_bytes != b.max_job_type_bytes {
-        changed.push("limits.max_job_type_bytes");
-    }
-    if a.max_idempotency_key_bytes != b.max_idempotency_key_bytes {
-        changed.push("limits.max_idempotency_key_bytes");
     }
 
     // Storage tuning is baked into the database and committer at startup.
@@ -216,6 +203,15 @@ mod tests {
         new.limits.default_max_attempts += 1;
         new.limits.max_schedule_horizon_ms += 1;
         new.storage.dedup_window_ms += 1;
+        // strict_queues and the per-call server limits are read live per request.
+        new.server.strict_queues = !new.server.strict_queues;
+        new.limits.max_reserve_batch += 1;
+        new.limits.max_reserve_queues += 1;
+        new.limits.max_wait_timeout_ms += 1;
+        new.limits.max_enqueue_batch += 1;
+        new.limits.max_queue_name_bytes += 1;
+        new.limits.max_job_type_bytes += 1;
+        new.limits.max_idempotency_key_bytes += 1;
         new.queues.push(crate::config::QueueConfig {
             name: "added".into(),
             ..Default::default()
@@ -224,16 +220,23 @@ mod tests {
     }
 
     #[test]
-    fn captured_fields_are_flagged_for_restart() {
+    fn strict_queues_is_hot_reloadable() {
         let mut new = Config::default();
         new.server.strict_queues = !new.server.strict_queues;
-        new.limits.max_reserve_batch += 1;
+        assert!(restart_only_changes(&Config::default(), &new).is_empty());
+    }
+
+    #[test]
+    fn captured_fields_are_flagged_for_restart() {
+        let mut new = Config::default();
+        new.server.db_path = "/somewhere/else".into();
+        new.limits.max_message_bytes += 1;
         new.storage.sweep_limit += 1;
         new.metrics.enabled = !new.metrics.enabled;
 
         let changed = restart_only_changes(&Config::default(), &new);
-        assert!(changed.contains(&"server"));
-        assert!(changed.contains(&"limits.max_reserve_batch"));
+        assert!(changed.contains(&"server.db_path"));
+        assert!(changed.contains(&"limits.max_message_bytes"));
         assert!(changed.contains(&"storage.sweep_limit"));
         assert!(changed.contains(&"metrics"));
     }
@@ -255,19 +258,21 @@ mod tests {
         let path = dir.join("sepp.toml");
         std::fs::write(
             &path,
-            "[auth]\napi_keys = [\"secret\"]\n\n\
+            "[server]\nstrict_queues = true\n\n\
+             [auth]\napi_keys = [\"secret\"]\n\n\
              [[queues]]\nname = \"emails\"\nmax_payload_bytes = 4321\n",
         )
         .unwrap();
 
         // Start from defaults, so the file genuinely differs.
         let state = ReloadState {
-            config: Arc::new(ArcSwap::from_pointee(Config::default())),
+            config: Config::default().into_shared(),
             registry: QueueRegistry::from_config(&Config::default()).into_shared(),
             interceptor: ApiKeyInterceptor::new(&None),
         };
         assert!(!state.interceptor.is_enforcing());
         assert!(!state.registry.load().is_declared("emails"));
+        assert!(!state.config.load().server.strict_queues);
 
         apply_reload(&state, &path);
 
@@ -277,7 +282,9 @@ mod tests {
         assert_eq!(reg.effective("emails").max_payload_bytes, 4321);
         // The API-key policy is now enforced.
         assert!(state.interceptor.is_enforcing());
-        // The config snapshot was republished as the source of truth.
+        // The republished snapshot is the live config handlers read: the
+        // hot-reloadable strict_queues flag and the auth keys both updated.
+        assert!(state.config.load().server.strict_queues);
         assert_eq!(
             state.config.load().auth.api_keys.as_deref(),
             Some(&["secret".to_string()][..])

@@ -1,5 +1,7 @@
+use std::sync::Arc;
 use std::{collections::HashSet, error::Error, net::SocketAddr, path::Path};
 
+use arc_swap::ArcSwap;
 use figment::{
     Figment,
     providers::{Env, Format, Serialized, Toml},
@@ -358,7 +360,14 @@ pub struct Config {
     pub queues: Vec<QueueConfig>,
 }
 
+pub type SharedConfig = Arc<ArcSwap<Config>>;
+
 impl Config {
+    // Wraps this configuration in a shared, atomically-swappable handle.
+    pub fn into_shared(self) -> SharedConfig {
+        Arc::new(ArcSwap::from_pointee(self))
+    }
+
     pub fn load(explicit_path: Option<&str>) -> Result<Self, Box<dyn Error>> {
         let path = explicit_path.unwrap_or(DEFAULT_CONFIG_PATH);
         if explicit_path.is_some() && !Path::new(path).exists() {

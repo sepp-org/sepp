@@ -1,4 +1,4 @@
-use crate::config::{Config, EffectiveLimits};
+use crate::config::{Config, EffectiveLimits, SharedConfig};
 use crate::metrics::{self, Metrics};
 use crate::pb::sepp::v1::{
     self as pb, AckRequest, AckResponse, DrainDeadLettersRequest, DrainDeadLettersResponse,
@@ -30,13 +30,26 @@ struct ServerLimits {
     max_idempotency_key_bytes: u32,
 }
 
+impl ServerLimits {
+    fn from_config(c: &Config) -> Self {
+        Self {
+            max_reserve_batch: c.limits.max_reserve_batch,
+            max_reserve_queues: c.limits.max_reserve_queues,
+            max_wait_timeout_ms: c.limits.max_wait_timeout_ms,
+            max_enqueue_batch: c.limits.max_enqueue_batch,
+            max_queue_name_bytes: c.limits.max_queue_name_bytes,
+            max_job_type_bytes: c.limits.max_job_type_bytes,
+            max_idempotency_key_bytes: c.limits.max_idempotency_key_bytes,
+        }
+    }
+}
+
 pub struct QueueServer {
     validator: Validator,
     storage: Storage,
     registry: SharedRegistry,
-    strict_queues: bool,
+    config: SharedConfig,
     dead_letter_retention_enabled: bool,
-    server_limits: ServerLimits,
     metrics: Metrics,
     _command_queue_gauge: ObservableGauge<u64>,
     _queue_depth_gauges: Vec<ObservableGauge<u64>>,
@@ -44,11 +57,16 @@ pub struct QueueServer {
 
 impl QueueServer {
     pub fn new(
-        config: &Config,
+        config: SharedConfig,
         registry: SharedRegistry,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let metrics = Metrics::new(config.metrics.enabled || config.metrics.prometheus_enabled);
-        let storage = Storage::open(config, registry.clone(), metrics.clone())?;
+        let (storage, metrics, dead_letter_retention_enabled) = {
+            let cfg = config.load();
+            let metrics = Metrics::new(cfg.metrics.enabled || cfg.metrics.prometheus_enabled);
+            let storage = Storage::open(&cfg, registry.clone(), metrics.clone())?;
+            let dead_letter_retention_enabled = cfg.storage.dead_letter_retention_ms > 0;
+            (storage, metrics, dead_letter_retention_enabled)
+        };
         let command_queue_gauge = {
             let storage = storage.clone();
             metrics::register_command_queue_gauge(move || storage.command_queue_depth() as u64)
@@ -59,17 +77,8 @@ impl QueueServer {
             validator: Validator::default(),
             storage,
             registry,
-            strict_queues: config.server.strict_queues,
-            dead_letter_retention_enabled: config.storage.dead_letter_retention_ms > 0,
-            server_limits: ServerLimits {
-                max_reserve_batch: config.limits.max_reserve_batch,
-                max_reserve_queues: config.limits.max_reserve_queues,
-                max_wait_timeout_ms: config.limits.max_wait_timeout_ms,
-                max_enqueue_batch: config.limits.max_enqueue_batch,
-                max_queue_name_bytes: config.limits.max_queue_name_bytes,
-                max_job_type_bytes: config.limits.max_job_type_bytes,
-                max_idempotency_key_bytes: config.limits.max_idempotency_key_bytes,
-            },
+            config,
+            dead_letter_retention_enabled,
             metrics,
             _command_queue_gauge: command_queue_gauge,
             _queue_depth_gauges: queue_depth_gauges,
@@ -80,9 +89,10 @@ impl QueueServer {
         &self,
         job: &EnqueueRequest,
         limits: &EffectiveLimits,
+        server: &ServerLimits,
     ) -> Result<(), pb::JobRejection> {
         use pb::job_rejection::Reason;
-        let s = &self.server_limits;
+        let s = server;
 
         if job.queue.len() > s.max_queue_name_bytes as usize {
             return Err(pb::JobRejection {
@@ -197,6 +207,8 @@ impl QueueServer {
         &self,
         job: &EnqueueRequest,
         registry: &QueueRegistry,
+        strict_queues: bool,
+        server: &ServerLimits,
     ) -> Result<(), pb::JobRejection> {
         use pb::job_rejection::Reason;
         if let Err(e) = self.validator.validate(job) {
@@ -207,7 +219,7 @@ impl QueueServer {
             });
         }
 
-        if self.strict_queues && !registry.is_declared(&job.queue) {
+        if strict_queues && !registry.is_declared(&job.queue) {
             return Err(pb::JobRejection {
                 reason: Some(Reason::UnknownQueue(pb::UnknownQueue {
                     queue: job.queue.clone(),
@@ -216,7 +228,7 @@ impl QueueServer {
         }
 
         let limits = registry.effective(&job.queue);
-        self.check_enqueue_limits(job, &limits)
+        self.check_enqueue_limits(job, &limits, server)
     }
 
     async fn commit_validated(
@@ -329,10 +341,15 @@ impl QueueService for QueueServer {
                 ));
             }
 
-            if req.jobs.len() as u64 > self.server_limits.max_enqueue_batch as u64 {
+            let (strict_queues, server_limits) = {
+                let cfg = self.config.load();
+                (cfg.server.strict_queues, ServerLimits::from_config(&cfg))
+            };
+
+            if req.jobs.len() as u64 > server_limits.max_enqueue_batch as u64 {
                 return Err(Status::invalid_argument(format!(
                     "batch exceeds max_enqueue_batch ({})",
-                    self.server_limits.max_enqueue_batch
+                    server_limits.max_enqueue_batch
                 )));
             }
 
@@ -344,7 +361,7 @@ impl QueueService for QueueServer {
             let mut valid = Vec::new();
             let mut slots: Vec<Option<JobResult>> = Vec::with_capacity(req.jobs.len());
             for job in req.jobs {
-                match self.classify_enqueue(&job, &registry) {
+                match self.classify_enqueue(&job, &registry, strict_queues, &server_limits) {
                     Ok(()) => {
                         slots.push(None);
                         valid.push(job);
@@ -426,10 +443,15 @@ impl QueueService for QueueServer {
                 ));
             }
 
-            if req.jobs.len() as u64 > self.server_limits.max_enqueue_batch as u64 {
+            let (strict_queues, server_limits) = {
+                let cfg = self.config.load();
+                (cfg.server.strict_queues, ServerLimits::from_config(&cfg))
+            };
+
+            if req.jobs.len() as u64 > server_limits.max_enqueue_batch as u64 {
                 return Err(Status::invalid_argument(format!(
                     "batch exceeds max_enqueue_batch ({})",
-                    self.server_limits.max_enqueue_batch
+                    server_limits.max_enqueue_batch
                 )));
             }
 
@@ -441,7 +463,7 @@ impl QueueService for QueueServer {
             let mut errors: Vec<pb::JobValidationError> = Vec::new();
             let mut valid: Vec<EnqueueRequest> = Vec::with_capacity(req.jobs.len());
             for (index, job) in req.jobs.into_iter().enumerate() {
-                match self.classify_enqueue(&job, &registry) {
+                match self.classify_enqueue(&job, &registry, strict_queues, &server_limits) {
                     Ok(()) => valid.push(job),
                     Err(rejection) => {
                         let label = rejection_label(&rejection);
@@ -523,26 +545,31 @@ impl QueueService for QueueServer {
                 .validate(&req)
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
-            if req.queues.len() as u64 > self.server_limits.max_reserve_queues as u64 {
+            let (strict_queues, server_limits) = {
+                let cfg = self.config.load();
+                (cfg.server.strict_queues, ServerLimits::from_config(&cfg))
+            };
+
+            if req.queues.len() as u64 > server_limits.max_reserve_queues as u64 {
                 return Err(Status::invalid_argument(format!(
                     "reserve exceeds max_reserve_queues ({})",
-                    self.server_limits.max_reserve_queues
+                    server_limits.max_reserve_queues
                 )));
             }
 
             if let Some(q) = req
                 .queues
                 .iter()
-                .find(|q| q.len() > self.server_limits.max_queue_name_bytes as usize)
+                .find(|q| q.len() > server_limits.max_queue_name_bytes as usize)
             {
                 return Err(Status::invalid_argument(format!(
                     "queue name {:?} exceeds max_queue_name_bytes ({})",
-                    q, self.server_limits.max_queue_name_bytes
+                    q, server_limits.max_queue_name_bytes
                 )));
             }
 
             let registry = self.registry.load();
-            if self.strict_queues {
+            if strict_queues {
                 let unknown: Vec<&str> = req
                     .queues
                     .iter()
@@ -568,11 +595,9 @@ impl QueueService for QueueServer {
             let max_jobs = req
                 .max_jobs
                 .unwrap_or(1)
-                .clamp(1, self.server_limits.max_reserve_batch) as usize;
+                .clamp(1, server_limits.max_reserve_batch) as usize;
 
-            let wait = req
-                .wait_timeout_ms
-                .min(self.server_limits.max_wait_timeout_ms);
+            let wait = req.wait_timeout_ms.min(server_limits.max_wait_timeout_ms);
             let deadline = Instant::now() + Duration::from_millis(wait);
             let waiter = self.storage.job_waiter(&req.queues);
 
@@ -802,10 +827,10 @@ impl QueueService for QueueServer {
                 .validate(&req)
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
-            let max = req
-                .max
-                .unwrap_or(1)
-                .clamp(1, self.server_limits.max_reserve_batch) as usize;
+            let max =
+                req.max
+                    .unwrap_or(1)
+                    .clamp(1, self.config.load().limits.max_reserve_batch) as usize;
 
             let records = self
                 .storage
@@ -841,7 +866,8 @@ impl QueueService for QueueServer {
     ) -> Result<Response<GetServerInfoResponse>, Status> {
         let _span = tracing::info_span!("sepp.get_server_info", otel.kind = "server").entered();
         let defaults = self.registry.load().effective("");
-        let s = &self.server_limits;
+        let config = self.config.load();
+        let s = ServerLimits::from_config(&config);
 
         Ok(Response::new(GetServerInfoResponse {
             server_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -862,7 +888,7 @@ impl QueueService for QueueServer {
             max_reserve_queues: s.max_reserve_queues,
             max_wait_timeout_ms: s.max_wait_timeout_ms,
             max_lease_duration_ms: defaults.max_lease_duration_ms,
-            strict_queues: self.strict_queues,
+            strict_queues: config.server.strict_queues,
             dead_letter_retention_enabled: self.dead_letter_retention_enabled,
         }))
     }
