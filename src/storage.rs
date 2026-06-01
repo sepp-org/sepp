@@ -939,10 +939,10 @@ fn apply_reserve(
             );
 
             let lease_timer = TimerKey {
-        deadline: lease_expires_at,
-        job_id: &job.id,
-    }
-    .encode();
+                deadline: lease_expires_at,
+                job_id: &job.id,
+            }
+            .encode();
             tx.insert(&store.leases, lease_timer.clone(), Vec::new());
             indexes.leases.insert(lease_timer, &inflight.queue);
             cycle.reserved(&inflight.queue);
@@ -1768,7 +1768,11 @@ mod tests {
     }
 
     fn dedup_timer_key(deadline: i64, dedup_key: &[u8]) -> Vec<u8> {
-        DedupTimerKey { deadline, dedup_key }.encode()
+        DedupTimerKey {
+            deadline,
+            dedup_key,
+        }
+        .encode()
     }
 
     fn dead_letter_key(failed_at: i64, queue: &str, job_id: &[u8]) -> Vec<u8> {
