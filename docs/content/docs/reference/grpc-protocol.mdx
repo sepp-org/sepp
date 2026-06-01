@@ -1,0 +1,20 @@
+---
+title: "gRPC protocol"
+description: "The QueueService RPCs, request/response messages, and field semantics."
+---
+
+{/* SCAFFOLD — layout only, no prose written yet. */}
+{/* TODO(content): Normative protocol reference from queue.proto. All 8 RPCs; every message/field incl. worker_id (Reserve/Ack/Nack/Extend), NackRequest.reason, full DeadLetterRecord (cause/failed_at/final_attempt/last_reason; embedded Job is a failure-time snapshot, not a live Job), and the response flags JobResult / EnqueueResponse.deduplicated / NackResponse.dead_lettered / ExtendResponse.lease_expires_at. Per-RPC gRPC status codes. The API Reference top-nav target. */}
+
+## QueueService RPCs
+
+## Enqueue messages
+
+## Reserve, Ack, Nack, Extend messages
+
+## Dead-letter messages
+
+## Common types: Job, Payload, PrimitiveValue, TraceContext
+
+## Status codes per RPC
+

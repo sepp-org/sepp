@@ -1,0 +1,18 @@
+---
+title: "Retries & dead-letter"
+description: "Retry directives on nack, attempt exhaustion, and the three ways a job is dead-lettered."
+---
+
+{/* SCAFFOLD — layout only, no prose written yet. */}
+{/* TODO(content): NackRetry default/delay_ms/dead_letter; the three DeadLetterCause variants (attempts exhausted, rejected, lease expired). max_attempts_ceiling clamps a client max_attempts so a job cannot be made un-dead-letterable (default_max_attempts <= max_attempts_ceiling). Retention gates DrainDeadLetters; the drain task lives in Operations. */}
+
+## Nack retry strategies
+
+## Backoff and delay
+
+## Attempts, default_max_attempts, and the ceiling
+
+## Dead-letter causes
+
+## Retention and replay
+

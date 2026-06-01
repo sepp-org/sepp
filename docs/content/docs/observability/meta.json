@@ -1,0 +1,10 @@
+{
+  "title": "Observability",
+  "pages": [
+    "index",
+    "metrics",
+    "tracing",
+    "logging",
+    "health-checks"
+  ]
+}

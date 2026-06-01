@@ -1,0 +1,20 @@
+---
+title: "Deployment"
+description: "Run the single binary in production: Docker, systemd, the data directory, and graceful shutdown."
+---
+
+{/* SCAFFOLD — layout only, no prose written yet. */}
+{/* TODO(content): Deployment how-to. ghcr.io/sepp-org/sepp image; persist db_path (default ./sepp-data) on a volume. SHUTDOWN: on SIGTERM/Ctrl-C tonic stops accepting connections and lets in-flight RPCs finish, then exits; leased jobs are NOT re-queued — they redeliver after lease expiry (no zero-loss drain). BACKUP: cold copy only (stop the server) — hot-copying the live fjall/LSM dir is unsafe. */}
+
+## The single binary
+
+## Docker image and data volume
+
+## systemd unit
+
+## Graceful shutdown & lease-expiry redelivery
+
+## Resource sizing
+
+## Backing up the data directory
+

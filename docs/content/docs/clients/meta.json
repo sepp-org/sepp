@@ -1,0 +1,10 @@
+{
+  "title": "Client SDKs",
+  "pages": [
+    "index",
+    "connecting",
+    "tracing-propagation",
+    "error-handling",
+    "build-your-own"
+  ]
+}

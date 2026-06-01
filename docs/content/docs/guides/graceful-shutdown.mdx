@@ -1,0 +1,16 @@
+---
+title: "Graceful shutdown & draining"
+description: "Drain in-flight jobs cleanly on the worker side and restart the server safely."
+---
+
+{/* SCAFFOLD — layout only, no prose written yet. */}
+{/* TODO(content): Operational recipe. AUTHORITATIVE server behavior lives in operations/deployment; link it. Server: connection-level graceful stop + lease-expiry redelivery (NOT a job drain). Worker: drain its own in-flight loop before exit. */}
+
+## Server SIGTERM behavior
+
+## Draining worker loops
+
+## Lease budgets during shutdown
+
+## Rolling restarts
+

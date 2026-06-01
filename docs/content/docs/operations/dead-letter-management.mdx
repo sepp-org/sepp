@@ -1,0 +1,18 @@
+---
+title: "Dead-letter management"
+description: "Enable retention and drain dead-lettered jobs for inspection and replay."
+---
+
+{/* SCAFFOLD — layout only, no prose written yet. */}
+{/* TODO(content): Day-2 DLQ how-to. dead_letter_retention_ms (0 disables). DrainDeadLetters: optional single-queue filter, oldest-first, max clamped to max_reserve_batch. DESTRUCTIVE: no redelivery token — a dropped response permanently removes jobs. Empty list is indistinguishable from retention disabled, so check dead_letter_retention_enabled first. Replay = client copies DeadLetterRecord.job fields into a fresh EnqueueRequest (no server-side replay). */}
+
+## Enabling retention
+
+## Inspecting with DrainDeadLetters
+
+## Destructive drain semantics
+
+## Replaying drained jobs
+
+## Retention expiry
+

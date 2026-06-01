@@ -1,0 +1,20 @@
+---
+title: "Metrics"
+description: "Export OTel metrics or scrape Prometheus, and read the job, queue-depth, and request metrics sepp emits."
+---
+
+{/* SCAFFOLD — layout only, no prose written yet. */}
+{/* TODO(content): Metrics how-to + catalogue. [metrics] OTLP push (otlp_endpoint, export_interval_ms) and a SEPARATE Prometheus listener (prometheus_listen_addr default 0.0.0.0:9464, distinct from the gRPC port). Catalogue (verified in src/metrics.rs): counters sepp.requests, sepp.jobs.enqueued/reserved/acked/nacked/dead_lettered/deduplicated/rejected, sepp.reserve.empty, sepp.sweep.promotions/lease_redeliveries/dedup_expirations, sepp.dead_letters.expired/drained; histograms sepp.request.duration, sepp.commit.duration; gauges sepp.queue.ready/scheduled/inflight (labeled per queue) and sepp.command_queue.depth. */}
+
+## Enabling OTLP metrics
+
+## Prometheus scrape endpoint
+
+## Job and request metrics
+
+## Queue-depth gauges
+
+## Command-queue and commit metrics
+
+## Building a dashboard
+

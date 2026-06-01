@@ -10,7 +10,7 @@ export default function HomePage() {
   const router = useRouter();
 
   useEffect(() => {
-    router.replace('/docs/cheatsheet');
+    router.replace('/docs');
   }, [router]);
 
   return (
@@ -24,10 +24,10 @@ export default function HomePage() {
       }}
     >
       <Link
-        href="/docs/cheatsheet"
+        href="/docs"
         style={{ color: 'var(--accent)', fontFamily: 'var(--font-plex-mono)' }}
       >
-        → docs/cheatsheet
+        → docs
       </Link>
     </main>
   );

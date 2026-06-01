@@ -2,6 +2,16 @@
   "title": "Docs",
   "root": true,
   "pages": [
-    "cheatsheet"
+    "index",
+    "get-started",
+    "concepts",
+    "producers",
+    "workers",
+    "clients",
+    "operations",
+    "observability",
+    "guides",
+    "reference",
+    "contributing"
   ]
 }

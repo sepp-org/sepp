@@ -1,0 +1,10 @@
+{
+  "title": "Workers",
+  "pages": [
+    "index",
+    "reserve",
+    "ack-nack-extend",
+    "worker-loop",
+    "idempotent-workers"
+  ]
+}
