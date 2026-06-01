@@ -19,6 +19,10 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::config::Config;
+use crate::keys::{
+    DeadLetterKey, DedupKey, DedupTimerKey, DedupValue, Inflight, JobValue, ReadyKey, TimerKey,
+    deadline_of, queue_prefix, read_queue,
+};
 use crate::metrics::{CycleMetrics, Metrics, QueueDepthSnapshot};
 use crate::pb::sepp::v1::{
     DeadLetterCause, DeadLetterRecord, EnqueueRequest, EnqueueResponse, ExtendRequest, Job,
@@ -54,161 +58,6 @@ struct Store {
     params: StorageParams,
     registry: SharedRegistry,
     metrics: Metrics,
-}
-
-fn read_u32(bytes: &[u8], at: usize) -> Option<u32> {
-    Some(u32::from_be_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
-}
-
-fn read_i64(bytes: &[u8], at: usize) -> Option<i64> {
-    Some(i64::from_be_bytes(bytes.get(at..at + 8)?.try_into().ok()?))
-}
-
-fn queue_prefix(queue: &str) -> Vec<u8> {
-    let mut k = Vec::with_capacity(2 + queue.len());
-    k.extend_from_slice(&(queue.len() as u16).to_be_bytes());
-    k.extend_from_slice(queue.as_bytes());
-    k
-}
-
-fn read_queue(bytes: &[u8]) -> Option<&str> {
-    let len = u16::from_be_bytes(*bytes.first_chunk::<2>()?) as usize;
-    std::str::from_utf8(bytes.get(2..2 + len)?).ok()
-}
-
-fn ready_key(queue: &str, priority: u32, enqueued_at: i64, job_id: &str) -> Vec<u8> {
-    let mut k = queue_prefix(queue);
-    k.push(9u8.saturating_sub(priority.min(9) as u8));
-    k.extend_from_slice(&enqueued_at.to_be_bytes());
-    k.extend_from_slice(job_id.as_bytes());
-    k
-}
-
-fn ready_key_id_offset(queue: &str) -> usize {
-    2 + queue.len() + 1 + 8
-}
-
-fn dedup_key(queue: &str, idempotency_key: &str) -> Vec<u8> {
-    let mut k = queue_prefix(queue);
-    k.extend_from_slice(idempotency_key.as_bytes());
-    k
-}
-
-fn encode_dedup(enqueued_at: i64, job_id: &str) -> Vec<u8> {
-    let mut v = Vec::with_capacity(8 + job_id.len());
-    v.extend_from_slice(&enqueued_at.to_be_bytes());
-    v.extend_from_slice(job_id.as_bytes());
-    v
-}
-
-fn decode_dedup(bytes: &[u8]) -> Option<(i64, &str)> {
-    let enqueued_at = i64::from_be_bytes(bytes.first_chunk::<8>().copied()?);
-    let job_id = std::str::from_utf8(bytes.get(8..)?).ok()?;
-    Some((enqueued_at, job_id))
-}
-
-fn timer_key(deadline: i64, job_id: &str) -> Vec<u8> {
-    let mut k = Vec::with_capacity(8 + job_id.len());
-    k.extend_from_slice(&deadline.to_be_bytes());
-    k.extend_from_slice(job_id.as_bytes());
-    k
-}
-
-fn deadline_of(key: &[u8]) -> i64 {
-    i64::from_be_bytes(key.first_chunk::<8>().copied().unwrap_or([0; 8]))
-}
-
-fn dead_letter_key(failed_at: i64, queue: &str, job_id: &[u8]) -> Vec<u8> {
-    let mut k = Vec::with_capacity(8 + 2 + queue.len() + job_id.len());
-    k.extend_from_slice(&failed_at.to_be_bytes());
-    k.extend_from_slice(&queue_prefix(queue));
-    k.extend_from_slice(job_id);
-    k
-}
-
-fn dedup_timer_key(deadline: i64, dedup_key: &[u8]) -> Vec<u8> {
-    let mut k = Vec::with_capacity(8 + dedup_key.len());
-    k.extend_from_slice(&deadline.to_be_bytes());
-    k.extend_from_slice(dedup_key);
-    k
-}
-
-fn encode_job(queue: &str, job: &Job) -> Vec<u8> {
-    let mut v = queue_prefix(queue);
-    job.encode(&mut v)
-        .expect("Vec buffer never runs out of space");
-    v
-}
-
-fn decode_job(bytes: &[u8]) -> Result<(String, Job), Status> {
-    let corrupt = || Status::internal("corrupt job record");
-    let qlen = 2 + u16::from_be_bytes(*bytes.first_chunk::<2>().ok_or_else(corrupt)?) as usize;
-    let queue = std::str::from_utf8(bytes.get(2..qlen).ok_or_else(corrupt)?)
-        .map_err(|_| corrupt())?
-        .to_owned();
-    let job = Job::decode(&bytes[qlen..]).map_err(|_| corrupt())?;
-    Ok((queue, job))
-}
-
-struct Inflight {
-    attempt: u32,
-    lease_expires_at: i64,
-    enqueued_at: i64,
-    priority: u32,
-    max_attempts: u32,
-    queue: String,
-    trace_context: Option<TraceContext>,
-}
-
-fn encode_inflight(s: &Inflight) -> Vec<u8> {
-    let tc_bytes = s
-        .trace_context
-        .as_ref()
-        .map(Message::encode_to_vec)
-        .unwrap_or_default();
-    let mut v = Vec::with_capacity(30 + s.queue.len() + tc_bytes.len());
-    v.extend_from_slice(&s.attempt.to_be_bytes());
-    v.extend_from_slice(&s.lease_expires_at.to_be_bytes());
-    v.extend_from_slice(&s.enqueued_at.to_be_bytes());
-    v.extend_from_slice(&s.priority.to_be_bytes());
-    v.extend_from_slice(&s.max_attempts.to_be_bytes());
-    v.extend_from_slice(&(s.queue.len() as u16).to_be_bytes());
-    v.extend_from_slice(s.queue.as_bytes());
-    v.extend_from_slice(&tc_bytes);
-    v
-}
-
-fn decode_inflight(bytes: &[u8]) -> Result<Inflight, Status> {
-    let corrupt = || Status::internal("corrupt inflight record");
-    let parse = || -> Option<Inflight> {
-        let attempt = read_u32(bytes, 0)?;
-        let lease_expires_at = read_i64(bytes, 4)?;
-        let enqueued_at = read_i64(bytes, 12)?;
-        let priority = read_u32(bytes, 20)?;
-        let max_attempts = read_u32(bytes, 24)?;
-        let queue_len = u16::from_be_bytes(bytes.get(28..30)?.try_into().ok()?) as usize;
-        let queue = std::str::from_utf8(bytes.get(30..30 + queue_len)?)
-            .ok()?
-            .to_owned();
-        let tc_bytes = bytes.get(30 + queue_len..)?;
-        let trace_context = if tc_bytes.is_empty() {
-            None
-        } else {
-            Some(TraceContext::decode(tc_bytes).ok()?)
-        };
-
-        Some(Inflight {
-            attempt,
-            lease_expires_at,
-            enqueued_at,
-            priority,
-            max_attempts,
-            queue,
-            trace_context,
-        })
-    };
-
-    parse().ok_or_else(corrupt)
 }
 
 fn stg_err(e: fjall::Error) -> Status {
@@ -365,14 +214,16 @@ fn rebuild_indexes(store: &Store) -> Result<Indexes, fjall::Error> {
 
     for guard in snap.iter(&store.ready) {
         let (key, value) = guard.into_inner()?;
-        let attempt = read_u32(&value, 0).unwrap_or(1);
+        let attempt = value
+            .first_chunk::<4>()
+            .map(|b| u32::from_be_bytes(*b))
+            .unwrap_or(1);
         indexes.ready.insert(key.to_vec(), attempt);
     }
 
     for guard in snap.iter(&store.scheduled) {
         let (key, _) = guard.into_inner()?;
-        let queue = key
-            .get(8..)
+        let queue = TimerKey::job_id(&key)
             .and_then(|job_id| snap.get(&store.jobs, job_id).ok().flatten())
             .and_then(|stored| read_queue(&stored).map(str::to_owned))
             .unwrap_or_default();
@@ -381,23 +232,22 @@ fn rebuild_indexes(store: &Store) -> Result<Indexes, fjall::Error> {
 
     for guard in snap.iter(&store.leases) {
         let (key, _) = guard.into_inner()?;
-        let queue = key
-            .get(8..)
+        let queue = TimerKey::job_id(&key)
             .and_then(|job_id| snap.get(&store.inflight, job_id).ok().flatten())
-            .and_then(|stored| decode_inflight(&stored).ok().map(|i| i.queue))
+            .and_then(|stored| Inflight::decode(&stored).ok().map(|i| i.queue))
             .unwrap_or_default();
         indexes.leases.insert(key.to_vec(), &queue);
     }
 
     for guard in snap.iter(&store.dedup_timers) {
         let (key, _) = guard.into_inner()?;
-        let queue = key.get(8..).and_then(read_queue).unwrap_or("").to_string();
+        let queue = DedupTimerKey::queue(&key).unwrap_or("").to_string();
         indexes.dedup_timers.insert(key.to_vec(), &queue);
     }
 
     for guard in snap.iter(&store.dead_letter) {
         let key = guard.key()?;
-        let queue = key.get(8..).and_then(read_queue).unwrap_or("").to_string();
+        let queue = DeadLetterKey::queue(&key).unwrap_or("").to_string();
         indexes.dead_letter.insert(key.to_vec(), &queue);
     }
 
@@ -847,20 +697,29 @@ fn apply_enqueue(
         let mut stale_dedup_timer: Option<Vec<u8>> = None;
 
         if let Some(key) = &req.idempotency_key {
-            let dkey = dedup_key(&req.queue, key);
+            let dkey = DedupKey {
+                queue: &req.queue,
+                idempotency_key: key,
+            }
+            .encode();
             if let Some(existing) = tx.get(&store.dedup, &dkey).map_err(stg_err)? {
-                match decode_dedup(&existing) {
-                    Some((ts, job_id)) if now - ts < limits.dedup_window_ms => {
+                match DedupValue::decode(&existing) {
+                    Some(dv) if now - dv.enqueued_at < limits.dedup_window_ms => {
                         cycle.deduplicated(&req.queue);
                         results.push(EnqueueResponse {
-                            job_id: job_id.to_owned(),
+                            job_id: dv.job_id.to_owned(),
                             deduplicated: true,
                         });
                         continue;
                     }
-                    Some((ts, _)) => {
-                        stale_dedup_timer =
-                            Some(dedup_timer_key(ts + limits.dedup_window_ms, &dkey));
+                    Some(dv) => {
+                        stale_dedup_timer = Some(
+                            DedupTimerKey {
+                                deadline: dv.enqueued_at + limits.dedup_window_ms,
+                                dedup_key: &dkey,
+                            }
+                            .encode(),
+                        );
                     }
                     None => {}
                 }
@@ -891,7 +750,11 @@ fn apply_enqueue(
         tx.insert(
             &store.jobs,
             id.clone().into_bytes(),
-            encode_job(&queue, &job),
+            JobValue {
+                queue: &queue,
+                job: &job,
+            }
+            .encode(),
         );
 
         if let Some(payload) = payload {
@@ -904,7 +767,11 @@ fn apply_enqueue(
 
         match job.scheduled_at {
             Some(at) if at > now => {
-                let tk = timer_key(at, &id);
+                let tk = TimerKey {
+                    deadline: at,
+                    job_id: &id,
+                }
+                .encode();
                 tx.insert(
                     &store.scheduled,
                     tk.clone(),
@@ -913,7 +780,14 @@ fn apply_enqueue(
                 indexes.scheduled.insert(tk, &queue);
             }
             _ => {
-                let rk = ready_key(&queue, job.priority, job.enqueued_at, &id);
+                let rk = ReadyKey {
+                    queue: &queue,
+                    priority: job.priority,
+                    enqueued_at: job.enqueued_at,
+                    job_id: &id,
+                }
+                .encode();
+
                 tx.insert(&store.ready, rk.clone(), job.attempt.to_be_bytes().to_vec());
                 indexes.ready.insert(rk, job.attempt);
                 cycle.new_ready.insert(queue.clone());
@@ -921,16 +795,32 @@ fn apply_enqueue(
         }
 
         if let Some(key) = &req.idempotency_key {
-            let dkey = dedup_key(&queue, key);
+            let dkey = DedupKey {
+                queue: &queue,
+                idempotency_key: key,
+            }
+            .encode();
             if let Some(old_timer) = stale_dedup_timer {
                 tx.remove(&store.dedup_timers, old_timer.clone());
                 indexes.dedup_timers.remove(&old_timer);
             }
 
-            let dtk = dedup_timer_key(now + limits.dedup_window_ms, &dkey);
+            let dtk = DedupTimerKey {
+                deadline: now + limits.dedup_window_ms,
+                dedup_key: &dkey,
+            }
+            .encode();
             tx.insert(&store.dedup_timers, dtk.clone(), Vec::new());
             indexes.dedup_timers.insert(dtk, &queue);
-            tx.insert(&store.dedup, dkey, encode_dedup(now, &id));
+            tx.insert(
+                &store.dedup,
+                dkey,
+                DedupValue {
+                    enqueued_at: now,
+                    job_id: &id,
+                }
+                .encode(),
+            );
         }
 
         cycle.enqueued(&queue);
@@ -964,15 +854,14 @@ fn apply_reserve(
         }
 
         let prefix = queue_prefix(queue);
-        let id_offset = ready_key_id_offset(queue);
         while jobs.len() < max_jobs {
             let Some((ready_k, attempt)) = indexes.ready.pop_front(&prefix) else {
                 break;
             };
 
-            let job_id: String = match ready_k.get(id_offset..).map(std::str::from_utf8) {
-                Some(Ok(id)) => id.to_owned(),
-                _ => {
+            let job_id: String = match ReadyKey::decode(&ready_k) {
+                Some(rk) => rk.job_id.to_owned(),
+                None => {
                     tx.remove(&store.ready, ready_k);
                     cycle.dirty = true;
                     continue;
@@ -995,7 +884,7 @@ fn apply_reserve(
                 }
             };
 
-            let (job_queue, mut job) = match decode_job(&stored) {
+            let (job_queue, mut job) = match JobValue::decode(&stored) {
                 Ok(decoded) => decoded,
                 Err(e) => {
                     warn!(error = %e, "reserve dropping corrupt job");
@@ -1046,10 +935,14 @@ fn apply_reserve(
             tx.insert(
                 &store.inflight,
                 job.id.clone().into_bytes(),
-                encode_inflight(&inflight),
+                inflight.encode(),
             );
 
-            let lease_timer = timer_key(lease_expires_at, &job.id);
+            let lease_timer = TimerKey {
+        deadline: lease_expires_at,
+        job_id: &job.id,
+    }
+    .encode();
             tx.insert(&store.leases, lease_timer.clone(), Vec::new());
             indexes.leases.insert(lease_timer, &inflight.queue);
             cycle.reserved(&inflight.queue);
@@ -1074,7 +967,7 @@ fn apply_ack(
         .map_err(stg_err)?
         .ok_or_else(|| Status::not_found("job not found"))?;
 
-    let inflight = decode_inflight(&stored)?;
+    let inflight = Inflight::decode(&stored)?;
     if inflight.attempt != attempt {
         return Err(Status::failed_precondition("attempt mismatch"));
     }
@@ -1083,7 +976,11 @@ fn apply_ack(
     tx.remove(&store.payloads, job_id.as_bytes().to_vec());
     tx.remove(&store.inflight, job_id.as_bytes().to_vec());
 
-    let lease_timer = timer_key(inflight.lease_expires_at, job_id);
+    let lease_timer = TimerKey {
+        deadline: inflight.lease_expires_at,
+        job_id,
+    }
+    .encode();
     tx.remove(&store.leases, lease_timer.clone());
     indexes.leases.remove(&lease_timer);
     cycle.acked(&inflight.queue);
@@ -1104,7 +1001,7 @@ fn read_dead_letter_job(
         return Ok(None);
     };
 
-    let (queue, mut job) = match decode_job(&stored) {
+    let (queue, mut job) = match JobValue::decode(&stored) {
         Ok(decoded) => decoded,
         Err(e) => {
             warn!(error = %e, "dead-letter: skipping record for corrupt job");
@@ -1147,7 +1044,12 @@ fn maybe_store_dead_letter(
     };
 
     job.attempt = meta.attempt;
-    let key = dead_letter_key(meta.failed_at, &job.queue, job_id);
+    let key = DeadLetterKey {
+        failed_at: meta.failed_at,
+        queue: &job.queue,
+        job_id,
+    }
+    .encode();
     indexes.dead_letter.insert(key.clone(), &job.queue);
 
     let record = DeadLetterRecord {
@@ -1223,12 +1125,16 @@ fn apply_nack(
         .map_err(stg_err)?
         .ok_or_else(|| Status::not_found("job not found"))?;
 
-    let inflight = decode_inflight(&stored)?;
+    let inflight = Inflight::decode(&stored)?;
     if inflight.attempt != req.attempt {
         return Err(Status::failed_precondition("attempt mismatch"));
     }
 
-    let lease_timer = timer_key(inflight.lease_expires_at, &req.job_id);
+    let lease_timer = TimerKey {
+        deadline: inflight.lease_expires_at,
+        job_id: &req.job_id,
+    }
+    .encode();
     let strategy = req.retry.as_ref().and_then(|r| r.strategy.as_ref());
     let force_dead_letter = matches!(strategy, Some(nack_retry::Strategy::DeadLetter(_)));
     let retry_delay_ms = match strategy {
@@ -1284,16 +1190,21 @@ fn apply_nack(
     let attempt = inflight.attempt + 1;
     if retry_delay_ms > 0 {
         let deadline = now.saturating_add(i64::try_from(retry_delay_ms).unwrap_or(i64::MAX));
-        let tk = timer_key(deadline, &req.job_id);
+        let tk = TimerKey {
+            deadline,
+            job_id: &req.job_id,
+        }
+        .encode();
         tx.insert(&store.scheduled, tk.clone(), attempt.to_be_bytes().to_vec());
         indexes.scheduled.insert(tk, &inflight.queue);
     } else {
-        let rk = ready_key(
-            &inflight.queue,
-            inflight.priority,
-            inflight.enqueued_at,
-            &req.job_id,
-        );
+        let rk = ReadyKey {
+            queue: &inflight.queue,
+            priority: inflight.priority,
+            enqueued_at: inflight.enqueued_at,
+            job_id: &req.job_id,
+        }
+        .encode();
 
         tx.insert(&store.ready, rk.clone(), attempt.to_be_bytes().to_vec());
         indexes.ready.insert(rk, attempt);
@@ -1327,7 +1238,7 @@ fn apply_extend(
         .map_err(stg_err)?
         .ok_or_else(|| Status::not_found("job not found"))?;
 
-    let mut inflight = decode_inflight(&stored)?;
+    let mut inflight = Inflight::decode(&stored)?;
     if inflight.attempt != req.attempt {
         return Err(Status::failed_precondition("attempt mismatch"));
     }
@@ -1337,7 +1248,11 @@ fn apply_extend(
         .load()
         .effective(&inflight.queue)
         .max_lease_duration_ms;
-    let old_timer = timer_key(inflight.lease_expires_at, &req.job_id);
+    let old_timer = TimerKey {
+        deadline: inflight.lease_expires_at,
+        job_id: &req.job_id,
+    }
+    .encode();
     let lease_ms = req.lease_duration_ms.min(max_lease);
     let lease_expires_at = now_ms().saturating_add(i64::try_from(lease_ms).unwrap_or(i64::MAX));
     inflight.lease_expires_at = lease_expires_at;
@@ -1345,13 +1260,17 @@ fn apply_extend(
     tx.insert(
         &store.inflight,
         req.job_id.clone().into_bytes(),
-        encode_inflight(&inflight),
+        inflight.encode(),
     );
 
     tx.remove(&store.leases, old_timer.clone());
     indexes.leases.remove(&old_timer);
 
-    let new_timer = timer_key(lease_expires_at, &req.job_id);
+    let new_timer = TimerKey {
+        deadline: lease_expires_at,
+        job_id: &req.job_id,
+    }
+    .encode();
     tx.insert(&store.leases, new_timer.clone(), Vec::new());
     indexes.leases.insert(new_timer, &inflight.queue);
     cycle.dirty = true;
@@ -1386,12 +1305,12 @@ fn apply_sweep(
         let attempt_hint = tx
             .get(&store.scheduled, &timer_k)
             .map_err(stg_err)?
-            .and_then(|v| read_u32(&v, 0));
+            .and_then(|v| v.first_chunk::<4>().map(|b| u32::from_be_bytes(*b)));
 
         tx.remove(&store.scheduled, timer_k.clone());
         cycle.dirty = true;
 
-        let Some(job_id) = timer_k.get(8..) else {
+        let Some(job_id) = TimerKey::job_id(&timer_k) else {
             continue;
         };
 
@@ -1399,7 +1318,7 @@ fn apply_sweep(
             continue;
         };
 
-        let (queue, job) = match decode_job(&stored) {
+        let (queue, job) = match JobValue::decode(&stored) {
             Ok(decoded) => decoded,
             Err(e) => {
                 warn!(error = %e, "sweep skipping corrupt job");
@@ -1429,7 +1348,14 @@ fn apply_sweep(
             "scheduled job promoted to ready",
         );
 
-        let rk = ready_key(&queue, job.priority, job.enqueued_at, &job.id);
+        let rk = ReadyKey {
+            queue: &queue,
+            priority: job.priority,
+            enqueued_at: job.enqueued_at,
+            job_id: &job.id,
+        }
+        .encode();
+
         tx.insert(&store.ready, rk.clone(), attempt.to_be_bytes().to_vec());
         indexes.ready.insert(rk, attempt);
         cycle.sweep_promotion(&queue);
@@ -1447,7 +1373,7 @@ fn apply_sweep(
         tx.remove(&store.leases, timer_k.clone());
         cycle.dirty = true;
 
-        let Some(job_id) = timer_k.get(8..) else {
+        let Some(job_id) = TimerKey::job_id(&timer_k) else {
             continue;
         };
 
@@ -1455,7 +1381,7 @@ fn apply_sweep(
             continue;
         };
 
-        let inflight = match decode_inflight(&stored) {
+        let inflight = match Inflight::decode(&stored) {
             Ok(decoded) => decoded,
             Err(e) => {
                 warn!(error = %e, "sweep skipping corrupt inflight record");
@@ -1527,12 +1453,13 @@ fn apply_sweep(
                 "lease expired; requeueing job",
             );
 
-            let rk = ready_key(
-                &inflight.queue,
-                inflight.priority,
-                inflight.enqueued_at,
-                job_id_str,
-            );
+            let rk = ReadyKey {
+                queue: &inflight.queue,
+                priority: inflight.priority,
+                enqueued_at: inflight.enqueued_at,
+                job_id: job_id_str,
+            }
+            .encode();
 
             tx.insert(&store.ready, rk.clone(), attempt.to_be_bytes().to_vec());
             indexes.ready.insert(rk, attempt);
@@ -1550,7 +1477,7 @@ fn apply_sweep(
 
         budget -= 1;
         processed += 1;
-        if let Some(dedup_k) = timer_k.get(8..) {
+        if let Some(dedup_k) = DedupTimerKey::dedup_key(&timer_k) {
             tx.remove(&store.dedup, dedup_k.to_vec());
         }
 
@@ -1821,67 +1748,36 @@ impl Storage {
 mod tests {
     use super::*;
 
-    fn sample_job(id: &str) -> Job {
-        Job {
-            id: id.to_string(),
-            job_type: "unit-test".to_string(),
-            enqueued_at: 1_700_000_000_000,
-            priority: 5,
-            attempt: 1,
-            max_attempts: 3,
-            ..Default::default()
+    // So that each test doesnt have to spell out the entire struct
+    fn ready_key(queue: &str, priority: u32, enqueued_at: i64, job_id: &str) -> Vec<u8> {
+        ReadyKey {
+            queue,
+            priority,
+            enqueued_at,
+            job_id,
         }
+        .encode()
     }
 
-    fn job_id_of<'a>(queue: &str, ready_k: &'a [u8]) -> &'a str {
-        std::str::from_utf8(&ready_k[ready_key_id_offset(queue)..]).unwrap()
+    fn job_id_of<'a>(_queue: &str, ready_k: &'a [u8]) -> &'a str {
+        ReadyKey::decode(ready_k).unwrap().job_id
     }
 
-    #[test]
-    fn queue_prefix_is_length_prefixed() {
-        assert_eq!(queue_prefix("ab"), vec![0, 2, b'a', b'b']);
-        assert_eq!(queue_prefix(""), vec![0, 0]);
+    fn timer_key(deadline: i64, job_id: &str) -> Vec<u8> {
+        TimerKey { deadline, job_id }.encode()
     }
 
-    #[test]
-    fn ready_key_id_offset_locates_the_job_id() {
-        let key = ready_key("orders", 3, 55, "the-job-id");
-        assert_eq!(job_id_of("orders", &key), "the-job-id");
+    fn dedup_timer_key(deadline: i64, dedup_key: &[u8]) -> Vec<u8> {
+        DedupTimerKey { deadline, dedup_key }.encode()
     }
 
-    #[test]
-    fn ready_key_priority_clamps_above_nine() {
-        let prio_offset = 2 + "q".len();
-        let nine = ready_key("q", 9, 0, "j");
-        let huge = ready_key("q", 1000, 0, "j");
-        assert_eq!(nine[prio_offset], huge[prio_offset]);
-    }
-
-    #[test]
-    fn timer_key_round_trips_through_deadline_of() {
-        assert_eq!(deadline_of(&timer_key(12345, "x")), 12345);
-        assert_eq!(deadline_of(&timer_key(0, "x")), 0);
-    }
-
-    #[test]
-    fn dedup_timer_key_carries_deadline_and_key() {
-        let k = dedup_timer_key(777, b"the-dedup-key");
-        assert_eq!(deadline_of(&k), 777);
-        assert_eq!(&k[8..], b"the-dedup-key");
-    }
-
-    #[test]
-    fn dead_letter_key_embeds_failed_at_and_queue() {
-        let k = dead_letter_key(777, "orders", b"job-9");
-        assert_eq!(deadline_of(&k), 777);
-        assert_eq!(
-            read_queue(&k[8..]),
-            Some("orders"),
-            "the queue is recoverable from the key for index rebuild"
-        );
-        // failed_at leads, so ascending key order is oldest-first regardless of
-        // queue or job id.
-        assert!(dead_letter_key(100, "zzz", b"zzz") < dead_letter_key(200, "aaa", b"aaa"));
+    fn dead_letter_key(failed_at: i64, queue: &str, job_id: &[u8]) -> Vec<u8> {
+        DeadLetterKey {
+            failed_at,
+            queue,
+            job_id,
+        }
+        .encode()
     }
 
     #[test]
@@ -1895,101 +1791,6 @@ mod tests {
             .map(|(k, q)| (deadline_of(k), q))
             .collect();
         assert_eq!(order, vec![(100, "qa"), (200, "qa"), (300, "qb")]);
-    }
-
-    #[test]
-    fn dedup_encoding_round_trips() {
-        let bytes = encode_dedup(42, "job-7");
-        assert_eq!(decode_dedup(&bytes), Some((42, "job-7")));
-    }
-
-    #[test]
-    fn decode_dedup_rejects_short_and_invalid_input() {
-        assert_eq!(decode_dedup(&[]), None);
-        assert_eq!(decode_dedup(&[0, 0, 0, 1]), None);
-        let mut bad = 1i64.to_be_bytes().to_vec();
-        bad.extend_from_slice(&[0xff, 0xff]);
-        assert_eq!(decode_dedup(&bad), None);
-    }
-
-    #[test]
-    fn job_encoding_round_trips_with_queue() {
-        let job = sample_job("job-42");
-        let (queue, decoded) = decode_job(&encode_job("orders", &job)).expect("decodes");
-        assert_eq!(queue, "orders");
-        assert_eq!(decoded, job);
-    }
-
-    #[test]
-    fn decode_job_rejects_corrupt_input() {
-        assert!(decode_job(&[]).is_err());
-        assert!(decode_job(&[0]).is_err());
-        assert!(decode_job(&[0, 5, 1, 2]).is_err());
-    }
-
-    fn sample_inflight(queue: &str, trace_context: Option<TraceContext>) -> Inflight {
-        Inflight {
-            attempt: 4,
-            lease_expires_at: 1_700_000_999_000,
-            enqueued_at: 1_700_000_000_000,
-            priority: 7,
-            max_attempts: 10,
-            queue: queue.to_string(),
-            trace_context,
-        }
-    }
-
-    #[test]
-    fn inflight_encoding_round_trips() {
-        let s = sample_inflight("my-queue", None);
-        let d = decode_inflight(&encode_inflight(&s)).expect("decodes");
-        assert_eq!(d.attempt, s.attempt);
-        assert_eq!(d.lease_expires_at, s.lease_expires_at);
-        assert_eq!(d.enqueued_at, s.enqueued_at);
-        assert_eq!(d.priority, s.priority);
-        assert_eq!(d.max_attempts, s.max_attempts);
-        assert_eq!(d.queue, s.queue);
-        assert_eq!(d.trace_context, None);
-    }
-
-    #[test]
-    fn inflight_encoding_round_trips_with_trace_context() {
-        let tc = TraceContext {
-            traceparent: "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01".to_string(),
-            tracestate: Some("vendor=abc".to_string()),
-        };
-        let s = sample_inflight("orders", Some(tc.clone()));
-        let d = decode_inflight(&encode_inflight(&s)).expect("decodes");
-        assert_eq!(d.queue, "orders");
-        assert_eq!(d.trace_context, Some(tc));
-    }
-
-    #[test]
-    fn inflight_encoding_round_trips_empty_queue() {
-        let tc = TraceContext {
-            traceparent: "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01".to_string(),
-            tracestate: None,
-        };
-        let s = sample_inflight("", Some(tc.clone()));
-        let d = decode_inflight(&encode_inflight(&s)).expect("decodes");
-        assert_eq!(d.queue, "");
-        assert_eq!(d.trace_context, Some(tc));
-    }
-
-    #[test]
-    fn decode_inflight_rejects_truncated_input() {
-        assert!(decode_inflight(&[]).is_err());
-        assert!(decode_inflight(&[0u8; 20]).is_err());
-        let bytes = encode_inflight(&sample_inflight("q", None));
-        assert!(decode_inflight(&bytes[..10]).is_err());
-    }
-
-    #[test]
-    fn decode_inflight_rejects_invalid_queue_utf8() {
-        let mut bytes = encode_inflight(&sample_inflight("ab", None));
-        bytes[30] = 0xff;
-        bytes[31] = 0xff;
-        assert!(decode_inflight(&bytes).is_err());
     }
 
     #[test]

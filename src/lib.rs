@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod config;
 pub mod config_watch;
+pub mod keys;
 pub mod metrics;
 pub mod pb;
 pub mod queue_server;
