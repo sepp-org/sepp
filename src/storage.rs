@@ -28,6 +28,7 @@ use crate::pb::sepp::v1::{
     DeadLetterCause, DeadLetterRecord, EnqueueRequest, EnqueueResponse, ExtendRequest, Job,
     NackRequest, Payload, TraceContext, nack_retry,
 };
+use crate::pb::{duration_to_millis, millis_to_timestamp, timestamp_to_millis};
 use crate::queues::SharedRegistry;
 use crate::telemetry;
 
@@ -729,19 +730,22 @@ fn apply_enqueue(
         let id = Uuid::new_v4().to_string();
         let queue = req.queue;
         let payload = req.payload;
+
+        let scheduled_at_ms = req.scheduled_at.as_ref().map(timestamp_to_millis);
         let job = Job {
             id: id.clone(),
             job_type: req.job_type,
             payload: None,
             priority: req.priority.unwrap_or(limits.default_priority),
             trace_context: req.trace_context,
-            enqueued_at: now,
+            enqueued_at: Some(millis_to_timestamp(now)),
             attempt: 1,
             max_attempts: req
                 .max_attempts
                 .unwrap_or(limits.default_max_attempts)
                 .min(limits.max_attempts_ceiling),
-            lease_expires_at: 0,
+            // Not yet leased; a real lease is stamped at reserve time.
+            lease_expires_at: Some(millis_to_timestamp(0)),
             custom: req.custom,
             scheduled_at: req.scheduled_at,
             queue: String::new(),
@@ -765,7 +769,7 @@ fn apply_enqueue(
             );
         }
 
-        match job.scheduled_at {
+        match scheduled_at_ms {
             Some(at) if at > now => {
                 let tk = TimerKey {
                     deadline: at,
@@ -783,7 +787,7 @@ fn apply_enqueue(
                 let rk = ReadyKey {
                     queue: &queue,
                     priority: job.priority,
-                    enqueued_at: job.enqueued_at,
+                    enqueued_at: now,
                     job_id: &id,
                 }
                 .encode();
@@ -919,13 +923,18 @@ fn apply_reserve(
                 }
             }
 
+            let enqueued_at_ms = job
+                .enqueued_at
+                .as_ref()
+                .map(timestamp_to_millis)
+                .unwrap_or(0);
             job.attempt = attempt;
-            job.lease_expires_at = lease_expires_at;
+            job.lease_expires_at = Some(millis_to_timestamp(lease_expires_at));
 
             let inflight = Inflight {
                 attempt,
                 lease_expires_at,
-                enqueued_at: job.enqueued_at,
+                enqueued_at: enqueued_at_ms,
                 priority: job.priority,
                 max_attempts: job.max_attempts,
                 queue: job_queue,
@@ -1055,7 +1064,7 @@ fn maybe_store_dead_letter(
     let record = DeadLetterRecord {
         job: Some(job),
         cause: meta.cause as i32,
-        failed_at: meta.failed_at,
+        failed_at: Some(millis_to_timestamp(meta.failed_at)),
         final_attempt: meta.attempt,
         last_reason: meta.last_reason,
     };
@@ -1138,13 +1147,13 @@ fn apply_nack(
     let strategy = req.retry.as_ref().and_then(|r| r.strategy.as_ref());
     let force_dead_letter = matches!(strategy, Some(nack_retry::Strategy::DeadLetter(_)));
     let retry_delay_ms = match strategy {
-        Some(nack_retry::Strategy::DelayMs(ms)) => {
+        Some(nack_retry::Strategy::Delay(delay)) => {
             let max = store
                 .registry
                 .load()
                 .effective(&inflight.queue)
                 .max_schedule_horizon_ms;
-            (*ms).min(max)
+            duration_to_millis(delay).min(max)
         }
         _ => 0,
     };
@@ -1253,7 +1262,12 @@ fn apply_extend(
         job_id: &req.job_id,
     }
     .encode();
-    let lease_ms = req.lease_duration_ms.min(max_lease);
+    let lease_ms = req
+        .lease_duration
+        .as_ref()
+        .map(duration_to_millis)
+        .unwrap_or(0)
+        .min(max_lease);
     let lease_expires_at = now_ms().saturating_add(i64::try_from(lease_ms).unwrap_or(i64::MAX));
     inflight.lease_expires_at = lease_expires_at;
 
@@ -1326,6 +1340,12 @@ fn apply_sweep(
             }
         };
 
+        let enqueued_at_ms = job
+            .enqueued_at
+            .as_ref()
+            .map(timestamp_to_millis)
+            .unwrap_or(0);
+        let scheduled_at_ms = job.scheduled_at.as_ref().map(timestamp_to_millis);
         let attempt = attempt_hint.unwrap_or(job.attempt);
         let _span = telemetry::enabled().then(|| {
             let span = tracing::info_span!(
@@ -1335,7 +1355,7 @@ fn apply_sweep(
                 job_type = %job.job_type,
                 attempt,
                 priority = job.priority,
-                scheduled_at = job.scheduled_at,
+                scheduled_at = scheduled_at_ms,
             );
             telemetry::link_from_proto(&span, job.trace_context.as_ref());
             span.entered()
@@ -1351,7 +1371,7 @@ fn apply_sweep(
         let rk = ReadyKey {
             queue: &queue,
             priority: job.priority,
-            enqueued_at: job.enqueued_at,
+            enqueued_at: enqueued_at_ms,
             job_id: &job.id,
         }
         .encode();

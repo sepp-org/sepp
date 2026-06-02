@@ -495,7 +495,7 @@ mod tests {
         Job {
             id: id.to_string(),
             job_type: "unit-test".to_string(),
-            enqueued_at: 1_700_000_000_000,
+            enqueued_at: Some(crate::pb::millis_to_timestamp(1_700_000_000_000)),
             priority: 5,
             attempt: 1,
             max_attempts: 3,

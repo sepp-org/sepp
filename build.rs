@@ -9,7 +9,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // version below is the one currently vendored; to refresh, bump it to a
     // newer published label/commit and re-run:
     //
-    //     buf export buf.build/sepp-org/sepp-proto:v1.0.1 -o proto
+    //     buf export buf.build/sepp-org/sepp-proto:v1.1.0 -o proto
     //
     // The build itself never invokes `buf` or touches the network, so it works
     // in offline CI and picks up local edits to `proto/sepp/v1/queue.proto`.

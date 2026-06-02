@@ -255,8 +255,8 @@ async fn reserve_batch(
         .clone()
         .reserve(ReserveRequest {
             queues: queues.iter().map(|q| q.to_string()).collect(),
-            wait_timeout_ms: wait.as_millis() as u64,
-            lease_duration_ms: lease.as_millis() as u64,
+            wait_timeout: Some(dur(wait)),
+            lease_duration: Some(dur(lease)),
             worker_id: None,
             max_jobs,
         })
@@ -289,7 +289,7 @@ async fn ack(client: &Client, job: &Job) {
 async fn nack(client: &Client, job: &Job, retry: Retry, reason: &str) -> bool {
     let strategy = match retry {
         Retry::Default => nack_retry::Strategy::Default(()),
-        Retry::After(delay) => nack_retry::Strategy::DelayMs(delay.as_millis() as u64),
+        Retry::After(delay) => nack_retry::Strategy::Delay(dur(delay)),
         Retry::DeadLetter => nack_retry::Strategy::DeadLetter(()),
     };
     client
@@ -309,20 +309,23 @@ async fn nack(client: &Client, job: &Job, retry: Retry, reason: &str) -> bool {
         .dead_lettered
 }
 
-/// Extends a job's lease and returns the new `lease_expires_at` the server reports.
 async fn extend(client: &Client, job: &Job, lease: Duration) -> i64 {
-    client
+    let resp = client
         .clone()
         .extend(ExtendRequest {
             job_id: job.id.clone(),
             attempt: job.attempt,
-            lease_duration_ms: lease.as_millis() as u64,
+            lease_duration: Some(dur(lease)),
             worker_id: None,
         })
         .await
         .expect("extend RPC")
-        .into_inner()
-        .lease_expires_at
+        .into_inner();
+    ts_to_ms(
+        &resp
+            .lease_expires_at
+            .expect("extend reports a lease expiry"),
+    )
 }
 
 fn prim_str(value: &str) -> PrimitiveValue {
@@ -342,6 +345,23 @@ fn epoch_ms_in(d: Duration) -> i64 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap()
         .as_millis() as i64
+}
+
+/// Proto v1.1.0 carries durations as `google.protobuf.Duration` and timestamps
+/// as `google.protobuf.Timestamp`. These mirror what a real client does at the
+/// boundary, reusing the library's own conversions.
+fn dur(d: Duration) -> prost_types::Duration {
+    sepp::pb::millis_to_duration(d.as_millis() as u64)
+}
+
+/// An epoch-ms instant as a wire `Timestamp`.
+fn ts_ms(ms: i64) -> prost_types::Timestamp {
+    sepp::pb::millis_to_timestamp(ms)
+}
+
+/// A wire `Timestamp` back to epoch ms.
+fn ts_to_ms(ts: &prost_types::Timestamp) -> i64 {
+    sepp::pb::timestamp_to_millis(ts)
 }
 
 const LEASE: Duration = Duration::from_secs(30);
@@ -365,7 +385,7 @@ async fn server_advertises_its_capabilities() {
         "server advertises at least one protocol version"
     );
     assert!(
-        info.server_time_ms > 0,
+        ts_to_ms(&info.server_time.expect("server reports a time")) > 0,
         "server reports its wall-clock time for skew detection"
     );
     assert!(
@@ -514,7 +534,7 @@ async fn scheduled_job_waits_for_its_time() {
     enqueue(
         &client,
         EnqueueRequest {
-            scheduled_at: Some(epoch_ms_in(Duration::from_secs(3))),
+            scheduled_at: Some(ts_ms(epoch_ms_in(Duration::from_secs(3)))),
             ..enqueue_req("smoke-sched")
         },
     )
@@ -1390,8 +1410,8 @@ name = "smoke-strict-emails"
         .clone()
         .reserve(ReserveRequest {
             queues: vec!["smoke-strict-ghost".to_string()],
-            wait_timeout_ms: NO_WAIT.as_millis() as u64,
-            lease_duration_ms: LEASE.as_millis() as u64,
+            wait_timeout: Some(dur(NO_WAIT)),
+            lease_duration: Some(dur(LEASE)),
             worker_id: None,
             max_jobs: None,
         })
@@ -1916,7 +1936,7 @@ async fn stale_attempt_is_fenced_off() {
         .extend(ExtendRequest {
             job_id: first.id.clone(),
             attempt: first.attempt,
-            lease_duration_ms: LEASE.as_millis() as u64,
+            lease_duration: Some(dur(LEASE)),
             worker_id: None,
         })
         .await
@@ -2062,8 +2082,8 @@ async fn reserve_validates_its_request() {
         .clone()
         .reserve(ReserveRequest {
             queues: vec![],
-            wait_timeout_ms: 0,
-            lease_duration_ms: LEASE.as_millis() as u64,
+            wait_timeout: None,
+            lease_duration: Some(dur(LEASE)),
             worker_id: None,
             max_jobs: None,
         })
@@ -2071,13 +2091,13 @@ async fn reserve_validates_its_request() {
         .expect_err("an empty queue list is rejected");
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
 
-    // Zero lease duration (proto uint64.gte = 1).
+    // Zero lease duration (proto duration.gt = {}: must be strictly positive).
     let err = client
         .clone()
         .reserve(ReserveRequest {
             queues: vec!["smoke-rvalid".to_string()],
-            wait_timeout_ms: 0,
-            lease_duration_ms: 0,
+            wait_timeout: None,
+            lease_duration: Some(dur(Duration::ZERO)),
             worker_id: None,
             max_jobs: None,
         })
@@ -2091,8 +2111,8 @@ async fn reserve_validates_its_request() {
         .clone()
         .reserve(ReserveRequest {
             queues: too_many,
-            wait_timeout_ms: 0,
-            lease_duration_ms: LEASE.as_millis() as u64,
+            wait_timeout: None,
+            lease_duration: Some(dur(LEASE)),
             worker_id: None,
             max_jobs: None,
         })
@@ -2331,13 +2351,23 @@ max_schedule_horizon_ms = 1000
         enqueue_one(
             &client,
             EnqueueRequest {
-                scheduled_at: Some(epoch_ms_in(Duration::from_secs(3600))),
+                scheduled_at: Some(ts_ms(epoch_ms_in(Duration::from_secs(3600)))),
                 ..tiny("ok")
             },
         )
         .await,
     );
-    assert!(matches!(r, Reason::ScheduledTooFar(s) if s.horizon_ms == 1000));
+    match r {
+        Reason::ScheduledTooFar(s) => {
+            let horizon = s.horizon.expect("rejection carries the horizon");
+            assert_eq!(
+                sepp::pb::duration_to_millis(&horizon),
+                1000,
+                "the rejection reports the configured horizon"
+            );
+        }
+        other => panic!("expected ScheduledTooFar, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -2423,13 +2453,14 @@ max_lease_duration_ms = 2000
     let job = reserve(&client, "smoke-capped", Duration::from_secs(600), WAIT)
         .await
         .expect("capped job reservable");
+    let lease_expires_ms = ts_to_ms(&job.lease_expires_at.expect("reserved job has a lease"));
     assert!(
-        job.lease_expires_at <= before + 2000 + 2000,
+        lease_expires_ms <= before + 2000 + 2000,
         "reserve clamps the lease to the queue max (got {}ms out)",
-        job.lease_expires_at - before,
+        lease_expires_ms - before,
     );
     assert!(
-        job.lease_expires_at >= before + 1000,
+        lease_expires_ms >= before + 1000,
         "yet the deadline is genuinely in the future"
     );
 
@@ -2508,7 +2539,7 @@ async fn scheduled_job_survives_restart() {
         enqueue(
             &client,
             EnqueueRequest {
-                scheduled_at: Some(epoch_ms_in(Duration::from_secs(3))),
+                scheduled_at: Some(ts_ms(epoch_ms_in(Duration::from_secs(3)))),
                 ..enqueue_req("smoke-restart-sched")
             },
         )

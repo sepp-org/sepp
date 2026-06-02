@@ -7,6 +7,7 @@ use crate::pb::sepp::v1::{
     NackRequest, NackResponse, PrimitiveValue, ReserveRequest, ReserveResponse,
     enqueue_atomic_response, job_result, queue_service_server::QueueService,
 };
+use crate::pb::{millis_to_duration, millis_to_timestamp, timestamp_to_millis};
 use crate::queues::{QueueRegistry, SharedRegistry};
 use crate::storage::{Storage, now_ms};
 use crate::telemetry;
@@ -189,13 +190,14 @@ impl QueueServer {
             });
         }
 
-        if let Some(at) = job.scheduled_at
-            && at > now_ms().saturating_add(limits.max_schedule_horizon_ms as i64)
+        if let Some(at) = &job.scheduled_at
+            && timestamp_to_millis(at)
+                > now_ms().saturating_add(limits.max_schedule_horizon_ms as i64)
         {
             return Err(pb::JobRejection {
                 reason: Some(Reason::ScheduledTooFar(pb::ScheduledTooFar {
-                    horizon_ms: limits.max_schedule_horizon_ms,
-                    actual_ms: at,
+                    horizon: Some(millis_to_duration(limits.max_schedule_horizon_ms)),
+                    actual: Some(*at),
                 })),
             });
         }
@@ -269,7 +271,7 @@ fn record_job_dimensions(span: &tracing::Span, jobs: &[EnqueueRequest]) {
 fn nack_strategy_label(req: &NackRequest) -> &'static str {
     use pb::nack_retry::Strategy;
     match req.retry.as_ref().and_then(|r| r.strategy.as_ref()) {
-        Some(Strategy::DelayMs(_)) => "delay",
+        Some(Strategy::Delay(_)) => "delay",
         Some(Strategy::DeadLetter(_)) => "dead_letter",
         Some(Strategy::Default(_)) | None => "default",
     }
@@ -590,14 +592,26 @@ impl QueueService for QueueServer {
                 .map(|q| registry.effective(q).max_lease_duration_ms)
                 .min()
                 .unwrap_or(u64::MAX);
-            let lease = req.lease_duration_ms.min(max_lease);
+            // Inbound Duration -> internal i64/u64 ms. lease_duration is
+            // required (validated); wait_timeout is optional (unset => 0).
+            let lease = req
+                .lease_duration
+                .as_ref()
+                .map(crate::pb::duration_to_millis)
+                .unwrap_or(0)
+                .min(max_lease);
 
             let max_jobs = req
                 .max_jobs
                 .unwrap_or(1)
                 .clamp(1, server_limits.max_reserve_batch) as usize;
 
-            let wait = req.wait_timeout_ms.min(server_limits.max_wait_timeout_ms);
+            let wait = req
+                .wait_timeout
+                .as_ref()
+                .map(crate::pb::duration_to_millis)
+                .unwrap_or(0)
+                .min(server_limits.max_wait_timeout_ms);
             let deadline = Instant::now() + Duration::from_millis(wait);
             let waiter = self.storage.job_waiter(&req.queues);
 
@@ -629,7 +643,10 @@ impl QueueService for QueueServer {
                                 attempt = job.attempt,
                                 priority = job.priority,
                                 max_attempts = job.max_attempts,
-                                lease_expires_at = job.lease_expires_at,
+                                lease_expires_at = job
+                                    .lease_expires_at
+                                    .as_ref()
+                                    .map(timestamp_to_millis),
                             );
                             telemetry::link_from_proto(&deliver, job.trace_context.as_ref());
 
@@ -768,7 +785,11 @@ impl QueueService for QueueServer {
             job_id = %request.get_ref().job_id,
             attempt = request.get_ref().attempt,
             worker_id = request.get_ref().worker_id.as_deref().unwrap_or("<none>"),
-            lease_duration_ms = request.get_ref().lease_duration_ms,
+            lease_duration_ms = request
+                .get_ref()
+                .lease_duration
+                .as_ref()
+                .map(crate::pb::duration_to_millis),
             queue = tracing::field::Empty,
             lease_expires_at = tracing::field::Empty,
             error = tracing::field::Empty
@@ -794,7 +815,7 @@ impl QueueService for QueueServer {
 
             Ok(Response::new(ExtendResponse {
                 job_id,
-                lease_expires_at: outcome.lease_expires_at,
+                lease_expires_at: Some(millis_to_timestamp(outcome.lease_expires_at)),
             }))
         }
         .instrument(span.clone())
@@ -872,7 +893,7 @@ impl QueueService for QueueServer {
         Ok(Response::new(GetServerInfoResponse {
             server_version: env!("CARGO_PKG_VERSION").to_string(),
             supported_protocol_versions: vec!["v1".to_string()],
-            server_time_ms: now_ms(),
+            server_time: Some(millis_to_timestamp(now_ms())),
             restricts_encodings: defaults.allowed_encodings.is_some(),
             allowed_encodings: defaults.allowed_encodings.unwrap_or_default(),
             max_payload_bytes: defaults.max_payload_bytes,
@@ -882,12 +903,12 @@ impl QueueService for QueueServer {
             max_queue_name_bytes: s.max_queue_name_bytes,
             max_job_type_bytes: s.max_job_type_bytes,
             max_idempotency_key_bytes: s.max_idempotency_key_bytes,
-            max_schedule_horizon_ms: defaults.max_schedule_horizon_ms,
+            max_schedule_horizon: Some(millis_to_duration(defaults.max_schedule_horizon_ms)),
             max_enqueue_batch: s.max_enqueue_batch,
             max_reserve_batch: s.max_reserve_batch,
             max_reserve_queues: s.max_reserve_queues,
-            max_wait_timeout_ms: s.max_wait_timeout_ms,
-            max_lease_duration_ms: defaults.max_lease_duration_ms,
+            max_wait_timeout: Some(millis_to_duration(s.max_wait_timeout_ms)),
+            max_lease_duration: Some(millis_to_duration(defaults.max_lease_duration_ms)),
             strict_queues: config.server.strict_queues,
             dead_letter_retention_enabled: self.dead_letter_retention_enabled,
         }))
