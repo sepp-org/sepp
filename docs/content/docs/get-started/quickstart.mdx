@@ -8,11 +8,72 @@ description: "Run the server, enqueue a job, and watch a worker process it — y
 
 ## Start the server
 
-## Enqueue a job
+First install sepp with one of the methods described in the [install guide](/docs/get-started/install). Then run the 
+server with:
 
-## Reserve, process, and ack
+```bash
+.\sepp
+```
 
-## See it complete
+or with Docker:
+
+```bash
+docker run --rm \
+  -p 50051:50051 \
+  -v sepp-data:/sepp/sepp-data \
+  ghcr.io/sepp-org/sepp:latest
+```
+
+This starts sepp with the default configuration, listening on `localhost:50051` and persisting data to a `sepp-data` directory in the current working directory. 
+You can generate a config file to edit with `sepp config example > sepp.toml`. Sepp will pick it up automatically
+as long as it is named `sepp.toml` and in the same directory as the binary, or you can specify a custom path with the `SEPP_CONFIG` environment variable.
+
+## Talk to the server
+
+In order to talk to the server, you need a client library. There are official clients for [Rust](TODO), [Python](TODO) and [Node.js](TODO).
+Sepp has a fairly simple gRPC line protocol, so you can also roll your own client in any language you want. See the 
+[protobuf definitions](https://github.com/sepp-org/proto) for more.
+
+### Enqueue a job
+
+<LangTabs items={['Rust', 'Python', 'TypeScript']} groupId="hello">
+
+```rust
+use sepp_rs::client::SeppClient;
+use sepp_rs::EnqueueRequest;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut client = SeppClient::connect("http://localhost:50051").await?;
+
+    let request = EnqueueRequest::new("queue name", "job type");
+    let response = client.enqueue(request).await?;
+
+    println!("Enqueued job with ID: {}", response.job_id);
+    Ok(())
+}
+```
+
+```python
+    
+}
+```
+
+```python
+print("hello")
+```
+
+```go
+package main
+import "fmt"
+func main() { fmt.Println("hello") }
+```
+
+</LangTabs>
+
+### Reserve, process, and ack
+
+### See it complete
 
 ## Where to go next
 

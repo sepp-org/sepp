@@ -1,7 +1,6 @@
 {
   "title": "Get Started",
   "pages": [
-    "index",
     "install",
     "quickstart",
     "first-producer",

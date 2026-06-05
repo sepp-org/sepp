@@ -3,16 +3,48 @@ title: "Overview"
 description: "A small, language-agnostic, durable job queue — a single static binary with embedded storage, spoken over gRPC."
 ---
 
-{/* SCAFFOLD — layout only, no prose written yet. */}
-{/* TODO(content): One-screen hub. One-line pitch, a Cards grid (Run the server / Enqueue your first job / Write a worker / Operate & observe), short feature map. Funnels into Get Started. */}
+## What is a job queue?
 
-## What sepp is
-
-## Who this is for: producers, workers, operators
+A job queue is a system that allows producers to enqueue jobs for workers to complete in an asynchronous manner, including across different
+programming languages. For example, a Rust backend service might schedule a job to send an email, which is then picked up by a Python worker
+that has access to a SMTP server. Durable job queues like sepp persist these jobs onto disk so that they are not lost in the event of a 
+server crash or restart.
 
 ## Start here
 
+<Cards>
+  <Card
+    href="/docs/get-started/quickstart"
+    title="Run the server"
+    description="Install sepp and run it."
+    icon={<IconTerminal size={18} />}
+  />
+  <Card
+    href="/docs/get-started/first-producer"
+    title="Enqueue your first job"
+    description="Push a job to the server with a client library."
+    icon={<IconBolt size={18} />}
+  />
+  <Card
+    href="/docs/get-started/first-worker"
+    title="Write a worker"
+    description="Reserve, process and ack jobs in a loop."
+    icon={<IconLayers size={18} />}
+  />
+  <Card
+    href="/docs/operations"
+    title="Operate & observe"
+    description="Deploy, tune storage, and ingest metrics and traces."
+    icon={<IconBook size={18} />}
+  />
+</Cards>
+
 ## Core feature map
 
-## Bring your own client
-
+- **Fully durable by default** — every job is persisted to disk before responding. [Durability](/docs/operations/durability)
+- **At-least-once delivery** — leased jobs return to ready if a worker dies. [Delivery guarantees](/docs/concepts/delivery-guarantees)
+- **Priority & scheduling** — run-at timestamps and per-job priority. [Scheduling](/docs/concepts/priority-and-scheduling)
+- **Retries & dead-letter** — bounded retries, then sideline for inspection. [Retries](/docs/concepts/retries-and-dead-letter)
+- **Idempotent enqueue** — dedup keys collapse duplicate producers. [Idempotency](/docs/concepts/idempotency-and-dedup)
+- **Language-agnostic** — one gRPC line protocol, any client. [Build your own](/docs/clients/build-your-own)
+- **Built-in admin UI** — real-time server state, job inspection, configuration and more. **_Coming soon_**

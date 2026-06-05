@@ -7,12 +7,21 @@ import {
   useState,
   type ReactNode,
 } from 'react';
-import { IconRust, IconPython, IconGo, IconShell } from './lang-icons';
+import {
+  IconRust,
+  IconPython,
+  IconGo,
+  IconJavaScript,
+  IconTypeScript,
+  IconShell,
+} from './lang-icons';
 
 const LANG_ICON: Record<string, (p: { size?: number }) => React.ReactElement> = {
   Rust: IconRust,
   Python: IconPython,
   Go: IconGo,
+  JavaScript: IconJavaScript,
+  TypeScript: IconTypeScript,
   Shell: IconShell,
 };
 
@@ -21,6 +30,8 @@ const LANG_COLOR: Record<string, string> = {
   Rust: '#dea584',
   Python: '#3572A5',
   Go: '#00ADD8',
+  JavaScript: '#f1e05a',
+  TypeScript: '#3178c6',
 };
 
 interface LangTabsProps {

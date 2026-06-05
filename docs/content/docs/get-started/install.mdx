@@ -1,6 +1,6 @@
 ---
 title: "Install"
-description: "Get the sepp binary: prebuilt release, cargo install, Docker image, or build from source."
+description: "Get the sepp binary: prebuilt release, cargo install, Docker image or build from source."
 ---
 
 {/* SCAFFOLD — layout only, no prose written yet. */}
@@ -8,11 +8,101 @@ description: "Get the sepp binary: prebuilt release, cargo install, Docker image
 
 ## Download a release binary
 
-## Run with Docker
+Prebuilt binaries are available for Linux, Windows and macOS on the [releases page](https://github.com/sepp-org/sepp/releases).
+
+## Install with Cargo
+
+If you have Rust and Cargo installed, you can install the latest release of sepp with:
+
+```bash
+cargo install sepp --locked
+```
 
 ## Build from source
 
-## Install protoc
+sepp is written in Rust and requires no additional dependencies to build. Clone the repo and build with Cargo:
 
-## Verify the install
+```bash
+git clone https://github.com/sepp-org/sepp
+cd sepp
+cargo build --release
+```
 
+## Run with Docker
+
+sepp is also published as a container image on the GitHub Container Registry,
+which is the easiest way to run the server if you already have Docker. The
+image contains nothing but the single `sepp` binary and runs it as a non-root
+user.
+
+```bash
+docker pull ghcr.io/sepp-org/sepp:latest
+```
+
+Several tags are published:
+
+- `latest` is the most recent tagged release.
+- `1.2.3`, `1.2` and `1` let you pin to an exact release, or to a minor or major version line.
+- `master` follows the tip of the `master` branch and is rebuilt on every push.
+- `sha-<short>` points at a single commit, for example `sha-caa284e`.
+
+The same image runs on both `amd64` and `arm64` machines. Each tag is a
+multi-architecture manifest, so Docker pulls the build that matches your host
+and you never have to pass a `--platform` flag.
+
+### Run the server
+
+```bash
+docker run --rm \
+  -p 50051:50051 \
+  -v sepp-data:/sepp/sepp-data \
+  ghcr.io/sepp-org/sepp:latest
+```
+
+sepp listens for gRPC on port `50051` and writes its database to
+`/sepp/sepp-data` inside the container.
+
+<Callout type="warn" title="Mount a volume for the data directory">
+Everything sepp persists lives under `/sepp/sepp-data`. If you do not mount a
+volume or a host directory there, those jobs are lost as soon as the container
+is removed. The directory is owned by user `65532` inside the image, so a
+bind-mounted host directory has to be writable by that user.
+</Callout>
+
+A named volume like the one above works without any setup, because Docker
+creates it from the image and keeps the same ownership. If you would rather
+bind-mount a directory from the host, create it first and hand it to user
+`65532` so that the server can write to it:
+
+```bash
+mkdir -p ./sepp-data
+sudo chown 65532:65532 ./sepp-data
+
+docker run --rm \
+  -p 50051:50051 \
+  -v "$(pwd)/sepp-data:/sepp/sepp-data" \
+  ghcr.io/sepp-org/sepp:latest
+```
+
+### Configuration
+
+The image ships with the example configuration at `/etc/sepp/sepp.toml` and
+sets `SEPP_CONFIG` so that the server loads it on startup. You can override any
+single field with an environment variable, by prefixing it with `SEPP_`,
+uppercasing it and joining the section and field with `__`. For example, this
+runs the server on a different port:
+
+```bash
+docker run --rm \
+  -p 6000:6000 \
+  -e SEPP_SERVER__LISTEN_ADDR=0.0.0.0:6000 \
+  -v sepp-data:/sepp/sepp-data \
+  ghcr.io/sepp-org/sepp:latest
+```
+
+To change more than a field or two, mount your own configuration file over
+`/etc/sepp/sepp.toml` instead. You can print one to start from with:
+
+```bash
+docker run --rm ghcr.io/sepp-org/sepp:latest config example > sepp.toml
+```
