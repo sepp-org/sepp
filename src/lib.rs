@@ -8,3 +8,4 @@ pub mod queue_server;
 pub mod queues;
 pub mod storage;
 pub mod telemetry;
+pub mod validate;

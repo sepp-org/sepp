@@ -10,8 +10,6 @@ tonic-prost = "0.14"
 tokio = { version = "1", features = ["full"] }
 prost = "0.14"
 prost-types = "0.14"
-prost-reflect = "0.16.4"
-prost-protovalidate = "0.4"
 uuid = { version = "1.23.2", features = ["v4"] }
 fjall = "3"
 flume = "0.12"
@@ -36,8 +34,7 @@ http-body-util = "0.1"
 
 [build-dependencies]
 tonic-prost-build = "0.14"
-prost-build = "0.14"
-prost-reflect-build = "0.16"
+protox = "0.9"
 
 [dev-dependencies]
 rcgen = "0.14"

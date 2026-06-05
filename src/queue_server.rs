@@ -16,7 +16,7 @@ use std::{time::Duration, time::Instant as StdInstant};
 
 use opentelemetry::metrics::ObservableGauge;
 
-use prost_protovalidate::Validator;
+use crate::validate;
 use tokio::time::{Instant, sleep_until};
 use tonic::{Request, Response, Status};
 use tracing::Instrument;
@@ -46,7 +46,6 @@ impl ServerLimits {
 }
 
 pub struct QueueServer {
-    validator: Validator,
     storage: Storage,
     registry: SharedRegistry,
     config: SharedConfig,
@@ -75,7 +74,6 @@ impl QueueServer {
         let queue_depth_gauges = metrics.register_queue_depth_gauges();
 
         Ok(Self {
-            validator: Validator::default(),
             storage,
             registry,
             config,
@@ -213,11 +211,9 @@ impl QueueServer {
         server: &ServerLimits,
     ) -> Result<(), pb::JobRejection> {
         use pb::job_rejection::Reason;
-        if let Err(e) = self.validator.validate(job) {
+        if let Err(message) = validate::enqueue_request(job) {
             return Err(pb::JobRejection {
-                reason: Some(Reason::InvalidRequest(pb::InvalidRequest {
-                    message: e.to_string(),
-                })),
+                reason: Some(Reason::InvalidRequest(pb::InvalidRequest { message })),
             });
         }
 
@@ -543,9 +539,7 @@ impl QueueService for QueueServer {
         let started = StdInstant::now();
         let result = async move {
             let req = request.into_inner();
-            self.validator
-                .validate(&req)
-                .map_err(|e| Status::invalid_argument(e.to_string()))?;
+            validate::reserve_request(&req).map_err(Status::invalid_argument)?;
 
             let (strict_queues, server_limits) = {
                 let cfg = self.config.load();
@@ -705,9 +699,7 @@ impl QueueService for QueueServer {
         let started = StdInstant::now();
         let result = async move {
             let req = request.into_inner();
-            self.validator
-                .validate(&req)
-                .map_err(|e| Status::invalid_argument(e.to_string()))?;
+            validate::ack_request(&req).map_err(Status::invalid_argument)?;
 
             let outcome = self.storage.ack(req.job_id.clone(), req.attempt).await?;
             let span = tracing::Span::current();
@@ -744,9 +736,7 @@ impl QueueService for QueueServer {
         let started = StdInstant::now();
         let result = async move {
             let req = request.into_inner();
-            self.validator
-                .validate(&req)
-                .map_err(|e| Status::invalid_argument(e.to_string()))?;
+            validate::nack_request(&req).map_err(Status::invalid_argument)?;
 
             let job_id = req.job_id.clone();
             let outcome = self.storage.nack(req).await?;
@@ -799,9 +789,7 @@ impl QueueService for QueueServer {
         let started = StdInstant::now();
         let result = async move {
             let req = request.into_inner();
-            self.validator
-                .validate(&req)
-                .map_err(|e| Status::invalid_argument(e.to_string()))?;
+            validate::extend_request(&req).map_err(Status::invalid_argument)?;
 
             // The per-queue lease ceiling is applied inside storage where the
             // job's queue is known via its Inflight record.
@@ -844,9 +832,7 @@ impl QueueService for QueueServer {
         let started = StdInstant::now();
         let result = async move {
             let req = request.into_inner();
-            self.validator
-                .validate(&req)
-                .map_err(|e| Status::invalid_argument(e.to_string()))?;
+            validate::drain_dead_letters_request(&req).map_err(Status::invalid_argument)?;
 
             let max =
                 req.max
