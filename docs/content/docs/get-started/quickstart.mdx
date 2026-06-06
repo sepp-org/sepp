@@ -3,9 +3,6 @@ title: "Quickstart"
 description: "Run the server, enqueue a job, and watch a worker process it — your first durable job in a few minutes."
 ---
 
-{/* SCAFFOLD — layout only, no prose written yet. */}
-{/* TODO(content): Linear copy-run first-success flow against a local single binary. LangTabs for enqueue + worker snippets. The aha moment, with expected output. Links to first-producer / first-worker. */}
-
 ## Start the server
 
 First install sepp with one of the methods described in the [install guide](/docs/get-started/install). Then run the 
@@ -30,13 +27,15 @@ as long as it is named `sepp.toml` and in the same directory as the binary, or y
 
 ## Talk to the server
 
-In order to talk to the server, you need a client library. There are official clients for [Rust](TODO), [Python](TODO) and [Node.js](TODO).
+First you need a client library. There are official clients for [Rust](TODO), [Python](TODO) and [Node.js](TODO).
 Sepp has a fairly simple gRPC line protocol, so you can also roll your own client in any language you want. See the 
 [protobuf definitions](https://github.com/sepp-org/proto) for more.
 
 ### Enqueue a job
 
-<LangTabs items={['Rust', 'Python', 'TypeScript']} groupId="hello">
+This simple example enqueues a single job with type "job type" onto the "queue name" queue. For more details and options, see the [producer docs](/docs/producers).
+
+<LangTabs items={['Rust', 'Python', 'TypeScript']} groupId="enqueue">
 
 ```rust
 use sepp_rs::client::SeppClient;
@@ -46,7 +45,7 @@ use sepp_rs::EnqueueRequest;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut client = SeppClient::connect("http://localhost:50051").await?;
 
-    let request = EnqueueRequest::new("queue name", "job type");
+    let request = EnqueueRequest::new("queue name", "job type")?;
     let response = client.enqueue(request).await?;
 
     println!("Enqueued job with ID: {}", response.job_id);
@@ -55,25 +54,98 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 ```python
-    
-}
+import asyncio
+from sepp import SeppClient, EnqueueRequest
+
+async def main() -> None:
+    client = await SeppClient.connect("http://localhost:50051")
+
+    request = EnqueueRequest("queue name", "job type")
+    response = await client.enqueue(request)
+
+    print(f"Enqueued job with ID: {response.job_id}")
 ```
 
-```python
-print("hello")
-```
+```ts
+import { SeppClient, EnqueueRequest } from "sepp";
 
-```go
-package main
-import "fmt"
-func main() { fmt.Println("hello") }
+const client = await SeppClient.connect("http://localhost:50051");
+const request: EnqueueRequest = {
+  queue: "queue name",
+  jobType: "job type",  
+};
+
+const response: EnqueueAck = await client.enqueue(request);
+
+console.log(`Enqueued job with ID: ${response.jobId}`);
 ```
 
 </LangTabs>
 
-### Reserve, process, and ack
+### Reserve, process and ack
 
-### See it complete
+Getting a job from a queue is called "reserving" a job. Each reserved job has a lease attached to it. If the lease expires before the job is acknowledged, the server will consider this attempt as failed and makes the job available for reservation again. A successful job completion is acknowledged by sending an "ack" message to the server and a failed one by sending a "nack".
 
-## Where to go next
+The easiest way of processing jobs is to use the Worker abstraction which will automatically handle the reservation, processing and acknowledgment logic for you. For more details and options, see the [worker docs](/docs/workers).
 
+<LangTabs items={['Rust', 'Python', 'TypeScript']} groupId="process">
+
+```rust
+use std::time::Duration;
+use sepp_rs::client::SeppClient;
+use sepp_rs::worker::Worker;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = SeppClient::connect("http://localhost:50051").await?;
+
+    let worker = Worker::new(client, ["queue name"], Duration::from_secs(30))?
+        .handle("job type", |payload, ctx| async move {
+            println!("Processing job with ID: {}", ctx.id);
+            // Do the work here
+            // Return Err(HandlerError) to nack and Ok(()) to ack.
+            Ok(())
+        })?;
+
+    worker.run().await;
+    Ok(())
+}
+```
+
+```python
+import asyncio
+from datetime import timedelta
+from sepp import SeppClient, Worker
+
+async def main() -> None:
+    client = await SeppClient.connect("http://localhost:50051")
+
+    worker = Worker(client, ["queue name"], timedelta(seconds=30))
+
+    @worker.handler("job type")
+    async def handle(payload, ctx) -> None:
+        print(f"Processing job with ID: {ctx.id}")
+        # Do the work here
+        # Raise HandlerError to nack and return normally to ack.
+
+    await worker.run()
+```
+
+```ts
+import { SeppClient, Worker } from "sepp";
+
+const client = await SeppClient.connect("http://localhost:50051");
+
+const worker = new Worker(client, {
+  queues: ["queue name"],
+  leaseDuration: 30_000,
+}).handle("job type", async (payload, ctx) => {
+  console.log(`Processing job with ID: ${ctx.id}`);
+  // Do the work here
+  // Throw HandlerError to nack and return normally to ack.
+});
+
+await worker.run();
+```
+
+</LangTabs>

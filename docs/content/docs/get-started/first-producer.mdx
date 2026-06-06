@@ -1,18 +1,436 @@
 ---
 title: "Your first producer"
-description: "Connect a client and enqueue jobs with payloads, priority, scheduling, and idempotency keys."
+description: "Connect a client and enqueue jobs with payloads, priority, scheduling and idempotency keys."
 ---
 
-{/* SCAFFOLD — layout only, no prose written yet. */}
-{/* TODO(content): Self-contained producer walkthrough (LangTabs). EnqueueBatch with one job, payload encoding, idempotency_key, priority. Hands off to Producers. */}
+## Enqueue jobs
 
-## Connect to the server
+There are 3 different ways:
+- `enqueue` enqueues a single job and returns the result.
+- `enqueueBatch` is more efficient for enqueuing many jobs at once, because it amortizes the round-trip time and disk syncs across them. It returns a per job result list, so you can see which ones succeeded and which ones failed.
+- `enqueueAtomic` is like `enqueueBatch` but with an all-or-nothing guarantee: either all jobs are enqueued or none are.
 
-## Enqueue a single job
+<LangTabs items={['Rust', 'Python', 'TypeScript']} groupId="producer">
+
+```rust
+use sepp_rs::client::SeppClient;
+use sepp_rs::{AtomicEnqueueError, EnqueueRequest};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = SeppClient::connect("http://localhost:50051").await?;
+
+    // enqueue a single job.
+    let ack = client.enqueue(EnqueueRequest::new("emails", "welcome")?).await?;
+    println!("enqueued {} (deduplicated: {})", ack.job_id, ack.deduplicated);
+
+    // enqueue_batch: many jobs in one round-trip. Each gets its own result,
+    // so some can succeed while others are rejected.
+    let results = client
+        .enqueue_batch([
+            EnqueueRequest::new("emails", "welcome")?,
+            EnqueueRequest::new("emails", "receipt")?,
+        ])
+        .await?;
+    
+    for (i, result) in results.into_iter().enumerate() {
+        match result {
+            Ok(ack) => println!("job {i} enqueued: {}", ack.job_id),
+            Err(rejection) => eprintln!("job {i} rejected: {rejection}"),
+        }
+    }
+
+    // enqueue_atomic: all-or-nothing. If any job is rejected, none are enqueued.
+    match client
+        .enqueue_atomic([
+            EnqueueRequest::new("checkout", "reserve_seat")?,
+            EnqueueRequest::new("checkout", "charge_card")?,
+        ])
+        .await
+    {
+        Ok(acks) => println!("all {} jobs enqueued", acks.len()),
+        Err(AtomicEnqueueError::Validation(errors)) => {
+            for e in errors {
+                eprintln!("job {} rejected: {}", e.index, e.rejection);
+            }
+        }
+        // Transport or protocol failure (and any future variant); nothing was enqueued.
+        Err(e) => return Err(e.into()),
+    }
+
+    Ok(())
+}
+```
+
+```python
+import asyncio
+from sepp import SeppClient, EnqueueRequest, JobRejection, BatchValidationError
+
+async def main() -> None:
+    client = await SeppClient.connect("http://localhost:50051")
+
+    # enqueue a single job.
+    ack = await client.enqueue(EnqueueRequest("emails", "welcome"))
+    print(f"enqueued {ack.job_id} (deduplicated={ack.deduplicated})")
+
+    # enqueue_batch: many jobs in one round-trip. Each gets its own result,
+    # so some can succeed while others are rejected.
+    results = await client.enqueue_batch([
+        EnqueueRequest("emails", "welcome"),
+        EnqueueRequest("emails", "receipt"),
+    ])
+    
+    for i, result in enumerate(results):
+        if isinstance(result, JobRejection):
+            print(f"job {i} rejected: {result.message}")
+        else:
+            print(f"job {i} enqueued: {result.job_id}")
+
+    # enqueue_atomic: all-or-nothing. If any job is rejected, none are enqueued.
+    try:
+        acks = await client.enqueue_atomic([
+            EnqueueRequest("checkout", "reserve_seat"),
+            EnqueueRequest("checkout", "charge_card"),
+        ])
+        print(f"all {len(acks)} jobs enqueued")
+    except BatchValidationError as e:
+        for err in e.errors:
+            print(f"job {err.index} rejected: {err.rejection.message}")
+```
+
+```ts
+import {
+  SeppClient,
+  isJobRejection,
+  describeJobRejection,
+  BatchValidationError,
+} from "sepp";
+
+const client = await SeppClient.connect("http://localhost:50051");
+
+// enqueue a single job.
+const ack = await client.enqueue({ queue: "emails", jobType: "welcome" });
+console.log(`enqueued ${ack.jobId} (deduplicated=${ack.deduplicated})`);
+
+// enqueueBatch: many jobs in one round-trip. Each gets its own result,
+// so some can succeed while others are rejected.
+const results = await client.enqueueBatch([
+  { queue: "emails", jobType: "welcome" },
+  { queue: "emails", jobType: "receipt" },
+]);
+
+results.forEach((result, i) => {
+  if (isJobRejection(result)) {
+    console.warn(`job ${i} rejected: ${describeJobRejection(result)}`);
+  } else {
+    console.log(`job ${i} enqueued: ${result.jobId}`);
+  }
+});
+
+// enqueueAtomic: all-or-nothing. If any job is rejected, none are enqueued.
+try {
+  const acks = await client.enqueueAtomic([
+    { queue: "checkout", jobType: "reserve_seat" },
+    { queue: "checkout", jobType: "charge_card" },
+  ]);
+  console.log(`all ${acks.length} jobs enqueued`);
+} catch (err) {
+  if (err instanceof BatchValidationError) {
+    for (const e of err.errors) {
+      console.warn(`job ${e.index} rejected: ${describeJobRejection(e.rejection)}`);
+    }
+  } else {
+    throw err;
+  }
+}
+```
+
+</LangTabs>
+
+## Attach custom metadata
+
+Most jobs only need to carry a few structured fields — a record ID, a type, a flag. The `custom` map is the simplest way to do that: key/value pairs whose values are primitives (string, integer, float or boolean). Sepp stores them as typed values and hands them back to the worker on `ctx.custom`, so there's no encoding to agree on and nothing to decode. For most producers this is all you need — reach for a [payload](#attach-a-payload-and-encoding-hint) only when you have a larger or arbitrarily-structured body to carry.
+
+Queues cap how many entries and how much total data the map can hold, so keep it to lightweight metadata rather than using it as a stand-in for the payload.
+
+<LangTabs items={['Rust', 'Python', 'TypeScript']} groupId="custom">
+
+```rust
+use sepp_rs::client::SeppClient;
+use sepp_rs::EnqueueRequest;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = SeppClient::connect("http://localhost:50051").await?;
+
+    let request = EnqueueRequest::new("emails", "welcome")?
+        .with_custom_entry("user_id", 42)
+        .with_custom_entry("locale", "en-US")
+        .with_custom_entry("vip", true);
+
+    let ack = client.enqueue(request).await?;
+    println!("enqueued {}", ack.job_id);
+    Ok(())
+}
+```
+
+```python
+import asyncio
+from sepp import SeppClient, EnqueueRequest
+
+async def main() -> None:
+    client = await SeppClient.connect("http://localhost:50051")
+
+    request = EnqueueRequest(
+        "emails",
+        "welcome",
+        custom={"user_id": 42, "locale": "en-US", "vip": True},
+    )
+
+    ack = await client.enqueue(request)
+    print(f"enqueued {ack.job_id}")
+```
+
+```ts
+import { SeppClient } from "sepp";
+
+const client = await SeppClient.connect("http://localhost:50051");
+
+const ack = await client.enqueue({
+  queue: "emails",
+  jobType: "welcome",
+  custom: { userId: 42, locale: "en-US", vip: true },
+});
+
+console.log(`enqueued ${ack.jobId}`);
+```
+
+</LangTabs>
 
 ## Attach a payload and encoding hint
 
+Sepp is payload-agnostic by design. It treats the payload as an opaque byte blob and does not attempt to parse or understand it. This allows you to use any data format you like, such as JSON, Protobuf, Avro, MessagePack or even a custom binary format. You can also choose the most efficient encoding for your use case, without being limited by the server's capabilities.
+
+To attach a payload, build a `Payload` from your serialized bytes and an encoding hint, then set it on the request. The encoding is a free-form string — usually a MIME type like `application/json` — that sepp stores untouched and the worker reads back to decide how to decode the bytes.
+
+<Callout type="info" title="Payloads are bytes, not a contract">
+The encoding hint is just a label, sepp never validates it, so your producer and
+worker have to agree on the format themselves. This mostly bites when they're written
+in different languages: JSON is well-specified, but language bindings don't map it
+identically. The classic case is integers above 2<sup>53</sup>, which JavaScript reads
+back as lossy floats while Python and Rust keep full precision. If you need strict
+cross-language guarantees, reach for a schema'd format like Protobuf or Avro and
+test the producer/worker round-trip end-to-end either way.
+</Callout>
+
+
+<LangTabs items={['Rust', 'Python', 'TypeScript']} groupId="payload">
+
+```rust
+use sepp_rs::client::SeppClient;
+use sepp_rs::{EnqueueRequest, Payload};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = SeppClient::connect("http://localhost:50051").await?;
+
+    let payload = Payload::new(br#"{"user_id": 42}"#.to_vec(), "application/json");
+    let request = EnqueueRequest::new("emails", "welcome")?.with_payload(payload);
+
+    let ack = client.enqueue(request).await?;
+    println!("enqueued {}", ack.job_id);
+    Ok(())
+}
+```
+
+```python
+import asyncio
+from sepp import SeppClient, EnqueueRequest, Payload
+
+async def main() -> None:
+    client = await SeppClient.connect("http://localhost:50051")
+
+    payload = Payload(b'{"user_id": 42}', "application/json")
+    request = EnqueueRequest("emails", "welcome", payload=payload)
+
+    ack = await client.enqueue(request)
+    print(f"enqueued {ack.job_id}")
+```
+
+```ts
+import { SeppClient, Payload } from "sepp";
+
+const client = await SeppClient.connect("http://localhost:50051");
+
+// Payload.json serializes the value and tags it as "application/json".
+const payload = Payload.json({ userId: 42 });
+const ack = await client.enqueue({
+  queue: "emails",
+  jobType: "welcome",
+  payload,
+});
+
+console.log(`enqueued ${ack.jobId}`);
+```
+
+</LangTabs>
+
+<Callout type="warn" title="Keep payloads small">
+The payload travels inline with the job through every enqueue and reservation and
+is held in the queue until the job finishes, so large blobs cost throughput and
+memory on the hot path. Sepp caps payload size per queue — 1 MiB by default — and
+rejects anything larger with `PayloadTooLarge`; the limit is configurable but bounded
+by the server's maximum gRPC message size (16 MiB by default). For anything bigger,
+put the data in object storage (S3, GCS, a database) and enqueue only a reference to
+it — a URL or key — in the payload or a [custom field](#attach-custom-metadata).
+</Callout>
+
 ## Set priority and idempotency
+
+Every queue has a default priority, but you can override it per job. Priorities run from 0 (lowest) to 9 (highest), and the server hands out higher-priority jobs first. Use it to let time-sensitive work jump ahead of routine jobs on the same queue.
+
+An idempotency key makes an enqueue safe to retry. If a job with the same key was already enqueued on that queue within its dedup window, the server skips the duplicate and returns the original job's ID with `deduplicated` set to `true`. This is handy when a network blip leaves you unsure whether your enqueue landed — retry with the same key and you get the original job back instead of a second copy.
+
+<LangTabs items={['Rust', 'Python', 'TypeScript']} groupId="priority">
+
+```rust
+use sepp_rs::client::SeppClient;
+use sepp_rs::{EnqueueRequest, Priority};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = SeppClient::connect("http://localhost:50051").await?;
+
+    let request = EnqueueRequest::new("emails", "welcome")?
+        .with_priority(Priority::P7)
+        .with_idempotency_key("welcome-user-42");
+
+    let ack = client.enqueue(request).await?;
+    if ack.deduplicated {
+        println!("already enqueued as {}", ack.job_id);
+    } else {
+        println!("enqueued {}", ack.job_id);
+    }
+    Ok(())
+}
+```
+
+```python
+import asyncio
+from sepp import SeppClient, EnqueueRequest, Priority
+
+async def main() -> None:
+    client = await SeppClient.connect("http://localhost:50051")
+
+    request = EnqueueRequest(
+        "emails",
+        "welcome",
+        priority=Priority.P7,
+        idempotency_key="welcome-user-42",
+    )
+
+    ack = await client.enqueue(request)
+    if ack.deduplicated:
+        print(f"already enqueued as {ack.job_id}")
+    else:
+        print(f"enqueued {ack.job_id}")
+```
+
+```ts
+import { SeppClient, Priority } from "sepp";
+
+const client = await SeppClient.connect("http://localhost:50051");
+
+const ack = await client.enqueue({
+  queue: "emails",
+  jobType: "welcome",
+  priority: Priority.P7,
+  idempotencyKey: "welcome-user-42",
+});
+
+if (ack.deduplicated) {
+  console.log(`already enqueued as ${ack.jobId}`);
+} else {
+  console.log(`enqueued ${ack.jobId}`);
+}
+```
+
+</LangTabs>
 
 ## Handle the enqueue result
 
+A successful `enqueue` returns an `EnqueueAck`: the server-assigned `jobId` and the `deduplicated` flag you saw above. Once you hold the ack, the job is durably persisted and will be delivered to a worker.
+
+A failure is one of two kinds, and they call for different responses:
+
+- **Rejection** — the server understood the request but refused this job (unknown queue, payload too large, a disallowed encoding, and so on). This is deterministic: the same request will always be rejected, so fix the request rather than retry it.
+- **Transport or protocol error** — the call never reached a per-job verdict (the connection dropped, the deadline passed, the server is shedding load). These are often transient, so backing off and retrying is reasonable — and safe to do if you set an [idempotency key](#set-priority-and-idempotency), since a retry that the server already committed will simply come back deduplicated.
+
+Each client surfaces that split in its own idiomatic way:
+
+<LangTabs items={['Rust', 'Python', 'TypeScript']} groupId="result">
+
+```rust
+use sepp_rs::client::{EnqueueError, SeppClient};
+use sepp_rs::EnqueueRequest;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = SeppClient::connect("http://localhost:50051").await?;
+
+    match client.enqueue(EnqueueRequest::new("emails", "welcome")?).await {
+        Ok(ack) => println!("enqueued {} (deduplicated: {})", ack.job_id, ack.deduplicated),
+        // The job was refused; the same request will always fail, so fix it.
+        Err(EnqueueError::Rejected(rejection)) => eprintln!("rejected: {rejection}"),
+        // No per-job verdict was reached; often transient, so retrying is reasonable.
+        Err(e) => eprintln!("enqueue failed, retry later: {e}"),
+    }
+    Ok(())
+}
+```
+
+```python
+import asyncio
+from sepp import SeppClient, EnqueueRequest, JobRejectedError, ClientError
+
+async def main() -> None:
+    client = await SeppClient.connect("http://localhost:50051")
+
+    try:
+        ack = await client.enqueue(EnqueueRequest("emails", "welcome"))
+        print(f"enqueued {ack.job_id} (deduplicated={ack.deduplicated})")
+    except JobRejectedError as e:
+        # The job was refused; the same request will always fail, so fix it.
+        print(f"rejected: {e.rejection.message}")
+    except ClientError as e:
+        # No per-job verdict was reached; often transient, so retrying is reasonable.
+        print(f"enqueue failed, retry later: {e}")
+```
+
+```ts
+import {
+  SeppClient,
+  JobRejectedError,
+  ClientError,
+  describeJobRejection,
+} from "sepp";
+
+const client = await SeppClient.connect("http://localhost:50051");
+
+try {
+  const ack = await client.enqueue({ queue: "emails", jobType: "welcome" });
+  console.log(`enqueued ${ack.jobId} (deduplicated=${ack.deduplicated})`);
+} catch (err) {
+  if (err instanceof JobRejectedError) {
+    // The job was refused; the same request will always fail, so fix it.
+    console.error(`rejected: ${describeJobRejection(err.rejection)}`);
+  } else if (err instanceof ClientError) {
+    // No per-job verdict was reached; often transient, so retrying is reasonable.
+    console.error(`enqueue failed, retry later: ${err.message}`);
+  } else {
+    throw err;
+  }
+}
+```
+
+</LangTabs>
