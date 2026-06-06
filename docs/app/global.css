@@ -1199,3 +1199,25 @@ article > div.grid.gap-4.pb-6 > a.text-end > div::before {
     padding: 28px 20px 80px;
   }
 }
+
+/* ==========================================================================
+   Mermaid diagrams
+   ========================================================================== */
+/* Mermaid lays a diagram out by measuring its labels in a detached element, then
+   we inject the finished SVG into <article>, whose prose typography would
+   otherwise resize the label text after layout and clip the boxes. Pin the
+   typography on the mermaid svg itself (matched by id, so it applies during both
+   measurement and final render) to keep the two in sync. Flowchart/state labels
+   live in <foreignObject> (HTML), so their size must be pinned; sequence labels
+   are SVG <text> sized by Mermaid, so there we only normalize the font. */
+svg[id^='mermaid-'] foreignObject,
+svg[id^='mermaid-'] foreignObject * {
+  font-family: var(--font-plex-mono), ui-monospace, SFMono-Regular, monospace !important;
+  font-size: 13px !important;
+  line-height: 1.45 !important;
+  margin: 0 !important;
+}
+
+svg[id^='mermaid-'] text {
+  font-family: var(--font-plex-mono), ui-monospace, SFMono-Regular, monospace !important;
+}

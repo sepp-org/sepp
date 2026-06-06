@@ -3,6 +3,8 @@ title: "Your first producer"
 description: "Connect a client and enqueue jobs with payloads, priority, scheduling and idempotency keys."
 ---
 
+A producer is any code that puts jobs on a queue. You connect a client, build an `EnqueueRequest` (at minimum a queue and a job type), and send it; the server stores the job durably and returns its ID. Everything beyond that — payloads, custom fields, priority, idempotency keys — is optional detail you attach to the request. This page starts with a single enqueue and works through those options from there.
+
 ## Enqueue jobs
 
 There are 3 different ways:

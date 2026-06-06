@@ -9,6 +9,7 @@ import { TypeTable } from 'fumadocs-ui/components/type-table';
 import { Callout } from '@/components/callout';
 import { Card, Cards } from '@/components/card';
 import { LangTabs } from '@/components/lang-tabs';
+import { Mermaid } from '@/components/mermaid';
 import { PageFoot } from '@/components/page-foot';
 import {
   IconLayers,
@@ -25,6 +26,7 @@ export function getMDXComponents(components?: MDXComponents): MDXComponents {
     Card,
     Cards,
     LangTabs,
+    Mermaid,
     PageFoot,
     IconLayers,
     IconBolt,

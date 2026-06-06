@@ -1,20 +1,74 @@
 ---
 title: "Job lifecycle"
-description: "The state machine a job moves through: ready, scheduled, in-flight, completed, retried, or dead-lettered."
+description: "The state machine a job moves through"
 ---
-
-{/* SCAFFOLD — layout only, no prose written yet. */}
-{/* TODO(content): Canonical state-machine page; the most-referenced concept. Maps states to RPCs and to the queue-depth gauges (ready/scheduled/inflight). */}
 
 ## States and transitions
 
+A job in sepp can have the following states:
+- `Enqueued`: the job has been enqueued by a producer, but is not yet available for reservation. It will become `Ready` immediately if it has no delay, or `Scheduled` if it has a future run-at timestamp.
+- `Ready`: the job is available to be reserved by a worker.
+- `In-flight`: the job has been reserved by a worker and is being processed. It has a lease that expires after a certain amount of time, after which it returns to `Ready` or `Dead-lettered` if it has exceeded its max attempts.
+- `Scheduled`: the job is not yet ready to be reserved, but will become `Ready` at a certain time in the future.
+- `Dead-lettered`: this job has either exhausted its max attempts or has been manually moved to the `dead-letter` queue by a worker. It is not available for reservation and can only be inspected or deleted.
+
+Those states and the transitions between them:
+
+<Mermaid chart={`
+stateDiagram-v2
+  direction LR
+  state "In-flight" as InFlight
+  state "Dead-lettered" as Dead
+
+  [*] --> Scheduled: enqueue · run-at
+  [*] --> Ready: enqueue
+  Scheduled --> Ready: due
+  Ready --> InFlight: reserve
+  InFlight --> Scheduled: nack · retry after
+  InFlight --> Ready: nack · lease expires
+  InFlight --> Dead: max attempts · permanent
+  InFlight --> [*]: ack
+`} />
+
 ## Enqueue to ready
+
+When a producer enqueues a job, the committer writes it straight into the queue. With no delay it lands as `Ready` and can be reserved at once; with a future run-at timestamp it lands as `Scheduled`, and the sweep promotes it to `Ready` the moment its time arrives. An idempotency key can short-circuit this entirely. A duplicate enqueue within the dedup window returns the original job's ID instead of creating a second one.
 
 ## Reserve to in-flight
 
+A worker reserves the next `Ready` job, highest priority first, then oldest. Reserving moves it to `In-flight` and attaches a **lease**: a deadline by which the worker must ack, nack, or extend. Until then the job is invisible to every other worker, so exactly one worker owns it at a time.
+
 ## Ack, nack, and redelivery
+
+Once it holds a job, the worker reports the outcome:
+
+- **ack**: success. The job is removed for good.
+- **nack**: failure. By default the job returns to `Ready` for an immediate retry; with a retry-after delay it goes to `Scheduled`; as a permanent failure it is dead-lettered straight away.
+- **neither**: if the lease expires before any of those (say the worker crashed), the sweep redelivers the job exactly as if it had been nacked. Each redelivery bumps the attempt count.
+
+<Mermaid chart={`
+sequenceDiagram
+  participant W as worker
+  participant S as sepp
+  W->>S: reserve
+  S-->>W: job · attempt 1
+  Note over W: handler fails
+  W->>S: nack (retry)
+  Note over S: back to Ready
+  W->>S: reserve
+  S-->>W: job · attempt 2
+  W->>S: ack
+  Note over S: removed
+`} />
+
+<Callout type="warn" title="Delivery is at-least-once">
+Because a lost lease redelivers the job, a handler can run more than once for the same job. A crash after the work but before the ack looks identical to a crash before the work. Make handlers idempotent; see [idempotent workers](/docs/workers/idempotent-workers).
+</Callout>
 
 ## Terminal: completed or dead-lettered
 
+A job leaves the queue in exactly one of two ways. A successful **ack** completes the job and removes it immediately. A job is **dead-lettered** when it's nacked as a permanent failure, or when it runs out of attempts (whether the final failure was a nack or a lease expiry). Dead-lettered jobs are never redelivered. When a dead-letter retention is configured they're kept for inspection and manual handling; by default (`dead_letter_retention_ms = 0`) the dead-letter store is off and an exhausted job is simply dropped.
+
 ## Attempt and max_attempts
 
+Every delivery carries an `attempt` number, starting at 1, and each retry, whether from a nack or a lease expiry, increments it. A job is delivered up to `max_attempts` times (default 3, configurable per queue); once the attempt that fails has reached `max_attempts`, sepp dead-letters it instead of retrying. Both values are on the job's `ctx`, so a handler can tell when it's on its last attempt and act accordingly.
