@@ -83,3 +83,10 @@ In the sync modes, once a client receives a response the effect is already on di
 ## Tonic gRPC server
 
 Sepp uses [Tonic](https://github.com/hyperium/tonic)(soon to be grpc-rust) to serve the gRPC API. Tonic is the de-facto Rust gRPC library that is built on top of the async runtime Tokio, which allows us to handle multiple concurrent client connections and requests with ease. The gRPC server is responsible for validating incoming requests and translating them into commands that are sent to the committer thread via a channel. It also handles sending responses back to clients, including pushing ready jobs to workers that are waiting on a reserve call.
+
+## See also
+
+- [Job lifecycle](/docs/concepts/job-lifecycle): the states a job moves through.
+- [Delivery guarantees](/docs/concepts/delivery-guarantees): the guarantees this architecture provides.
+- [Durability & persistence](/docs/operations/durability): persist modes and what survives a crash.
+- [Storage tuning](/docs/operations/storage-tuning): tuning the LSM store and committer.

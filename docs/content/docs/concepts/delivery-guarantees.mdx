@@ -1,18 +1,35 @@
 ---
 title: "Delivery guarantees"
-description: "At-least-once delivery via leasing and exactly-once enqueue via idempotency keys — and what each does not promise."
+description: "At-least-once delivery via leasing and exactly-once enqueue via idempotency keys."
 ---
-
-{/* SCAFFOLD — layout only, no prose written yet. */}
-{/* TODO(content): Honest guarantees page. Boundary of at-least-once + dedup; ordering and exactly-once-processing caveats. Pairs with idempotency-and-dedup. */}
 
 ## At-least-once delivery
 
-## Why redelivery happens
+Sepp guarantees at-least-once delivery through a leasing mechanism. When a worker reserves a job, it is marked as in-flight and given a lease duration. If the worker fails to ack or nack the job before the lease expires (for example, if the worker crashes), the job is automatically redelivered back to ready for another worker to pick up. Each redelivery increments the attempt count, so you can set a max attempts limit to eventually dead-letter jobs that keep failing. It also guarantees that only one worker can have the job at a time.
+
+The problem comes from the fact that the worker might have actually processed the job successfully but failed to ack it due to a crash or a network issue. In that case, the job will be redelivered and processed again, leading to duplicate side effects if the job is not idempotent. This is a common trade-off in distributed systems: you can have at-least-once delivery but not exactly-once processing without additional mechanisms. See [idempotent workers](/docs/workers/idempotent-workers) for how to design your handlers to be resilient to this.
 
 ## Exactly-once enqueue
 
-## Designing idempotent workers
+Sepp also provides a mechanism for exactly-once enqueue through idempotency keys. When a producer enqueues a job with an idempotency key, the server checks if there is already a job with the same key that was enqueued within the deduplication window. If there is, it returns the existing job's ID instead of creating a new one. This allows producers to safely retry enqueueing without worrying about creating duplicate jobs due to network issues or other transient errors.
 
-## What sepp does not guarantee
+You can configure this window via the `dedup_window_ms` field in the server configuration and you can also set it on a per-queue basis.
+```toml
+[storage]
+dedup_window_ms = 300000 # 5 minutes
 
+[[queues]]
+name = "emails"
+dedup_window_ms = 600000 # 10 minutes
+```
+
+<Callout type="warn" title="Deduplication is bounded by the window">
+Exactly-once enqueue holds only within the deduplication window. If a producer retries after the window has elapsed, the original entry has already expired and a fresh job is created. Size the window to comfortably cover how long your producers might keep retrying.
+</Callout>
+
+## See also
+
+- [Leasing & redelivery](/docs/concepts/leasing): the lease lifecycle, in-flight state and redelivery in depth.
+- [Retries & dead-letter](/docs/concepts/retries-and-dead-letter): attempt counting, retry strategies and the dead-letter paths.
+- [Idempotency & deduplication](/docs/concepts/idempotency-and-dedup): how dedup keys and the deduplication window behave.
+- [At-least-once vs exactly-once](/docs/guides/at-least-once-vs-exactly-once): choosing the right guarantee for your workload.

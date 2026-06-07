@@ -72,3 +72,10 @@ A job leaves the queue in exactly one of two ways. A successful **ack** complete
 ## Attempt and max_attempts
 
 Every delivery carries an `attempt` number, starting at 1, and each retry, whether from a nack or a lease expiry, increments it. A job is delivered up to `max_attempts` times (default 3, configurable per queue); once the attempt that fails has reached `max_attempts`, sepp dead-letters it instead of retrying. Both values are on the job's `ctx`, so a handler can tell when it's on its last attempt and act accordingly.
+
+## See also
+
+- [Leasing & redelivery](/docs/concepts/leasing): the lease lifecycle and redelivery in depth.
+- [Retries & dead-letter](/docs/concepts/retries-and-dead-letter): attempt counting and the dead-letter paths.
+- [Delivery guarantees](/docs/concepts/delivery-guarantees): the at-least-once and exactly-once guarantees behind these states.
+- [Priority & scheduling](/docs/concepts/priority-and-scheduling): how ready and scheduled jobs are ordered and promoted.

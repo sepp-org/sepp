@@ -1,18 +1,258 @@
 ---
 title: "Retries & dead-letter"
-description: "Retry directives on nack, attempt exhaustion, and the three ways a job is dead-lettered."
+description: "Retry directives on nack, attempt exhaustion and the three ways a job is dead-lettered."
 ---
 
-{/* SCAFFOLD — layout only, no prose written yet. */}
-{/* TODO(content): NackRetry default/delay_ms/dead_letter; the three DeadLetterCause variants (attempts exhausted, rejected, lease expired). max_attempts_ceiling clamps a client max_attempts so a job cannot be made un-dead-letterable (default_max_attempts <= max_attempts_ceiling). Retention gates DrainDeadLetters; the drain task lives in Operations. */}
+When a job fails, the worker nacks it. A nack is more than "this failed": it tells sepp what happens next, an immediate retry, a delayed retry or a trip straight to the dead-letter store. Together with a per-job attempt limit, those directives decide whether a job comes back around and the three ways it can end up dead-lettered.
 
 ## Nack retry strategies
 
+A nack carries a retry directive that picks one of three outcomes:
+
+- **Retry** (`Default`): the job goes straight back to `Ready` for another attempt, as long as attempts remain.
+- **Retry after a delay** (`After`): the job waits in `Scheduled` and becomes `Ready` once the delay has elapsed.
+- **Dead-letter** (`DeadLetter`): the job skips any remaining attempts and is dead-lettered right away.
+
+`nack` returns a boolean that is `true` when the job was dead-lettered, either because you asked for `DeadLetter` or because the failing attempt hit the limit, so you can log or alert on a terminal failure. If you drive jobs through the `Worker` instead of `nack` directly, its `HandlerError` variants map onto these: retry, retry-after and permanent (see [your first worker](/docs/get-started/first-worker#report-success-or-failure)).
+
+<LangTabs items={['Rust', 'Python', 'TypeScript']} groupId="directive">
+
+```rust
+use std::time::Duration;
+use sepp_rs::client::RetryDirective;
+
+// Pick a directive based on why the job failed.
+let directive = if err.is_transient() {
+    RetryDirective::Default                          // retry now
+} else if err.is_rate_limited() {
+    RetryDirective::After(Duration::from_secs(60))   // retry, but not yet
+} else {
+    RetryDirective::DeadLetter                        // unrecoverable, skip the rest
+};
+
+// True if this nack ended the job (DeadLetter, or the attempt limit was hit).
+let dead_lettered = client.nack(&job.ctx, directive, err.to_string()).await?;
+```
+
+```python
+from datetime import timedelta
+from sepp import RetryDirective
+
+# Pick a directive based on why the job failed.
+if err.is_transient:
+    directive = RetryDirective.DEFAULT                       # retry now
+elif err.is_rate_limited:
+    directive = RetryDirective.after(timedelta(seconds=60))  # retry, but not yet
+else:
+    directive = RetryDirective.DEAD_LETTER                   # unrecoverable, skip the rest
+
+# True if this nack ended the job (DEAD_LETTER, or the attempt limit was hit).
+dead_lettered = await client.nack(job.ctx, directive, str(err))
+```
+
+```ts
+import { RetryDirective } from "sepp";
+
+// Pick a directive based on why the job failed.
+let retry: RetryDirective;
+if (err.isTransient) {
+  retry = RetryDirective.default();      // retry now
+} else if (err.isRateLimited) {
+  retry = RetryDirective.after(60_000);  // retry, but not yet
+} else {
+  retry = RetryDirective.deadLetter();   // unrecoverable, skip the rest
+}
+
+// True if this nack ended the job (deadLetter, or the attempt limit was hit).
+const deadLettered = await client.nack(job.ctx, { retry, reason: String(err) });
+```
+
+</LangTabs>
+
 ## Backoff and delay
+
+The `Default` directive retries immediately. There is no built-in backoff, so a job that fails the instant it is reserved will be retried just as fast. When you want spacing between attempts you ask for it with `After`, computing the delay yourself, often an exponential of the attempt number.
+
+A delayed retry takes the same path as a scheduled job: it waits in `Scheduled` and is promoted to `Ready` when the delay is up, so the delay is the earliest the retry runs and not an exact time. The delay is capped at the queue's schedule horizon, the same limit as `scheduled_at`, so a very long backoff is clamped rather than rejected.
+
+<LangTabs items={['Rust', 'Python', 'TypeScript']} groupId="backoff">
+
+```rust
+use std::time::Duration;
+use sepp_rs::client::RetryDirective;
+
+// No automatic backoff: derive the delay from the attempt number yourself.
+let backoff = Duration::from_secs(2u64.pow(job.ctx.attempt));
+client.nack(&job.ctx, RetryDirective::After(backoff), "retrying with backoff").await?;
+```
+
+```python
+from datetime import timedelta
+from sepp import RetryDirective
+
+# No automatic backoff: derive the delay from the attempt number yourself.
+backoff = timedelta(seconds=2 ** job.ctx.attempt)
+await client.nack(job.ctx, RetryDirective.after(backoff), "retrying with backoff")
+```
+
+```ts
+import { RetryDirective } from "sepp";
+
+// No automatic backoff: derive the delay from the attempt number yourself.
+const backoffMs = 2 ** job.ctx.attempt * 1000;
+await client.nack(job.ctx, { retry: RetryDirective.after(backoffMs), reason: "retrying with backoff" });
+```
+
+</LangTabs>
 
 ## Attempts, default_max_attempts, and the ceiling
 
+Every delivery carries an `attempt` number starting at 1, incremented on each redelivery whether the previous one ended in a nack-retry or a lease expiry. A job is delivered up to `max_attempts` times; once the failing attempt reaches `max_attempts`, sepp dead-letters it instead of retrying.
+
+A job's `max_attempts` is resolved in order: the value the producer set on the job, otherwise the queue's `default_max_attempts` (global default 3) and in all cases clamped to `max_attempts_ceiling` (global default 100). The ceiling is a guardrail so no producer can ask for an unbounded number of retries; a request above it is clamped down rather than rejected. `default_max_attempts` itself must not exceed the ceiling, which is checked when the config loads.
+
+```toml
+[limits]
+default_max_attempts = 3    # used when a job does not set its own
+max_attempts_ceiling = 100  # hard cap on what any job may request
+
+[[queues]]
+name = "emails"
+default_max_attempts = 5    # this queue retries a little more before giving up
+```
+
+Override the queue default on a single job at enqueue time:
+
+<LangTabs items={['Rust', 'Python', 'TypeScript']} groupId="set-attempts">
+
+```rust
+use sepp_rs::EnqueueRequest;
+
+// Override the queue default for this one job.
+let request = EnqueueRequest::new("emails", "welcome")?.with_max_attempts(5);
+client.enqueue(request).await?;
+```
+
+```python
+from sepp import EnqueueRequest
+
+# Override the queue default for this one job.
+request = EnqueueRequest("emails", "welcome", max_attempts=5)
+await client.enqueue(request)
+```
+
+```ts
+// Override the queue default for this one job.
+await client.enqueue({ queue: "emails", jobType: "welcome", maxAttempts: 5 });
+```
+
+</LangTabs>
+
+Both `attempt` and `max_attempts` ride on the job's `ctx`, so a handler can tell when it is on its last try and act differently rather than just failing again:
+
+<LangTabs items={['Rust', 'Python', 'TypeScript']} groupId="last-attempt">
+
+```rust
+// Inside a handler: ctx carries this delivery's place in the sequence.
+if ctx.attempt == ctx.max_attempts {
+    // Last try; a failure now dead-letters the job, so degrade gracefully.
+}
+```
+
+```python
+# Inside a handler: ctx carries this delivery's place in the sequence.
+if ctx.attempt == ctx.max_attempts:
+    # Last try; a failure now dead-letters the job, so degrade gracefully.
+    ...
+```
+
+```ts
+// Inside a handler: ctx carries this delivery's place in the sequence.
+if (ctx.attempt === ctx.maxAttempts) {
+  // Last try; a failure now dead-letters the job, so degrade gracefully.
+}
+```
+
+</LangTabs>
+
 ## Dead-letter causes
+
+A job leaves for the dead-letter store in exactly one of three ways, recorded as the record's `cause`:
+
+- `attempts_exhausted`: the job ran out of attempts across its nacks and redeliveries, with the final failing attempt reaching `max_attempts`.
+- `rejected`: a worker nacked with the `DeadLetter` directive, skipping any remaining attempts.
+- `lease_expired`: the lease expired while the job was on its final attempt, so there was no attempt left to redeliver into.
+
+The first two arrive through a nack; the third comes from a worker that simply went away on the last attempt (see [leasing & redelivery](/docs/concepts/leasing)). Dead-lettered jobs are terminal and are never redelivered.
 
 ## Retention and replay
 
+By default the dead-letter store is off (`dead_letter_retention_ms = 0`): a dead-lettered job is dropped on the spot and nothing is kept. Set a positive retention and sepp keeps each dead-lettered job for that long, sweeping it away once the window passes. While a job is retained you can inspect it and replay the ones worth another go.
+
+```toml
+[storage]
+dead_letter_retention_ms = 604800000  # keep dead jobs 7 days; 0 (the default) disables the store
+```
+
+You read them with `drain_dead_letters`, which returns up to `max` records (oldest-first, optionally for a single queue) and removes them in the same call. That makes it destructive: a dropped response loses exactly that batch, so the clients do not retry it for you. An empty result is ambiguous, it can mean nothing matched or that retention is off, so check `dead_letter_retention_enabled` in the server capabilities first.
+
+<Callout type="warn" title="Draining is destructive">
+`drain_dead_letters` removes the records it returns in the same transaction. There is no second copy, so persist or act on a batch before you move on; if the response is lost, that batch is gone.
+</Callout>
+
+Each record is a snapshot of the dead job (its `cause`, the last nack `reason`, the final attempt and the original fields) with a helper that rebuilds an enqueue for the same queue. A replay is a fresh job: the server assigns a new id and resets the attempt counter to 1.
+
+<LangTabs items={['Rust', 'Python', 'TypeScript']} groupId="drain">
+
+```rust
+// Drain up to 100 dead-lettered jobs from "emails" (this removes them).
+let records = client.drain_dead_letters(Some("emails"), 100).await?;
+for record in records {
+    eprintln!(
+        "{} died on attempt {} ({:?}): {}",
+        record.job_id,
+        record.final_attempt,
+        record.cause,
+        record.last_reason.as_deref().unwrap_or("no reason"),
+    );
+
+    // Replay the ones worth another go as a fresh job.
+    client.enqueue(record.to_enqueue_request()).await?;
+}
+```
+
+```python
+# Drain up to 100 dead-lettered jobs from "emails" (this removes them).
+records = await client.drain_dead_letters(queue="emails", max_records=100)
+for record in records:
+    print(
+        f"{record.job_id} died on attempt {record.final_attempt} "
+        f"({record.cause.value}): {record.last_reason or 'no reason'}"
+    )
+
+    # Replay the ones worth another go as a fresh job.
+    await client.enqueue(record.to_enqueue_request())
+```
+
+```ts
+// Drain up to 100 dead-lettered jobs from "emails" (this removes them).
+const records = await client.drainDeadLetters({ queue: "emails", max: 100 });
+for (const record of records) {
+  console.warn(
+    `${record.jobId} died on attempt ${record.finalAttempt} ` +
+      `(${record.cause}): ${record.lastReason ?? "no reason"}`,
+  );
+
+  // Replay the ones worth another go as a fresh job.
+  await client.enqueue(record.toEnqueueRequest());
+}
+```
+
+</LangTabs>
+
+## See also
+
+- [Leasing & redelivery](/docs/concepts/leasing): how lease expiry feeds the attempt counter.
+- [Job lifecycle](/docs/concepts/job-lifecycle): where dead-letter sits among the states.
+- [Dead-letter management](/docs/operations/dead-letter-management): operating the dead-letter store.
+- [Handling poison & dead-lettered jobs](/docs/guides/poison-jobs): patterns for jobs that keep failing.

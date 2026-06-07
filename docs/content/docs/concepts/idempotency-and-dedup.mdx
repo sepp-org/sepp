@@ -3,16 +3,127 @@ title: "Idempotency & deduplication"
 description: "How idempotency keys deduplicate enqueues within the dedup window."
 ---
 
-{/* SCAFFOLD — layout only, no prose written yet. */}
-{/* TODO(content): CANONICAL idempotency hub. dedup_window_ms, the deduplicated flag, contrast enqueue-side dedup (here) with worker-side idempotent handlers (workers/idempotent-workers). Every other idempotency page should open with a one-line disambiguation linking here. */}
+An idempotency key makes an enqueue safe to retry. Attach the same key to two enqueues on the same queue within the dedup window and the server keeps the first job and hands the second call back the original's id rather than creating a duplicate. That turns a network blip or timeout, the kind that leaves you unsure whether your enqueue landed, into a harmless retry.
 
 ## Idempotency keys
 
+You set the key on the enqueue request. It is a free-form string, so pick something stable and meaningful: the id of the entity the job is about, an event id, a digest of the inputs. The server enforces only one rule on it, length. A key must be non-empty and at most `max_idempotency_key_bytes` (256 bytes by default), otherwise the enqueue is rejected with `IdempotencyKeyTooLong`. Keys are scoped per queue, so the same key on two different queues never collides.
+
+<LangTabs items={['Rust', 'Python', 'TypeScript']} groupId="key">
+
+```rust
+use sepp_rs::client::SeppClient;
+use sepp_rs::EnqueueRequest;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = SeppClient::connect("http://localhost:50051").await?;
+
+    // Derive the key from what the job is "about", so a retry of the same
+    // logical enqueue carries the same key.
+    let request = EnqueueRequest::new("emails", "receipt")?
+        .with_idempotency_key("receipt-order-8a3f");
+
+    let ack = client.enqueue(request).await?;
+    if ack.deduplicated {
+        println!("already enqueued earlier as {}", ack.job_id);
+    } else {
+        println!("enqueued {}", ack.job_id);
+    }
+    Ok(())
+}
+```
+
+```python
+import asyncio
+from sepp import SeppClient, EnqueueRequest
+
+async def main() -> None:
+    client = await SeppClient.connect("http://localhost:50051")
+
+    # Derive the key from what the job is "about", so a retry of the same
+    # logical enqueue carries the same key.
+    request = EnqueueRequest(
+        "emails",
+        "receipt",
+        idempotency_key="receipt-order-8a3f",
+    )
+
+    ack = await client.enqueue(request)
+    if ack.deduplicated:
+        print(f"already enqueued earlier as {ack.job_id}")
+    else:
+        print(f"enqueued {ack.job_id}")
+```
+
+```ts
+import { SeppClient } from "sepp";
+
+const client = await SeppClient.connect("http://localhost:50051");
+
+// Derive the key from what the job is "about", so a retry of the same
+// logical enqueue carries the same key.
+const ack = await client.enqueue({
+  queue: "emails",
+  jobType: "receipt",
+  idempotencyKey: "receipt-order-8a3f",
+});
+
+if (ack.deduplicated) {
+  console.log(`already enqueued earlier as ${ack.jobId}`);
+} else {
+  console.log(`enqueued ${ack.jobId}`);
+}
+```
+
+</LangTabs>
+
+<Callout type="warn" title="The key is the whole identity">
+A dedup hit is decided on the queue and key alone. The payload, job type and other fields of the second enqueue are ignored and discarded, so the original job stands and the new content is silently dropped. Reuse a key only for what is genuinely the same logical job.
+</Callout>
+
 ## The dedup window
+
+The window decides how long a key is remembered. While an entry is inside its window a matching enqueue is deduplicated; once the window passes the entry is swept and the next enqueue with that key starts a fresh job. You set it with `dedup_window_ms`, globally under `[storage]` or per queue, and the default is 24 hours.
+
+```toml
+[storage]
+dedup_window_ms = 86400000  # 24 hours (the default)
+
+[[queues]]
+name = "payments"
+dedup_window_ms = 604800000  # 7 days for a high-stakes queue
+```
+
+<Callout type="info" title="The window does not slide">
+The window is measured from the first enqueue, not the most recent one. Enqueuing again with the same key keeps returning the original job until the window elapses; it does not push the expiry further out.
+</Callout>
 
 ## Deduplicated enqueue responses
 
+Every enqueue returns an ack with the job id and a `deduplicated` flag. On a fresh enqueue the flag is `false` and the id belongs to the job you just created. On a hit it is `true` and the id is the original job, so the call is a confirmation that the job already exists rather than a second one.
+
+One subtlety is worth knowing: the id you get back can point to a job that has already run or even been dead-lettered, because the dedup record outlives the job and lasts the full window. Read `deduplicated` as "this enqueue is already accounted for", not "a live job with this id exists right now". In a batch each result carries its own flag, so you can still tell which jobs were new (see [batch & atomic enqueue](/docs/producers/batch-enqueue)).
+
 ## Enqueue-side dedup vs idempotent handlers
+
+It is tempting to read an idempotency key as exactly-once processing. It is not. The key deduplicates the *enqueue*: it stops a producer's retry from creating a second job. It says nothing about how many times that one job then runs.
+
+Delivery is at-least-once, so a single job can still be reserved and processed more than once, for example when a worker's lease expires and the job is redelivered while the original worker is still going (see [leasing & redelivery](/docs/concepts/leasing)). Guarding against that is a separate concern: make the handler itself idempotent so doing the work twice is harmless.
+
+The two layers answer different questions. The idempotency key answers "was this job created once". An idempotent handler answers "did this work happen once". Use the key on the producer and idempotent handlers on the worker; most systems want both. See [idempotent workers](/docs/workers/idempotent-workers) for the handler side.
 
 ## Limits and tuning
 
+Size `dedup_window_ms` to comfortably outlast the longest a producer might keep retrying one enqueue, including outages and backoff. A retry that arrives after the window has lapsed is treated as a brand new job, which is exactly the duplicate you were trying to avoid.
+
+The cost of a longer window is storage. Every keyed enqueue holds a small record (the key, the original id and its enqueue time) for the length of the window, swept automatically once it expires. A long window on a high-volume queue keeps many of these around at once, so size it deliberately rather than reaching for "forever".
+
+Keys count against `max_idempotency_key_bytes` (256 bytes by default). Keep them short and stable, like a domain id, rather than hashing the entire payload. The window can be raised on the queues that need it and left at the default everywhere else (see [queues & strict mode](/docs/concepts/queues) for per-queue overrides).
+
+## See also
+
+- [Idempotent workers](/docs/workers/idempotent-workers): making the work itself safe to run more than once.
+- [Leasing & redelivery](/docs/concepts/leasing): why one job can still be processed twice.
+- [Delivery guarantees](/docs/concepts/delivery-guarantees): at-least-once delivery and exactly-once enqueue.
+- [Idempotent enqueue](/docs/producers/idempotent-enqueue): the producer-side recipe in depth.

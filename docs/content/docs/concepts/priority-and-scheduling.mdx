@@ -3,16 +3,156 @@ title: "Priority & scheduling"
 description: "Priority 0-9 dequeue order and scheduled/delayed jobs with the schedule horizon."
 ---
 
-{/* SCAFFOLD — layout only, no prose written yet. */}
-{/* TODO(content): Two related concepts: strict priority dequeue and scheduled_at future execution with max_schedule_horizon_ms (also clamps nack retry delay). default_priority fills an unset priority. */}
+Sepp gives you two levers over when a job runs. Priority reorders the jobs that are ready now; scheduling holds a job back until a future time. They are independent: a job can be high priority and scheduled at once. This page covers both and the limits around them.
 
 ## Priority levels 0-9
 
+Every job carries a priority from 0 to 9, where 0 is the lowest and 9 the highest. You set it per job on the enqueue request; leave it off and the job takes the queue's default (covered below). The server hands out higher-priority jobs before lower ones, so use priority to let urgent work jump the line on a busy queue. Use the `Priority` constants `P0` through `P9`, with `MIN` and `MAX` as aliases for `P0` and `P9`; the range is 0 to 9 and anything higher is rejected.
+
+<LangTabs items={['Rust', 'Python', 'TypeScript']} groupId="priority">
+
+```rust
+use sepp_rs::client::SeppClient;
+use sepp_rs::{EnqueueRequest, Priority};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = SeppClient::connect("http://localhost:50051").await?;
+
+    // MAX is the highest priority (9); it jumps ahead of anything lower on the queue.
+    let request = EnqueueRequest::new("emails", "password_reset")?
+        .with_priority(Priority::MAX);
+
+    client.enqueue(request).await?;
+    Ok(())
+}
+```
+
+```python
+import asyncio
+from sepp import SeppClient, EnqueueRequest, Priority
+
+async def main() -> None:
+    client = await SeppClient.connect("http://localhost:50051")
+
+    # MAX is the highest priority (9); it jumps ahead of anything lower on the queue.
+    request = EnqueueRequest(
+        "emails",
+        "password_reset",
+        priority=Priority.MAX,
+    )
+
+    await client.enqueue(request)
+```
+
+```ts
+import { SeppClient, Priority } from "sepp";
+
+const client = await SeppClient.connect("http://localhost:50051");
+
+// MAX is the highest priority (9); it jumps ahead of anything lower on the queue.
+await client.enqueue({
+  queue: "emails",
+  jobType: "password_reset",
+  priority: Priority.MAX,
+});
+```
+
+</LangTabs>
+
 ## Priority dequeue order
+
+When a worker reserves from a queue, sepp gives it the highest-priority job waiting there. Within one priority level, jobs are first-in first-out, so among equal priorities the one that has waited longest goes first. The two rules compose into a strict order: every priority 9 job is handed out before any priority 8 job, and so on down the levels.
+
+<Callout type="warn" title="Priority is strict">
+A higher-priority job always dequeues before a lower-priority one, no matter how long the lower one has waited. There is no aging to rescue a starved job, so a sustained flood of high-priority work can hold back everything beneath it. Keep the high bands for genuinely urgent jobs or split very different urgencies into separate queues so a flood of one cannot crowd out the other.
+</Callout>
 
 ## Scheduled and delayed jobs
 
+By default a job is ready the moment it is enqueued. Set `scheduled_at` to a future time and the job is held back: it lands in the `Scheduled` state, hidden from workers until its time arrives, when a background sweep promotes it to `Ready`. The scheduled time is the earliest a job can run, not an exact firing time; once promoted it waits for a free worker like any other ready job and takes its place in line by priority and its original enqueue time.
+
+There is no separate delay parameter. You pass an absolute instant, so to delay by a duration you add it to the current time yourself.
+
+<LangTabs items={['Rust', 'Python', 'TypeScript']} groupId="schedule">
+
+```rust
+use std::time::{Duration, SystemTime};
+use sepp_rs::client::SeppClient;
+use sepp_rs::EnqueueRequest;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = SeppClient::connect("http://localhost:50051").await?;
+
+    // No "delay" argument: schedule an absolute time, adding to now for a
+    // relative delay.
+    let run_at = SystemTime::now() + Duration::from_secs(60 * 60);
+    let request = EnqueueRequest::new("reports", "daily_rollup")?
+        .with_scheduled_at(run_at);
+
+    client.enqueue(request).await?;
+    Ok(())
+}
+```
+
+```python
+import asyncio
+from datetime import datetime, timedelta, timezone
+from sepp import SeppClient, EnqueueRequest
+
+async def main() -> None:
+    client = await SeppClient.connect("http://localhost:50051")
+
+    # No "delay" argument: schedule an absolute time, adding to now for a
+    # relative delay.
+    run_at = datetime.now(timezone.utc) + timedelta(hours=1)
+    request = EnqueueRequest("reports", "daily_rollup", scheduled_at=run_at)
+
+    await client.enqueue(request)
+```
+
+```ts
+import { SeppClient } from "sepp";
+
+const client = await SeppClient.connect("http://localhost:50051");
+
+// No "delay" argument: schedule an absolute time, adding to now for a
+// relative delay.
+const runAt = new Date(Date.now() + 60 * 60 * 1000);
+await client.enqueue({
+  queue: "reports",
+  jobType: "daily_rollup",
+  scheduledAt: runAt,
+});
+```
+
+</LangTabs>
+
 ## Schedule horizon
+
+There is a ceiling on how far ahead you can schedule. By default a job may be scheduled up to 30 days out; ask for further and the enqueue is rejected with `ScheduledTooFar`, which reports both the horizon and the time you asked for. The limit is `max_schedule_horizon_ms`, configurable globally and per queue. The server advertises it in its capabilities, so a producer can check it before sending.
+
+The horizon only bounds how far ahead you schedule. It says nothing about how long a job may sit `Ready` waiting for a worker, which is unbounded.
 
 ## Default priority
 
+A job that does not set a priority inherits the queue's default. The global default is 0 and you can raise it on specific queues so everything enqueued there starts elevated without each producer asking for it.
+
+```toml
+[limits]
+default_priority = 0  # the global default
+
+[[queues]]
+name = "alerts"
+default_priority = 7  # jobs on "alerts" start elevated
+```
+
+Per-queue defaults are part of the queue config, alongside the other overrides in [queues & strict mode](/docs/concepts/queues).
+
+## See also
+
+- [Designing priority queues](/docs/guides/priority-queues): patterns for using priority without starving work.
+- [Schedule & delay jobs](/docs/producers/scheduling): the producer-side recipe in depth.
+- [Job lifecycle](/docs/concepts/job-lifecycle): the Scheduled and Ready states in context.
+- [Queues & strict mode](/docs/concepts/queues): per-queue default priority and the other overrides.

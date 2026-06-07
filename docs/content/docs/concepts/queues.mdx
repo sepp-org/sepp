@@ -1,18 +1,72 @@
 ---
 title: "Queues & strict mode"
-description: "Named queues, auto-create versus strict declaration, and per-queue configuration overrides."
+description: "Named queues, auto-create versus strict declaration and per-queue configuration overrides."
 ---
-
-{/* SCAFFOLD — layout only, no prose written yet. */}
-{/* TODO(content): strict_queues, on-first-use auto-create, [[queues]] override semantics (merge over defaults), depth caps. Note allowed_job_types is a per-queue-only override (no global key, not advertised in GetServerInfo). Config keys live in Reference. */}
-
-## Named queues
 
 ## Auto-create vs strict mode
 
+By default, sepp runs in auto-create mode, where any reference to a queue name that doesn't exist yet will create it on the fly. This is convenient for development or more dynamic systems but can lead to mistakes like typos creating unintended queues or a worker accidentally consuming from the wrong queue. Strict mode disables auto-creation and requires that all queues be declared in the configuration before they can be used, which can help catch those mistakes early and enforce a more deliberate queue structure.
+
+To enable strict mode, set the `strict_queues` field in the server configuration to `true`:
+```toml
+[server]
+strict_queues = true
+```
+
+## Named queues
+
+You can declare queues in the configuration by adding a `[[queues]]` section for each queue, with its name and any specific configuration overrides:
+```toml
+[[queues]]
+name = "emails"
+max_lease_duration_ms = 60000
+default_max_attempts = 5
+default_priority = 5
+allowed_job_types = ["send_welcome", "send_receipt"]
+
+[[queues]]
+name = "reports"
+
+[[queues]]
+name = "large_payloads"
+max_payload_bytes = 8388608
+dedup_window_ms = 3600000
+```
+
+<Callout type="info" title="Hot reloading">
+Queues declared in the configuration are hot-reloadable, so you can add, remove or change them on the fly without restarting the server. Just edit the config file, save and the server will pick up the changes automatically.
+</Callout>
+
 ## Per-queue overrides
 
-## Queue depth and caps
+You can override many of the global defaults on a per-queue basis in the configuration. For example, you might want to allow larger payloads on a specific queue or set a different max attempts for another. This works both in auto-create and strict mode.
 
-## Choosing a queue layout
+```toml
+# Overridable fields (all optional):
+#   max_lease_duration_ms
+#   default_max_attempts
+#   max_attempts_ceiling
+#   default_priority
+#   max_payload_bytes
+#   allowed_encodings
+#   max_schedule_horizon_ms
+#   max_custom_entries
+#   max_custom_total_bytes
+#   max_custom_key_bytes
+#   dedup_window_ms
+#   max_queue_depth
+```
 
+You can also set an `allowed_job_types` list to restrict which job types can be enqueued onto that queue. This is a simple way to enforce some separation of concerns between different queues, and can help catch mistakes where a producer might enqueue the wrong type of job onto a queue that a worker is consuming from.
+
+```toml
+[[queues]]
+name = "emails"
+allowed_job_types = ["send_welcome", "send_receipt"]
+```
+
+## See also
+
+- [Limits & quotas](/docs/operations/limits): the global defaults that per-queue overrides replace.
+- [Configuration](/docs/operations/configuration): the config file, environment variables and hot reload.
+- [Configuration reference](/docs/reference/configuration): every config key in one place.

@@ -3,16 +3,160 @@ title: "Batch enqueue"
 description: "Best-effort EnqueueBatch with per-job results versus all-or-none EnqueueAtomic."
 ---
 
-{/* SCAFFOLD — layout only, no prose written yet. */}
-{/* TODO(content): The two batch RPCs; partial success vs all-or-none; how per-job JobRejection differs from a whole-batch gRPC error. max_enqueue_batch bounds size. */}
+Producing jobs one at a time works but when you have many to send there are two batch RPCs that do it in a single call: `EnqueueBatch`, which is best-effort and reports each job on its own, and `EnqueueAtomic`, which is all-or-none. This page covers what each one guarantees, how their failures differ and when to use which.
 
 ## Why batch
 
+Enqueuing one job at a time is simple but each call is a network round-trip and, in the sync persist modes, its own fsync. Batching amortizes both: the jobs ride in one request and the committer folds them into a single disk sync, so a batch of 100 costs far less than 100 separate enqueues. Reach for it whenever you are producing more than a handful of jobs at once.
+
+A batch is capped at `max_enqueue_batch` (256 by default). A request over the cap, or an empty one, is refused with an `InvalidArgument` error before any job is stored.
+
 ## Best-effort EnqueueBatch
+
+`EnqueueBatch` is best-effort: each job is validated on its own and the valid ones are enqueued, so some can succeed while others are refused. You get back one result per job in request order, each either an ack (the job's id and `deduplicated` flag) or a per-job rejection saying why that job was refused, drawn from the same catalogue a single enqueue can hit (unknown queue, payload too large, and so on).
+
+<LangTabs items={['Rust', 'Python', 'TypeScript']} groupId="batch">
+
+```rust
+use sepp_rs::EnqueueRequest;
+
+let results = client
+    .enqueue_batch([
+        EnqueueRequest::new("emails", "welcome")?,
+        EnqueueRequest::new("emails", "receipt")?,
+    ])
+    .await?;
+
+// One result per job, in order: some may be acks, others rejections.
+for (i, result) in results.into_iter().enumerate() {
+    match result {
+        Ok(ack) => println!("job {i} enqueued: {}", ack.job_id),
+        Err(rejection) => eprintln!("job {i} rejected: {rejection}"),
+    }
+}
+```
+
+```python
+from sepp import EnqueueRequest, JobRejection
+
+results = await client.enqueue_batch([
+    EnqueueRequest("emails", "welcome"),
+    EnqueueRequest("emails", "receipt"),
+])
+
+# One result per job, in order: some may be acks, others rejections.
+for i, result in enumerate(results):
+    if isinstance(result, JobRejection):
+        print(f"job {i} rejected: {result.message}")
+    else:
+        print(f"job {i} enqueued: {result.job_id}")
+```
+
+```ts
+import { isJobRejection, describeJobRejection } from "sepp";
+
+const results = await client.enqueueBatch([
+  { queue: "emails", jobType: "welcome" },
+  { queue: "emails", jobType: "receipt" },
+]);
+
+// One result per job, in order: some may be acks, others rejections.
+results.forEach((result, i) => {
+  if (isJobRejection(result)) {
+    console.warn(`job ${i} rejected: ${describeJobRejection(result)}`);
+  } else {
+    console.log(`job ${i} enqueued: ${result.jobId}`);
+  }
+});
+```
+
+</LangTabs>
 
 ## Atomic EnqueueAtomic
 
+`EnqueueAtomic` is all-or-none. It validates the whole batch first; if every job passes, all are enqueued and you get one ack per job; if any job fails validation, nothing is enqueued and you get back every failure together, each tagged with the index of the job it refers to. Use it when the jobs are coordinated steps and a partial enqueue would leave the system in a half-built state.
+
+<LangTabs items={['Rust', 'Python', 'TypeScript']} groupId="atomic">
+
+```rust
+use sepp_rs::{AtomicEnqueueError, EnqueueRequest};
+
+match client
+    .enqueue_atomic([
+        EnqueueRequest::new("checkout", "reserve_seat")?,
+        EnqueueRequest::new("checkout", "charge_card")?,
+    ])
+    .await
+{
+    Ok(acks) => println!("all {} jobs enqueued", acks.len()),
+    // One or more failed validation, so none were enqueued.
+    Err(AtomicEnqueueError::Validation(errors)) => {
+        for e in errors {
+            eprintln!("job {} rejected: {}", e.index, e.rejection);
+        }
+    }
+    // Transport or protocol failure; nothing was enqueued.
+    Err(e) => return Err(e.into()),
+}
+```
+
+```python
+from sepp import EnqueueRequest, BatchValidationError
+
+try:
+    acks = await client.enqueue_atomic([
+        EnqueueRequest("checkout", "reserve_seat"),
+        EnqueueRequest("checkout", "charge_card"),
+    ])
+    print(f"all {len(acks)} jobs enqueued")
+except BatchValidationError as e:
+    # One or more failed validation, so none were enqueued.
+    for err in e.errors:
+        print(f"job {err.index} rejected: {err.rejection.message}")
+```
+
+```ts
+import { BatchValidationError, describeJobRejection } from "sepp";
+
+try {
+  const acks = await client.enqueueAtomic([
+    { queue: "checkout", jobType: "reserve_seat" },
+    { queue: "checkout", jobType: "charge_card" },
+  ]);
+  console.log(`all ${acks.length} jobs enqueued`);
+} catch (err) {
+  if (err instanceof BatchValidationError) {
+    // One or more failed validation, so none were enqueued.
+    for (const e of err.errors) {
+      console.warn(`job ${e.index} rejected: ${describeJobRejection(e.rejection)}`);
+    }
+  } else {
+    throw err; // transport or protocol failure
+  }
+}
+```
+
+</LangTabs>
+
 ## Per-job results vs whole-batch failure
+
+It helps to separate two kinds of failure. A per-job rejection is the server understanding the request and refusing one specific job; it is deterministic, so the fix is to correct that job rather than retry it. A whole-call error is a gRPC status on the entire call, the connection dropped, the deadline passed, the batch was empty or over `max_enqueue_batch`; no per-job verdicts were reached at all.
+
+The two RPCs differ only in how they treat per-job rejections. `EnqueueBatch` reports them inline, one slot at a time and still enqueues the rest. `EnqueueAtomic` treats a single rejection as a failure of the whole operation and enqueues nothing. A whole-call error looks the same for both: the call returns an error and nothing is enqueued.
+
+<Callout type="info" title="Two failures, two responses">
+A per-job rejection is deterministic: re-sending the same job fails the same way, so fix the job rather than retry it. A whole-call error is often transient, a dropped connection or a passed deadline, so backing off and retrying the batch is reasonable; with idempotency keys on the jobs, that retry is safe too.
+</Callout>
 
 ## Choosing between them
 
+Reach for `EnqueueBatch` by default: it is the throughput win for independent jobs and partial success is usually fine, just retry the few that were rejected. Reach for `EnqueueAtomic` only when the jobs belong together, the steps of one workflow, where enqueuing some but not others would be a bug.
+
+Both are far cheaper than a loop of single enqueues and both honor idempotency keys, so a batch is as safe to retry as a single enqueue.
+
+## See also
+
+- [Your first producer](/docs/get-started/first-producer): the end-to-end enqueue walkthrough.
+- [Batch & atomic enqueue](/docs/producers/batch-enqueue): the producer-side recipe in depth.
+- [Handling rejections](/docs/producers/handling-rejections): responding to per-job and whole-call failures.
+- [Idempotency & deduplication](/docs/concepts/idempotency-and-dedup): making a batch safe to retry.
