@@ -167,6 +167,7 @@ pub struct QueueDepthSnapshot {
     pub ready: HashMap<String, u64>,
     pub scheduled: HashMap<String, u64>,
     pub inflight: HashMap<String, u64>,
+    pub dead_letter: HashMap<String, u64>,
 }
 
 #[derive(Default)]
@@ -390,7 +391,18 @@ impl Metrics {
                 })
                 .build()
         };
-        vec![ready, scheduled, inflight]
+        let dead_lettered = {
+            let depths = self.queue_depths.clone();
+            meter
+                .u64_observable_gauge("sepp.queue.dead_lettered")
+                .with_callback(move |observer| {
+                    for (queue, depth) in &depths.load().dead_letter {
+                        observer.observe(*depth, &[KeyValue::new("queue", queue.clone())]);
+                    }
+                })
+                .build()
+        };
+        vec![ready, scheduled, inflight, dead_lettered]
     }
 }
 

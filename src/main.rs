@@ -5,6 +5,7 @@ use tonic::service::interceptor::InterceptedService;
 use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 
+use sepp::admin::{self, AdminState};
 use sepp::auth::ApiKeyInterceptor;
 use sepp::config::{Config, DEFAULT_CONFIG_PATH};
 use sepp::config_watch::{self, ReloadState};
@@ -98,7 +99,11 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     let registry = registry.into_shared();
     let shared_config = config.clone().into_shared();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let (reload_seq_tx, reload_seq_rx) = tokio::sync::watch::channel(0u64);
     let svc = QueueServer::new(shared_config.clone(), registry.clone(), shutdown_rx)?;
+    // QueueServiceServer::new consumes svc, so the admin UI's storage handle
+    // must be cloned out first.
+    let admin_storage = config.admin.enabled.then(|| svc.storage());
     let queue_service = QueueServiceServer::new(svc)
         .max_decoding_message_size(config.limits.max_message_bytes as usize);
     let interceptor = ApiKeyInterceptor::new(&config.auth.api_keys);
@@ -144,6 +149,7 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
             config: shared_config.clone(),
             registry: registry.clone(),
             interceptor: interceptor.clone(),
+            reload_seq: std::sync::Arc::new(reload_seq_tx),
         };
         match config_watch::spawn(watch_path.into(), state) {
             Ok(()) => info!(path = %watch_path, "watching config file for hot reload"),
@@ -151,6 +157,18 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
         }
     } else {
         debug!(path = %watch_path, "no config file on disk; hot reload disabled");
+    }
+
+    if config.admin.enabled {
+        let storage = admin_storage.expect("storage captured when admin is enabled");
+        let state = AdminState::new(
+            storage,
+            shared_config.clone(),
+            registry.clone(),
+            watch_path.into(),
+            reload_seq_rx,
+        );
+        admin::spawn(state, config.admin.listen_addr, shutdown_tx.subscribe()).await?;
     }
 
     builder

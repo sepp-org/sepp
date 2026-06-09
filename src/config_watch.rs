@@ -19,6 +19,7 @@ pub struct ReloadState {
     pub config: SharedConfig,
     pub registry: SharedRegistry,
     pub interceptor: ApiKeyInterceptor,
+    pub reload_seq: Arc<tokio::sync::watch::Sender<u64>>,
 }
 
 pub fn spawn(path: PathBuf, state: ReloadState) -> Result<(), Box<dyn Error>> {
@@ -65,6 +66,9 @@ pub fn spawn(path: PathBuf, state: ReloadState) -> Result<(), Box<dyn Error>> {
                     std::thread::sleep(DEBOUNCE);
                     while rx.try_recv().is_ok() {}
                     apply_reload(&state, &path);
+                    // Bumped even when the reload no-ops or fails, so a writer
+                    // waiting on the sequence learns its change was seen.
+                    state.reload_seq.send_modify(|n| *n += 1);
 
                     match rx.try_recv() {
                         Ok(_) => continue,
@@ -117,7 +121,7 @@ fn apply_reload(state: &ReloadState, path: &Path) {
     info!(path = %path_str, "configuration reloaded");
 }
 
-fn restart_only_changes(old: &Config, new: &Config) -> Vec<&'static str> {
+pub fn restart_only_changes(old: &Config, new: &Config) -> Vec<&'static str> {
     let mut changed = Vec::new();
 
     // Bind address, db path, and TLS are consumed once during startup wiring.
@@ -182,6 +186,16 @@ fn restart_only_changes(old: &Config, new: &Config) -> Vec<&'static str> {
         changed.push("metrics");
     }
 
+    // The admin listener is bound once at startup; keys and the session TTL
+    // are read live.
+    let (a, b) = (&old.admin, &new.admin);
+    if a.enabled != b.enabled {
+        changed.push("admin.enabled");
+    }
+    if a.listen_addr != b.listen_addr {
+        changed.push("admin.listen_addr");
+    }
+
     changed
 }
 
@@ -233,12 +247,27 @@ mod tests {
         new.limits.max_message_bytes += 1;
         new.storage.sweep_limit += 1;
         new.metrics.enabled = !new.metrics.enabled;
+        new.admin.enabled = !new.admin.enabled;
+        new.admin.listen_addr = "127.0.0.1:9999".parse().unwrap();
 
         let changed = restart_only_changes(&Config::default(), &new);
         assert!(changed.contains(&"server.db_path"));
         assert!(changed.contains(&"limits.max_message_bytes"));
         assert!(changed.contains(&"storage.sweep_limit"));
         assert!(changed.contains(&"metrics"));
+        assert!(changed.contains(&"admin.enabled"));
+        assert!(changed.contains(&"admin.listen_addr"));
+    }
+
+    #[test]
+    fn admin_keys_and_session_ttl_are_hot_reloadable() {
+        let mut new = Config::default();
+        new.admin.session_ttl_ms += 1;
+        new.admin.keys = Some(vec![crate::config::AdminKey {
+            name: "ops".into(),
+            key: "secret".into(),
+        }]);
+        assert!(restart_only_changes(&Config::default(), &new).is_empty());
     }
 
     #[test]
@@ -269,6 +298,7 @@ mod tests {
             config: Config::default().into_shared(),
             registry: QueueRegistry::from_config(&Config::default()).into_shared(),
             interceptor: ApiKeyInterceptor::new(&None),
+            reload_seq: Arc::new(tokio::sync::watch::channel(0).0),
         };
         assert!(!state.interceptor.is_enforcing());
         assert!(!state.registry.load().is_declared("emails"));

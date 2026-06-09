@@ -24,6 +24,26 @@ db_path = "./sepp-data"
 # effect regardless of this flag; strict only gates rejection of unknown names.
 strict_queues = false
 
+[admin]
+# Serve the admin web UI on its own HTTP listener, separate from the gRPC
+# server and the metrics endpoints.
+enabled = false
+
+# host:port the admin UI binds to. Binding a non-loopback address requires
+# keys below.
+listen_addr = "127.0.0.1:9465"
+
+# Named keys for admin UI logins. The browser exchanges a key for a session
+# cookie; curl can send one directly as `Authorization: Bearer <key>`. If
+# omitted, admin auth is disabled and only a loopback listen_addr is allowed.
+# Separate from worker keys in [auth].
+#keys = [
+#  { name = "ops", key = "change-me" },
+#]
+
+# How long a browser session stays valid after login. Default 12 hours.
+session_ttl_ms = 43200000
+
 [auth]
 # Primitive API key authentication. If omitted, every caller is allowed.
 # If set to a non-empty list, only those keys are accepted.

@@ -7,6 +7,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use arc_swap::ArcSwap;
 use fjall::{
     KeyspaceCreateOptions, KvSeparationOptions, PersistMode, Readable,
     SingleWriterTxDatabase as TxDatabase, SingleWriterTxKeyspace as TxKeyspace,
@@ -43,6 +44,7 @@ struct StorageParams {
     persist_mode: PersistMode,
     sweep_limit: usize,
     dead_letter_retention_ms: u64,
+    admin_enabled: bool,
 }
 
 struct Store {
@@ -180,6 +182,7 @@ impl Indexes {
             ready: self.ready.by_queue.clone(),
             scheduled: self.scheduled.by_queue.clone(),
             inflight: self.leases.by_queue.clone(),
+            dead_letter: self.dead_letter.by_queue.clone(),
         }
     }
 }
@@ -280,6 +283,62 @@ pub struct ExtendOutcome {
     pub trace_context: Option<TraceContext>,
 }
 
+#[derive(Clone, Copy)]
+pub enum PeekState {
+    Ready,
+    Scheduled,
+    Inflight,
+    DeadLetter,
+}
+
+pub struct PeekPage {
+    pub keys: Vec<Vec<u8>>,
+    pub next_cursor: Option<Vec<u8>>,
+    pub truncated: bool,
+}
+
+#[derive(Debug)]
+pub struct RequeueOutcome {
+    pub requeued: u64,
+    pub missing: u64,
+}
+
+#[derive(Debug)]
+pub struct DeleteOutcome {
+    pub deleted: u64,
+    pub missing: u64,
+}
+
+#[derive(Debug)]
+pub struct PurgeOutcome {
+    pub purged: u64,
+    pub remaining: bool,
+}
+
+#[derive(Default, Clone)]
+pub struct QueueTotals {
+    pub enqueued: u64,
+    pub reserved: u64,
+    pub acked: u64,
+    pub nacked: u64,
+    pub dead_lettered: u64,
+}
+
+#[derive(Default)]
+pub struct AdminSnapshot {
+    pub ts_ms: i64,
+    pub depths: QueueDepthSnapshot,
+    pub totals: HashMap<String, QueueTotals>,
+    // Filled in by the reader at frame-build time; the committer leaves it 0.
+    pub command_queue_len: usize,
+}
+
+const PEEK_LIMIT_MAX: usize = 100;
+const PEEK_EXAMINE_CAP: usize = 10_000;
+const PURGE_CHUNK_MAX: usize = 1000;
+const ADMIN_PUBLISH_INTERVAL: Duration = Duration::from_millis(250);
+const ADMIN_IDLE_EVICT_MS: i64 = 15 * 60 * 1000;
+
 enum Command {
     Enqueue {
         jobs: Vec<EnqueueRequest>,
@@ -309,6 +368,28 @@ enum Command {
         max: usize,
         resp: oneshot::Sender<Result<Vec<DeadLetterRecord>, Status>>,
     },
+    PeekKeys {
+        state: PeekState,
+        queue: String,
+        cursor: Option<Vec<u8>>,
+        limit: usize,
+        resp: oneshot::Sender<Result<PeekPage, Status>>,
+    },
+    RequeueDeadLetters {
+        queue: String,
+        keys: Vec<Vec<u8>>,
+        resp: oneshot::Sender<Result<RequeueOutcome, Status>>,
+    },
+    DeleteDeadLetters {
+        queue: String,
+        keys: Vec<Vec<u8>>,
+        resp: oneshot::Sender<Result<DeleteOutcome, Status>>,
+    },
+    PurgeQueueChunk {
+        queue: String,
+        max: usize,
+        resp: oneshot::Sender<Result<PurgeOutcome, Status>>,
+    },
 }
 
 enum Responder {
@@ -327,6 +408,15 @@ enum Responder {
         oneshot::Sender<Result<Vec<DeadLetterRecord>, Status>>,
         Vec<DeadLetterRecord>,
     ),
+    Requeue(
+        oneshot::Sender<Result<RequeueOutcome, Status>>,
+        RequeueOutcome,
+    ),
+    DeleteDeadLetters(
+        oneshot::Sender<Result<DeleteOutcome, Status>>,
+        DeleteOutcome,
+    ),
+    Purge(oneshot::Sender<Result<PurgeOutcome, Status>>, PurgeOutcome),
 }
 
 impl Responder {
@@ -350,6 +440,15 @@ impl Responder {
             Responder::Drain(resp, payload) => {
                 let _ = resp.send(outcome.clone().map(|()| payload));
             }
+            Responder::Requeue(resp, payload) => {
+                let _ = resp.send(outcome.clone().map(|()| payload));
+            }
+            Responder::DeleteDeadLetters(resp, payload) => {
+                let _ = resp.send(outcome.clone().map(|()| payload));
+            }
+            Responder::Purge(resp, payload) => {
+                let _ = resp.send(outcome.clone().map(|()| payload));
+            }
         }
     }
 }
@@ -357,8 +456,9 @@ impl Responder {
 struct Cycle {
     dirty: bool,
     new_ready: HashSet<String>,
-    // `None` when metrics are disabled — every recorder method becomes a no-op
-    // and we skip allocating into nine HashMaps that would never be flushed.
+    // `None` when neither metrics nor admin stats want the deltas — every
+    // recorder method becomes a no-op and we skip allocating into nine
+    // HashMaps that would never be read.
     metrics: Option<CycleMetrics>,
 }
 
@@ -456,18 +556,70 @@ fn next_deadline(indexes: &Indexes, retention_ms: u64) -> Option<i64> {
     .min()
 }
 
+fn fold_admin_totals(
+    totals: &mut HashMap<String, QueueTotals>,
+    last_active: &mut HashMap<String, i64>,
+    m: &CycleMetrics,
+) {
+    let now = now_ms();
+    let mut fold = |by_queue: &HashMap<String, u64>, pick: fn(&mut QueueTotals) -> &mut u64| {
+        for (queue, n) in by_queue {
+            *pick(totals.entry(queue.clone()).or_default()) += n;
+            last_active.insert(queue.clone(), now);
+        }
+    };
+
+    fold(&m.enqueued_by_queue, |t| &mut t.enqueued);
+    fold(&m.reserved_by_queue, |t| &mut t.reserved);
+    fold(&m.acked_by_queue, |t| &mut t.acked);
+    fold(&m.nacked_by_queue, |t| &mut t.nacked);
+
+    for ((queue, _cause), n) in &m.dead_lettered_by_queue_cause {
+        totals.entry(queue.clone()).or_default().dead_lettered += n;
+        last_active.insert(queue.clone(), now);
+    }
+}
+
+fn evict_idle_admin_totals(
+    indexes: &Indexes,
+    totals: &mut HashMap<String, QueueTotals>,
+    last_active: &mut HashMap<String, i64>,
+    now: i64,
+) {
+    totals.retain(|queue, _| {
+        last_active
+            .get(queue)
+            .is_some_and(|&at| now - at < ADMIN_IDLE_EVICT_MS)
+            || indexes.ready.by_queue.contains_key(queue)
+            || indexes.scheduled.by_queue.contains_key(queue)
+            || indexes.leases.by_queue.contains_key(queue)
+            || indexes.dead_letter.by_queue.contains_key(queue)
+    });
+    last_active.retain(|queue, _| totals.contains_key(queue));
+}
+
 fn run_committer(
     store: Store,
     mut indexes: Indexes,
     rx: flume::Receiver<Command>,
     notifiers: QueueNotifiers,
     max_sweep_interval: Duration,
+    admin_stats: Arc<ArcSwap<AdminSnapshot>>,
 ) {
     let retention_ms = store.params.dead_letter_retention_ms;
+    let mut totals: HashMap<String, QueueTotals> = HashMap::new();
+    let mut last_active: HashMap<String, i64> = HashMap::new();
+    let mut last_published: Option<std::time::Instant> = None;
     loop {
         let sweep_due = next_deadline(&indexes, retention_ms).is_some_and(|d| d <= now_ms());
         if sweep_due {
-            run_sweep_cycle(&store, &mut indexes, &notifiers);
+            let cycle_metrics = run_sweep_cycle(&store, &mut indexes, &notifiers);
+            if store.params.admin_enabled {
+                if let Some(m) = cycle_metrics {
+                    fold_admin_totals(&mut totals, &mut last_active, &m);
+                }
+                evict_idle_admin_totals(&indexes, &mut totals, &mut last_active, now_ms());
+            }
         }
 
         let first = if sweep_due {
@@ -499,11 +651,29 @@ fn run_committer(
                 rpcs.push(c);
             }
 
-            run_rpc_cycle(&store, &mut indexes, &notifiers, rpcs);
+            let cycle_metrics = run_rpc_cycle(&store, &mut indexes, &notifiers, rpcs);
+            if store.params.admin_enabled
+                && let Some(m) = cycle_metrics
+            {
+                fold_admin_totals(&mut totals, &mut last_active, &m);
+            }
         }
 
         if store.metrics.is_enabled() {
             store.metrics.set_queue_depths(indexes.snapshot());
+        }
+
+        // Runs on idle timeouts too, so a quiet server still refreshes ts_ms.
+        if store.params.admin_enabled
+            && last_published.is_none_or(|at| at.elapsed() >= ADMIN_PUBLISH_INTERVAL)
+        {
+            admin_stats.store(Arc::new(AdminSnapshot {
+                ts_ms: now_ms(),
+                depths: indexes.snapshot(),
+                totals: totals.clone(),
+                command_queue_len: 0,
+            }));
+            last_published = Some(std::time::Instant::now());
         }
     }
 
@@ -515,9 +685,9 @@ fn run_rpc_cycle(
     indexes: &mut Indexes,
     notifiers: &QueueNotifiers,
     rpcs: Vec<Command>,
-) {
+) -> Option<CycleMetrics> {
     let mut tx = store.db.write_tx();
-    let mut cycle = Cycle::new(store.metrics.is_enabled());
+    let mut cycle = Cycle::new(store.metrics.is_enabled() || store.params.admin_enabled);
     let mut responders: Vec<Responder> = Vec::with_capacity(rpcs.len());
 
     let mut rpcs = rpcs.into_iter();
@@ -538,7 +708,7 @@ fn run_rpc_cycle(
         for cmd in rpcs {
             fail_command(cmd, &status);
         }
-        return;
+        return None;
     }
 
     let outcome = if cycle.dirty {
@@ -553,18 +723,22 @@ fn run_rpc_cycle(
     for responder in responders {
         responder.respond(&outcome);
     }
-    if outcome.is_ok() {
-        if let Some(m) = &cycle.metrics {
-            store.metrics.flush_cycle(m);
-        }
-        // Must wake *after* the commit lands. tokio::Notify only delivers to
-        // waiters armed before the wake, so a wake issued pre-commit could be
-        // followed by an arm+reserve that then fails to see the new ready
-        // entry if the commit ultimately fails or is rolled back.
-        for queue in &cycle.new_ready {
-            notifiers.wake(queue);
-        }
+    if outcome.is_err() {
+        return None;
     }
+
+    if let Some(m) = &cycle.metrics {
+        store.metrics.flush_cycle(m);
+    }
+    // Must wake *after* the commit lands. tokio::Notify only delivers to
+    // waiters armed before the wake, so a wake issued pre-commit could be
+    // followed by an arm+reserve that then fails to see the new ready
+    // entry if the commit ultimately fails or is rolled back.
+    for queue in &cycle.new_ready {
+        notifiers.wake(queue);
+    }
+
+    cycle.metrics
 }
 
 // Applies one command to the cycle's shared transaction, answering business
@@ -614,6 +788,33 @@ fn apply_command(
                 Err(e) => return reject(resp, e),
             }
         }
+        // Read-only against the in-memory indexes: answered inline so it
+        // neither waits on the cycle's commit nor marks it dirty.
+        Command::PeekKeys {
+            state,
+            queue,
+            cursor,
+            limit,
+            resp,
+        } => {
+            let _ = resp.send(Ok(peek_keys(indexes, state, &queue, cursor, limit)));
+        }
+        Command::RequeueDeadLetters { queue, keys, resp } => {
+            match apply_requeue_dead_letters(store, indexes, tx, cycle, &queue, keys) {
+                Ok(outcome) => responders.push(Responder::Requeue(resp, outcome)),
+                Err(e) => return reject(resp, e),
+            }
+        }
+        Command::DeleteDeadLetters { queue, keys, resp } => {
+            let outcome = apply_delete_dead_letters(store, indexes, tx, cycle, &queue, keys);
+            responders.push(Responder::DeleteDeadLetters(resp, outcome));
+        }
+        Command::PurgeQueueChunk { queue, max, resp } => {
+            match apply_purge_queue_chunk(store, indexes, tx, cycle, &queue, max) {
+                Ok(outcome) => responders.push(Responder::Purge(resp, outcome)),
+                Err(e) => return reject(resp, e),
+            }
+        }
     }
 
     Ok(())
@@ -651,20 +852,36 @@ fn fail_command(cmd: Command, status: &Status) {
         Command::DrainDeadLetters { resp, .. } => {
             let _ = resp.send(Err(status.clone()));
         }
+        Command::PeekKeys { resp, .. } => {
+            let _ = resp.send(Err(status.clone()));
+        }
+        Command::RequeueDeadLetters { resp, .. } => {
+            let _ = resp.send(Err(status.clone()));
+        }
+        Command::DeleteDeadLetters { resp, .. } => {
+            let _ = resp.send(Err(status.clone()));
+        }
+        Command::PurgeQueueChunk { resp, .. } => {
+            let _ = resp.send(Err(status.clone()));
+        }
     }
 }
 
-fn run_sweep_cycle(store: &Store, indexes: &mut Indexes, notifiers: &QueueNotifiers) {
+fn run_sweep_cycle(
+    store: &Store,
+    indexes: &mut Indexes,
+    notifiers: &QueueNotifiers,
+) -> Option<CycleMetrics> {
     let started = std::time::Instant::now();
     let mut tx = store.db.write_tx();
-    let mut cycle = Cycle::new(store.metrics.is_enabled());
+    let mut cycle = Cycle::new(store.metrics.is_enabled() || store.params.admin_enabled);
 
     let processed = match apply_sweep(store, indexes, &mut tx, &mut cycle) {
         Ok(processed) => processed,
         Err(e) => {
             warn!(error = %e, "timer sweep aborted");
             resync(store, indexes);
-            return;
+            return None;
         }
     };
 
@@ -676,7 +893,7 @@ fn run_sweep_cycle(store: &Store, indexes: &mut Indexes, notifiers: &QueueNotifi
 
     if outcome.is_err() {
         resync(store, indexes);
-        return;
+        return None;
     }
 
     if let Some(m) = &cycle.metrics {
@@ -694,6 +911,8 @@ fn run_sweep_cycle(store: &Store, indexes: &mut Indexes, notifiers: &QueueNotifi
     } else {
         debug!(?elapsed, processed, "timer sweep");
     }
+
+    cycle.metrics
 }
 
 fn commit_and_persist(store: &Store, tx: WriteTransaction<'_>) -> Result<(), Status> {
@@ -1169,6 +1388,288 @@ fn apply_drain(
     Ok(records)
 }
 
+fn peek_keys(
+    indexes: &Indexes,
+    state: PeekState,
+    queue: &str,
+    cursor: Option<Vec<u8>>,
+    limit: usize,
+) -> PeekPage {
+    use std::ops::Bound::{Excluded, Included, Unbounded};
+
+    let limit = limit.clamp(1, PEEK_LIMIT_MAX);
+
+    // Ready keys embed the queue, so a prefix range lands exactly on the
+    // queue's entries and never needs an examined cap.
+    if let PeekState::Ready = state {
+        let prefix = queue_prefix(queue);
+        let start = match cursor {
+            Some(c) => Excluded(c),
+            None => Included(prefix.clone()),
+        };
+        let mut range = indexes
+            .ready
+            .keys
+            .range((start, Unbounded))
+            .map(|(k, _)| k)
+            .take_while(|k| k.starts_with(&prefix));
+        let keys: Vec<Vec<u8>> = range.by_ref().take(limit).cloned().collect();
+        let next_cursor = (keys.len() == limit && range.next().is_some())
+            .then(|| keys.last().cloned())
+            .flatten();
+
+        return PeekPage {
+            keys,
+            next_cursor,
+            truncated: false,
+        };
+    }
+
+    let index = match state {
+        PeekState::Scheduled => &indexes.scheduled,
+        PeekState::Inflight => &indexes.leases,
+        PeekState::DeadLetter => &indexes.dead_letter,
+        PeekState::Ready => unreachable!("handled above"),
+    };
+    let start = match cursor {
+        Some(c) => Excluded(c),
+        None => Unbounded,
+    };
+
+    let mut keys = Vec::new();
+    let mut last_examined: Option<&Vec<u8>> = None;
+    for (examined, (key, owner)) in index.keys.range((start, Unbounded)).enumerate() {
+        if examined == PEEK_EXAMINE_CAP {
+            return PeekPage {
+                keys,
+                next_cursor: last_examined.cloned(),
+                truncated: true,
+            };
+        }
+
+        if owner == queue {
+            keys.push(key.clone());
+            if keys.len() == limit {
+                return PeekPage {
+                    next_cursor: Some(key.clone()),
+                    keys,
+                    truncated: false,
+                };
+            }
+        }
+        last_examined = Some(key);
+    }
+
+    PeekPage {
+        keys,
+        next_cursor: None,
+        truncated: false,
+    }
+}
+
+fn apply_requeue_dead_letters(
+    store: &Store,
+    indexes: &mut Indexes,
+    tx: &mut WriteTransaction<'_>,
+    cycle: &mut Cycle,
+    queue: &str,
+    keys: Vec<Vec<u8>>,
+) -> Result<RequeueOutcome, Status> {
+    let now = now_ms();
+    let mut requeued = 0u64;
+    let mut missing = 0u64;
+
+    for key in keys {
+        if DeadLetterKey::queue(&key) != Some(queue) {
+            missing += 1;
+            continue;
+        }
+
+        let Some(stored) = tx.get(&store.dead_letter, &key).map_err(stg_err)? else {
+            indexes.dead_letter.remove(&key);
+            missing += 1;
+            continue;
+        };
+
+        let record = match DeadLetterRecord::decode(&*stored) {
+            Ok(record) => record,
+            Err(e) => {
+                warn!(error = %e, "requeue leaving corrupt dead-letter record in place");
+                missing += 1;
+                continue;
+            }
+        };
+        let Some(mut job) = record.job else {
+            warn!("requeue leaving dead-letter record without a job in place");
+            missing += 1;
+            continue;
+        };
+
+        // Mirror apply_enqueue: the record's job carries queue and payload
+        // inline (see maybe_store_dead_letter), but jobs/payloads store them
+        // separately and the persisted Job leaves both fields empty.
+        let job_queue = std::mem::take(&mut job.queue);
+        let payload = job.payload.take();
+        job.attempt = 1;
+        job.enqueued_at = Some(millis_to_timestamp(now));
+        job.lease_expires_at = Some(millis_to_timestamp(0));
+        job.scheduled_at = None;
+
+        tx.insert(
+            &store.jobs,
+            job.id.clone().into_bytes(),
+            JobValue {
+                queue: &job_queue,
+                job: &job,
+            }
+            .encode(),
+        );
+        if let Some(payload) = payload {
+            tx.insert(
+                &store.payloads,
+                job.id.clone().into_bytes(),
+                payload.encode_to_vec(),
+            );
+        }
+
+        let rk = ReadyKey {
+            queue: &job_queue,
+            priority: job.priority,
+            enqueued_at: now,
+            job_id: &job.id,
+        }
+        .encode();
+        tx.insert(&store.ready, rk.clone(), job.attempt.to_be_bytes().to_vec());
+        indexes.ready.insert(rk, job.attempt);
+
+        tx.remove(&store.dead_letter, key.clone());
+        indexes.dead_letter.remove(&key);
+        cycle.new_ready.insert(job_queue);
+        cycle.dirty = true;
+        requeued += 1;
+    }
+
+    Ok(RequeueOutcome { requeued, missing })
+}
+
+fn apply_delete_dead_letters(
+    store: &Store,
+    indexes: &mut Indexes,
+    tx: &mut WriteTransaction<'_>,
+    cycle: &mut Cycle,
+    queue: &str,
+    keys: Vec<Vec<u8>>,
+) -> DeleteOutcome {
+    let mut deleted = 0u64;
+    let mut missing = 0u64;
+
+    for key in keys {
+        match indexes.dead_letter.keys.get(&key) {
+            Some(owner) if owner == queue => {
+                indexes.dead_letter.remove(&key);
+                tx.remove(&store.dead_letter, key);
+                cycle.dirty = true;
+                deleted += 1;
+            }
+            _ => missing += 1,
+        }
+    }
+
+    DeleteOutcome { deleted, missing }
+}
+
+fn apply_purge_queue_chunk(
+    store: &Store,
+    indexes: &mut Indexes,
+    tx: &mut WriteTransaction<'_>,
+    cycle: &mut Cycle,
+    queue: &str,
+    max: usize,
+) -> Result<PurgeOutcome, Status> {
+    if indexes.leases.by_queue.get(queue).copied().unwrap_or(0) > 0 {
+        return Err(Status::failed_precondition("queue has in-flight jobs"));
+    }
+
+    let max = max.clamp(1, PURGE_CHUNK_MAX);
+    let mut purged = 0usize;
+
+    let prefix = queue_prefix(queue);
+    while purged < max {
+        let Some((ready_k, _)) = indexes.ready.pop_front(&prefix) else {
+            break;
+        };
+        if let Some(rk) = ReadyKey::decode(&ready_k) {
+            tx.remove(&store.jobs, rk.job_id.as_bytes().to_vec());
+            tx.remove(&store.payloads, rk.job_id.as_bytes().to_vec());
+        }
+        tx.remove(&store.ready, ready_k);
+        cycle.dirty = true;
+        purged += 1;
+    }
+
+    let chosen: Vec<Vec<u8>> = indexes
+        .scheduled
+        .keys
+        .iter()
+        .filter(|(_, q)| q.as_str() == queue)
+        .take(max - purged)
+        .map(|(k, _)| k.clone())
+        .collect();
+    for timer_k in chosen {
+        if let Some(job_id) = TimerKey::job_id(&timer_k) {
+            tx.remove(&store.jobs, job_id.to_vec());
+            tx.remove(&store.payloads, job_id.to_vec());
+        }
+        tx.remove(&store.scheduled, timer_k.clone());
+        indexes.scheduled.remove(&timer_k);
+        cycle.dirty = true;
+        purged += 1;
+    }
+
+    let chosen: Vec<Vec<u8>> = indexes
+        .dead_letter
+        .keys
+        .iter()
+        .filter(|(_, q)| q.as_str() == queue)
+        .take(max - purged)
+        .map(|(k, _)| k.clone())
+        .collect();
+    for key in chosen {
+        tx.remove(&store.dead_letter, key.clone());
+        indexes.dead_letter.remove(&key);
+        cycle.dirty = true;
+        purged += 1;
+    }
+
+    let chosen: Vec<Vec<u8>> = indexes
+        .dedup_timers
+        .keys
+        .iter()
+        .filter(|(_, q)| q.as_str() == queue)
+        .take(max - purged)
+        .map(|(k, _)| k.clone())
+        .collect();
+    for timer_k in chosen {
+        if let Some(dedup_k) = DedupTimerKey::dedup_key(&timer_k) {
+            tx.remove(&store.dedup, dedup_k.to_vec());
+        }
+        tx.remove(&store.dedup_timers, timer_k.clone());
+        indexes.dedup_timers.remove(&timer_k);
+        cycle.dirty = true;
+        purged += 1;
+    }
+
+    let remaining = indexes.ready.by_queue.contains_key(queue)
+        || indexes.scheduled.by_queue.contains_key(queue)
+        || indexes.dead_letter.by_queue.contains_key(queue)
+        || indexes.dedup_timers.by_queue.contains_key(queue);
+
+    Ok(PurgeOutcome {
+        purged: purged as u64,
+        remaining,
+    })
+}
+
 fn apply_nack(
     store: &Store,
     indexes: &mut Indexes,
@@ -1641,10 +2142,199 @@ impl Future for Armed<'_> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum AdminJobState {
+    Ready,
+    Scheduled,
+    Inflight,
+}
+
+pub struct AdminJob {
+    pub key: Vec<u8>,
+    pub state: AdminJobState,
+    pub job: Job,
+}
+
+pub struct AdminDeadLetter {
+    pub key: Vec<u8>,
+    pub record: DeadLetterRecord,
+}
+
+// Point-get-only view of the database for admin reads off the committer
+// thread. Methods are sync (callers wrap them in spawn_blocking) and peeked
+// keys can vanish between peek and resolve, so misses are silently skipped.
+#[derive(Clone)]
+pub struct ReadHandle {
+    db: TxDatabase,
+    jobs: TxKeyspace,
+    payloads: TxKeyspace,
+    inflight: TxKeyspace,
+    ready: TxKeyspace,
+    scheduled: TxKeyspace,
+    dead_letter: TxKeyspace,
+}
+
+impl ReadHandle {
+    fn load_job(&self, snap: &impl Readable, job_id: &str) -> Option<Job> {
+        let stored = snap.get(&self.jobs, job_id.as_bytes()).ok().flatten()?;
+        let (queue, mut job) = JobValue::decode(&stored).ok()?;
+        job.queue = queue;
+        if let Some(bytes) = snap.get(&self.payloads, job_id.as_bytes()).ok().flatten() {
+            job.payload = Payload::decode(&*bytes).ok();
+        }
+
+        Some(job)
+    }
+
+    pub fn resolve_ready(&self, keys: &[Vec<u8>]) -> Vec<AdminJob> {
+        let snap = self.db.read_tx();
+        keys.iter()
+            .filter_map(|key| {
+                let job_id = ReadyKey::decode(key)?.job_id.to_owned();
+                let attempt = snap
+                    .get(&self.ready, key)
+                    .ok()
+                    .flatten()
+                    .and_then(|v| v.first_chunk::<4>().map(|b| u32::from_be_bytes(*b)))?;
+                let mut job = self.load_job(&snap, &job_id)?;
+                job.attempt = attempt;
+
+                Some(AdminJob {
+                    key: key.clone(),
+                    state: AdminJobState::Ready,
+                    job,
+                })
+            })
+            .collect()
+    }
+
+    pub fn resolve_scheduled(&self, keys: &[Vec<u8>]) -> Vec<AdminJob> {
+        let snap = self.db.read_tx();
+        keys.iter()
+            .filter_map(|key| {
+                let job_id = std::str::from_utf8(TimerKey::job_id(key)?).ok()?;
+                let attempt = snap
+                    .get(&self.scheduled, key)
+                    .ok()
+                    .flatten()
+                    .and_then(|v| v.first_chunk::<4>().map(|b| u32::from_be_bytes(*b)))?;
+                let mut job = self.load_job(&snap, job_id)?;
+                job.attempt = attempt;
+
+                Some(AdminJob {
+                    key: key.clone(),
+                    state: AdminJobState::Scheduled,
+                    job,
+                })
+            })
+            .collect()
+    }
+
+    pub fn resolve_inflight(&self, keys: &[Vec<u8>]) -> Vec<AdminJob> {
+        let snap = self.db.read_tx();
+        keys.iter()
+            .filter_map(|key| {
+                let job_id = std::str::from_utf8(TimerKey::job_id(key)?).ok()?;
+                let stored = snap.get(&self.inflight, job_id.as_bytes()).ok().flatten()?;
+                let inflight = Inflight::decode(&stored).ok()?;
+                // A peeked lease key goes stale when the job is extended or
+                // re-reserved; only the key matching the live lease counts.
+                if inflight.lease_expires_at != deadline_of(key) {
+                    return None;
+                }
+                let mut job = self.load_job(&snap, job_id)?;
+                job.attempt = inflight.attempt;
+                job.lease_expires_at = Some(millis_to_timestamp(inflight.lease_expires_at));
+
+                Some(AdminJob {
+                    key: key.clone(),
+                    state: AdminJobState::Inflight,
+                    job,
+                })
+            })
+            .collect()
+    }
+
+    pub fn resolve_dead_letters(&self, keys: &[Vec<u8>]) -> Vec<AdminDeadLetter> {
+        let snap = self.db.read_tx();
+        keys.iter()
+            .filter_map(|key| {
+                let stored = snap.get(&self.dead_letter, key).ok().flatten()?;
+                // The record embeds the job and its payload (see
+                // maybe_store_dead_letter); no further lookups needed.
+                let record = DeadLetterRecord::decode(&*stored).ok()?;
+
+                Some(AdminDeadLetter {
+                    key: key.clone(),
+                    record,
+                })
+            })
+            .collect()
+    }
+
+    pub fn get_job(&self, job_id: &str) -> Option<AdminJob> {
+        let snap = self.db.read_tx();
+        let inflight = snap
+            .get(&self.inflight, job_id.as_bytes())
+            .ok()
+            .flatten()
+            .and_then(|stored| Inflight::decode(&stored).ok());
+
+        let mut job = self.load_job(&snap, job_id)?;
+        if let Some(inflight) = inflight {
+            job.attempt = inflight.attempt;
+            job.lease_expires_at = Some(millis_to_timestamp(inflight.lease_expires_at));
+            let key = TimerKey {
+                deadline: inflight.lease_expires_at,
+                job_id,
+            }
+            .encode();
+
+            return Some(AdminJob {
+                key,
+                state: AdminJobState::Inflight,
+                job,
+            });
+        }
+
+        // Keys are reconstructed best-effort: a nack-retry's timer deadline
+        // is not recoverable from the job record, so such jobs report Ready.
+        let scheduled_at = job.scheduled_at.as_ref().map(timestamp_to_millis);
+        let (state, key) = match scheduled_at {
+            Some(at) if at > now_ms() => (
+                AdminJobState::Scheduled,
+                TimerKey {
+                    deadline: at,
+                    job_id,
+                }
+                .encode(),
+            ),
+            _ => (
+                AdminJobState::Ready,
+                ReadyKey {
+                    queue: &job.queue,
+                    priority: job.priority,
+                    enqueued_at: job
+                        .enqueued_at
+                        .as_ref()
+                        .map(timestamp_to_millis)
+                        .unwrap_or(0),
+                    job_id,
+                }
+                .encode(),
+            ),
+        };
+
+        Some(AdminJob { key, state, job })
+    }
+}
+
 #[derive(Clone)]
 pub struct Storage {
     tx: flume::Sender<Command>,
     notifiers: QueueNotifiers,
+    read: ReadHandle,
+    admin_stats: Arc<ArcSwap<AdminSnapshot>>,
 }
 
 impl Storage {
@@ -1680,6 +2370,7 @@ impl Storage {
             },
             sweep_limit: config.storage.sweep_limit,
             dead_letter_retention_ms: config.storage.dead_letter_retention_ms,
+            admin_enabled: config.admin.enabled,
         };
 
         if matches!(
@@ -1715,6 +2406,16 @@ impl Storage {
             registry,
             metrics,
         };
+        let read = ReadHandle {
+            db: store.db.clone(),
+            jobs: store.jobs.clone(),
+            payloads: store.payloads.clone(),
+            inflight: store.inflight.clone(),
+            ready: store.ready.clone(),
+            scheduled: store.scheduled.clone(),
+            dead_letter: store.dead_letter.clone(),
+        };
+        let admin_stats = Arc::new(ArcSwap::from_pointee(AdminSnapshot::default()));
         let indexes = rebuild_indexes(&store)?;
 
         if config.server.strict_queues {
@@ -1728,7 +2429,17 @@ impl Storage {
             .name("sepp-committer".to_string())
             .spawn({
                 let notifiers = notifiers.clone();
-                move || run_committer(store, indexes, rx, notifiers, max_sweep_interval)
+                let admin_stats = Arc::clone(&admin_stats);
+                move || {
+                    run_committer(
+                        store,
+                        indexes,
+                        rx,
+                        notifiers,
+                        max_sweep_interval,
+                        admin_stats,
+                    )
+                }
             })
             .expect("failed to spawn committer thread");
 
@@ -1742,11 +2453,24 @@ impl Storage {
             "storage opened",
         );
 
-        Ok(Self { tx, notifiers })
+        Ok(Self {
+            tx,
+            notifiers,
+            read,
+            admin_stats,
+        })
     }
 
     pub fn command_queue_depth(&self) -> usize {
         self.tx.len()
+    }
+
+    pub fn read_handle(&self) -> ReadHandle {
+        self.read.clone()
+    }
+
+    pub fn admin_stats(&self) -> Arc<ArcSwap<AdminSnapshot>> {
+        Arc::clone(&self.admin_stats)
     }
 
     pub fn job_waiter(&self, queues: &[String]) -> JobWaiter {
@@ -1808,6 +2532,50 @@ impl Storage {
         max: usize,
     ) -> Result<Vec<DeadLetterRecord>, Status> {
         self.send(|resp| Command::DrainDeadLetters { queue, max, resp })
+            .await?
+    }
+
+    pub async fn peek_keys(
+        &self,
+        state: PeekState,
+        queue: String,
+        cursor: Option<Vec<u8>>,
+        limit: usize,
+    ) -> Result<PeekPage, Status> {
+        self.send(|resp| Command::PeekKeys {
+            state,
+            queue,
+            cursor,
+            limit,
+            resp,
+        })
+        .await?
+    }
+
+    pub async fn requeue_dead_letters(
+        &self,
+        queue: String,
+        keys: Vec<Vec<u8>>,
+    ) -> Result<RequeueOutcome, Status> {
+        self.send(|resp| Command::RequeueDeadLetters { queue, keys, resp })
+            .await?
+    }
+
+    pub async fn delete_dead_letters(
+        &self,
+        queue: String,
+        keys: Vec<Vec<u8>>,
+    ) -> Result<DeleteOutcome, Status> {
+        self.send(|resp| Command::DeleteDeadLetters { queue, keys, resp })
+            .await?
+    }
+
+    pub async fn purge_queue_chunk(
+        &self,
+        queue: String,
+        max: usize,
+    ) -> Result<PurgeOutcome, Status> {
+        self.send(|resp| Command::PurgeQueueChunk { queue, max, resp })
             .await?
     }
 }
@@ -2080,5 +2848,146 @@ mod tests {
         assert_eq!(idx.by_queue.get("qa").copied(), Some(1));
         idx.pop_front(&queue_prefix("qa"));
         assert_eq!(idx.by_queue.get("qa").copied(), None);
+    }
+
+    #[test]
+    fn peek_keys_pages_ready_with_a_cursor() {
+        let mut indexes = Indexes::default();
+        for i in 0..5i64 {
+            indexes
+                .ready
+                .insert(ready_key("q", 5, 100 + i, &format!("j{i}")), 1);
+        }
+        indexes.ready.insert(ready_key("other", 5, 100, "x"), 1);
+
+        let mut seen = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = peek_keys(&indexes, PeekState::Ready, "q", cursor, 2);
+            assert!(!page.truncated);
+            assert!(page.keys.len() <= 2);
+            seen.extend(page.keys);
+            match page.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+
+        let expected: Vec<Vec<u8>> = (0..5i64)
+            .map(|i| ready_key("q", 5, 100 + i, &format!("j{i}")))
+            .collect();
+        assert_eq!(seen, expected, "pages walk every key once, in order");
+    }
+
+    #[test]
+    fn peek_keys_truncates_at_the_examined_cap() {
+        let mut indexes = Indexes::default();
+        for i in 0..PEEK_EXAMINE_CAP as i64 {
+            indexes
+                .dead_letter
+                .insert(dead_letter_key(i, "noise", b"j"), "noise");
+        }
+        let wanted = dead_letter_key(PEEK_EXAMINE_CAP as i64, "wanted", b"j");
+        indexes.dead_letter.insert(wanted.clone(), "wanted");
+
+        let page = peek_keys(&indexes, PeekState::DeadLetter, "wanted", None, 10);
+        assert!(page.truncated, "the cap hits before the page fills");
+        assert!(page.keys.is_empty());
+        let cursor = page
+            .next_cursor
+            .expect("a truncated page carries a resume cursor");
+
+        let resumed = peek_keys(&indexes, PeekState::DeadLetter, "wanted", Some(cursor), 10);
+        assert!(!resumed.truncated);
+        assert_eq!(resumed.keys, vec![wanted]);
+        assert_eq!(resumed.next_cursor, None);
+    }
+
+    #[test]
+    fn admin_totals_fold_only_the_five_rpc_counters() {
+        let mut m = CycleMetrics::default();
+        m.enqueued_by_queue.insert("qa".into(), 3);
+        m.reserved_by_queue.insert("qa".into(), 2);
+        m.acked_by_queue.insert("qa".into(), 1);
+        m.nacked_by_queue.insert("qb".into(), 4);
+        m.dead_lettered_by_queue_cause
+            .insert(("qb".into(), "rejected"), 1);
+        m.dead_lettered_by_queue_cause
+            .insert(("qb".into(), "attempts_exhausted"), 2);
+        m.sweep_promotions_by_queue.insert("qc".into(), 9);
+
+        let mut totals = HashMap::new();
+        let mut last_active = HashMap::new();
+        fold_admin_totals(&mut totals, &mut last_active, &m);
+        fold_admin_totals(&mut totals, &mut last_active, &m);
+
+        let qa = &totals["qa"];
+        assert_eq!(
+            (
+                qa.enqueued,
+                qa.reserved,
+                qa.acked,
+                qa.nacked,
+                qa.dead_lettered
+            ),
+            (6, 4, 2, 0, 0)
+        );
+        let qb = &totals["qb"];
+        assert_eq!((qb.nacked, qb.dead_lettered), (8, 6), "causes are summed");
+        assert!(
+            !totals.contains_key("qc"),
+            "sweep counters do not feed totals"
+        );
+        assert!(last_active.contains_key("qa") && last_active.contains_key("qb"));
+    }
+
+    fn open_test_store() -> Store {
+        let path = std::env::temp_dir().join(format!("sepp-storage-test-{}", Uuid::new_v4()));
+        let db = TxDatabase::builder(path)
+            .temporary(true)
+            .open()
+            .expect("open temporary db");
+        let opts = KeyspaceCreateOptions::default;
+
+        Store {
+            jobs: db.keyspace("jobs", opts).unwrap(),
+            payloads: db.keyspace("payloads", opts).unwrap(),
+            inflight: db.keyspace("inflight", opts).unwrap(),
+            ready: db.keyspace("ready", opts).unwrap(),
+            dedup: db.keyspace("dedup", opts).unwrap(),
+            dedup_timers: db.keyspace("dedup_timers", opts).unwrap(),
+            scheduled: db.keyspace("scheduled", opts).unwrap(),
+            leases: db.keyspace("leases", opts).unwrap(),
+            dead_letter: db.keyspace("dead_letter", opts).unwrap(),
+            db,
+            params: StorageParams {
+                persist_mode: PersistMode::Buffer,
+                sweep_limit: 1000,
+                dead_letter_retention_ms: 0,
+                admin_enabled: true,
+            },
+            registry: crate::queues::QueueRegistry::from_config(&Config::default()).into_shared(),
+            metrics: Metrics::new(false),
+        }
+    }
+
+    #[test]
+    fn purge_refuses_while_jobs_are_inflight() {
+        let store = open_test_store();
+        let mut indexes = Indexes::default();
+        indexes.leases.insert(timer_key(500, "j1"), "q");
+
+        let mut tx = store.db.write_tx();
+        let mut cycle = Cycle::new(false);
+        let err = apply_purge_queue_chunk(&store, &mut indexes, &mut tx, &mut cycle, "q", 100)
+            .expect_err("in-flight jobs must block a purge");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(!cycle.dirty, "a refused purge writes nothing");
+
+        indexes.leases.remove(&timer_key(500, "j1"));
+        let outcome = apply_purge_queue_chunk(&store, &mut indexes, &mut tx, &mut cycle, "q", 100)
+            .expect("an idle queue purges");
+        assert_eq!(outcome.purged, 0);
+        assert!(!outcome.remaining);
     }
 }

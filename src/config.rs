@@ -347,6 +347,34 @@ impl Default for MetricsConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AdminConfig {
+    pub enabled: bool,
+    pub listen_addr: SocketAddr,
+    // None = auth disabled; only allowed on a loopback listen_addr.
+    pub keys: Option<Vec<AdminKey>>,
+    pub session_ttl_ms: u64,
+}
+
+impl Default for AdminConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen_addr: SocketAddr::from(([127, 0, 0, 1], 9465)),
+            keys: None,
+            session_ttl_ms: 12 * 60 * 60 * 1000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminKey {
+    pub name: String,
+    pub key: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -357,6 +385,7 @@ pub struct Config {
     pub logging: LoggingConfig,
     pub tracing: TracingConfig,
     pub metrics: MetricsConfig,
+    pub admin: AdminConfig,
     pub queues: Vec<QueueConfig>,
 }
 
@@ -374,9 +403,17 @@ impl Config {
             return Err(format!("config file not found: {path}").into());
         }
 
+        Self::extract(Toml::file(path))
+    }
+
+    pub fn from_toml_str(toml: &str) -> Result<Self, Box<dyn Error>> {
+        Self::extract(Toml::string(toml))
+    }
+
+    fn extract(toml: impl figment::Provider) -> Result<Self, Box<dyn Error>> {
         let config: Config = Figment::new()
             .merge(Serialized::defaults(Config::default()))
-            .merge(Toml::file(path))
+            .merge(toml)
             .merge(Env::prefixed("SEPP_").split("__"))
             .extract()?;
         config.validate()?;
@@ -424,6 +461,13 @@ impl Config {
             if self.metrics.export_interval_ms == 0 {
                 return Err("metrics.export_interval_ms must be > 0".into());
             }
+        }
+
+        if self.admin.enabled
+            && !self.admin.listen_addr.ip().is_loopback()
+            && self.admin.keys.is_none()
+        {
+            return Err("admin UI on a non-loopback address requires [admin] keys".into());
         }
 
         let defaults = EffectiveLimits::from_globals(&self.limits, &self.storage);
@@ -624,6 +668,36 @@ mod tests {
         assert!(
             cfg.validate().is_err(),
             "garde range(min = 1) rejects a zero batch cap"
+        );
+    }
+
+    #[test]
+    fn admin_on_non_loopback_requires_keys() {
+        let mut cfg = Config::default();
+        cfg.admin.enabled = true;
+        cfg.admin.listen_addr = SocketAddr::from(([0, 0, 0, 0], 9465));
+        assert!(
+            cfg.validate().is_err(),
+            "a non-loopback admin bind without keys must be rejected"
+        );
+
+        cfg.admin.keys = Some(vec![AdminKey {
+            name: "ops".into(),
+            key: "secret".into(),
+        }]);
+        assert!(cfg.validate().is_ok());
+
+        let mut loopback = Config::default();
+        loopback.admin.enabled = true;
+        assert!(loopback.validate().is_ok(), "loopback admin needs no keys");
+    }
+
+    #[test]
+    fn from_toml_str_validates_like_load() {
+        assert!(Config::from_toml_str("").is_ok());
+        assert!(
+            Config::from_toml_str("[admin]\nenabled = true\nlisten_addr = \"0.0.0.0:9465\"\n")
+                .is_err()
         );
     }
 

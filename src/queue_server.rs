@@ -22,7 +22,7 @@ use tokio::time::{Instant, sleep_until};
 use tonic::{Request, Response, Status};
 use tracing::Instrument;
 
-struct ServerLimits {
+pub(crate) struct ServerLimits {
     max_reserve_batch: u32,
     max_reserve_queues: u32,
     max_wait_timeout_ms: u64,
@@ -33,7 +33,7 @@ struct ServerLimits {
 }
 
 impl ServerLimits {
-    fn from_config(c: &Config) -> Self {
+    pub(crate) fn from_config(c: &Config) -> Self {
         Self {
             max_reserve_batch: c.limits.max_reserve_batch,
             max_reserve_queues: c.limits.max_reserve_queues,
@@ -88,149 +88,8 @@ impl QueueServer {
         })
     }
 
-    fn check_enqueue_limits(
-        &self,
-        job: &EnqueueRequest,
-        limits: &EffectiveLimits,
-        server: &ServerLimits,
-    ) -> Result<(), pb::JobRejection> {
-        use pb::job_rejection::Reason;
-        let s = server;
-
-        if job.queue.len() > s.max_queue_name_bytes as usize {
-            return Err(pb::JobRejection {
-                reason: Some(Reason::QueueNameTooLong(pb::QueueNameTooLong {
-                    limit: s.max_queue_name_bytes,
-                    actual: job.queue.len() as u64,
-                })),
-            });
-        }
-
-        if job.job_type.len() > s.max_job_type_bytes as usize {
-            return Err(pb::JobRejection {
-                reason: Some(Reason::JobTypeNameTooLong(pb::JobTypeNameTooLong {
-                    limit: s.max_job_type_bytes,
-                    actual: job.job_type.len() as u64,
-                })),
-            });
-        }
-
-        if let Some(allowed) = &limits.allowed_job_types
-            && !allowed.iter().any(|t| t == &job.job_type)
-        {
-            return Err(pb::JobRejection {
-                reason: Some(Reason::JobTypeNotAllowed(pb::JobTypeNotAllowed {
-                    job_type: job.job_type.clone(),
-                    allowed: allowed.clone(),
-                })),
-            });
-        }
-
-        if let Some(key) = &job.idempotency_key
-            && key.len() > s.max_idempotency_key_bytes as usize
-        {
-            return Err(pb::JobRejection {
-                reason: Some(Reason::IdempotencyKeyTooLong(pb::IdempotencyKeyTooLong {
-                    limit: s.max_idempotency_key_bytes,
-                    actual: key.len() as u64,
-                })),
-            });
-        }
-
-        if let Some(payload) = &job.payload
-            && payload.data.len() as u64 > limits.max_payload_bytes
-        {
-            return Err(pb::JobRejection {
-                reason: Some(Reason::PayloadTooLarge(pb::PayloadTooLarge {
-                    limit: limits.max_payload_bytes,
-                    actual: payload.data.len() as u64,
-                })),
-            });
-        }
-
-        if let Some(payload) = &job.payload
-            && let Some(allowed) = &limits.allowed_encodings
-            && !allowed.iter().any(|e| e == &payload.encoding)
-        {
-            return Err(pb::JobRejection {
-                reason: Some(Reason::EncodingNotAllowed(pb::EncodingNotAllowed {
-                    encoding: payload.encoding.clone(),
-                    allowed: allowed.clone(),
-                })),
-            });
-        }
-
-        if job.custom.len() as u64 > limits.max_custom_entries as u64 {
-            return Err(pb::JobRejection {
-                reason: Some(Reason::CustomEntriesTooMany(pb::CustomEntriesTooMany {
-                    limit: limits.max_custom_entries,
-                    actual: job.custom.len() as u32,
-                })),
-            });
-        }
-
-        let mut custom_bytes: u64 = 0;
-        for (key, value) in &job.custom {
-            if key.len() as u64 > limits.max_custom_key_bytes as u64 {
-                return Err(pb::JobRejection {
-                    reason: Some(Reason::CustomKeyTooLong(pb::CustomKeyTooLong {
-                        key: key.clone(),
-                        limit: limits.max_custom_key_bytes,
-                        actual: key.len() as u64,
-                    })),
-                });
-            }
-            custom_bytes += key.len() as u64 + primitive_value_bytes(value);
-        }
-
-        if custom_bytes > limits.max_custom_total_bytes {
-            return Err(pb::JobRejection {
-                reason: Some(Reason::CustomMapTooLarge(pb::CustomMapTooLarge {
-                    limit: limits.max_custom_total_bytes,
-                    actual: custom_bytes,
-                })),
-            });
-        }
-
-        if let Some(at) = &job.scheduled_at
-            && timestamp_to_millis(at)
-                > now_ms().saturating_add(limits.max_schedule_horizon_ms as i64)
-        {
-            return Err(pb::JobRejection {
-                reason: Some(Reason::ScheduledTooFar(pb::ScheduledTooFar {
-                    horizon: Some(millis_to_duration(limits.max_schedule_horizon_ms)),
-                    actual: Some(*at),
-                })),
-            });
-        }
-
-        Ok(())
-    }
-
-    fn classify_enqueue(
-        &self,
-        job: &EnqueueRequest,
-        registry: &QueueRegistry,
-        strict_queues: bool,
-        server: &ServerLimits,
-    ) -> Result<(), pb::JobRejection> {
-        use pb::job_rejection::Reason;
-        if let Err(message) = validate::enqueue_request(job) {
-            return Err(pb::JobRejection {
-                reason: Some(Reason::InvalidRequest(pb::InvalidRequest { message })),
-            });
-        }
-
-        if strict_queues && !registry.is_declared(&job.queue) {
-            return Err(pb::JobRejection {
-                reason: Some(Reason::UnknownQueue(pb::UnknownQueue {
-                    queue: job.queue.clone(),
-                })),
-            });
-        }
-
-        let limits = registry.effective(&job.queue);
-        self.check_enqueue_limits(job, &limits, server)
+    pub fn storage(&self) -> Storage {
+        self.storage.clone()
     }
 
     async fn commit_validated(
@@ -255,6 +114,151 @@ impl QueueServer {
     }
 }
 
+// Free functions rather than methods so the admin HTTP enqueue route shares
+// the exact validation pipeline of the gRPC path.
+fn check_enqueue_limits(
+    job: &EnqueueRequest,
+    limits: &EffectiveLimits,
+    server: &ServerLimits,
+) -> Result<(), pb::JobRejection> {
+    use pb::job_rejection::Reason;
+    let s = server;
+
+    if job.queue.len() > s.max_queue_name_bytes as usize {
+        return Err(pb::JobRejection {
+            reason: Some(Reason::QueueNameTooLong(pb::QueueNameTooLong {
+                limit: s.max_queue_name_bytes,
+                actual: job.queue.len() as u64,
+            })),
+        });
+    }
+
+    if job.job_type.len() > s.max_job_type_bytes as usize {
+        return Err(pb::JobRejection {
+            reason: Some(Reason::JobTypeNameTooLong(pb::JobTypeNameTooLong {
+                limit: s.max_job_type_bytes,
+                actual: job.job_type.len() as u64,
+            })),
+        });
+    }
+
+    if let Some(allowed) = &limits.allowed_job_types
+        && !allowed.iter().any(|t| t == &job.job_type)
+    {
+        return Err(pb::JobRejection {
+            reason: Some(Reason::JobTypeNotAllowed(pb::JobTypeNotAllowed {
+                job_type: job.job_type.clone(),
+                allowed: allowed.clone(),
+            })),
+        });
+    }
+
+    if let Some(key) = &job.idempotency_key
+        && key.len() > s.max_idempotency_key_bytes as usize
+    {
+        return Err(pb::JobRejection {
+            reason: Some(Reason::IdempotencyKeyTooLong(pb::IdempotencyKeyTooLong {
+                limit: s.max_idempotency_key_bytes,
+                actual: key.len() as u64,
+            })),
+        });
+    }
+
+    if let Some(payload) = &job.payload
+        && payload.data.len() as u64 > limits.max_payload_bytes
+    {
+        return Err(pb::JobRejection {
+            reason: Some(Reason::PayloadTooLarge(pb::PayloadTooLarge {
+                limit: limits.max_payload_bytes,
+                actual: payload.data.len() as u64,
+            })),
+        });
+    }
+
+    if let Some(payload) = &job.payload
+        && let Some(allowed) = &limits.allowed_encodings
+        && !allowed.iter().any(|e| e == &payload.encoding)
+    {
+        return Err(pb::JobRejection {
+            reason: Some(Reason::EncodingNotAllowed(pb::EncodingNotAllowed {
+                encoding: payload.encoding.clone(),
+                allowed: allowed.clone(),
+            })),
+        });
+    }
+
+    if job.custom.len() as u64 > limits.max_custom_entries as u64 {
+        return Err(pb::JobRejection {
+            reason: Some(Reason::CustomEntriesTooMany(pb::CustomEntriesTooMany {
+                limit: limits.max_custom_entries,
+                actual: job.custom.len() as u32,
+            })),
+        });
+    }
+
+    let mut custom_bytes: u64 = 0;
+    for (key, value) in &job.custom {
+        if key.len() as u64 > limits.max_custom_key_bytes as u64 {
+            return Err(pb::JobRejection {
+                reason: Some(Reason::CustomKeyTooLong(pb::CustomKeyTooLong {
+                    key: key.clone(),
+                    limit: limits.max_custom_key_bytes,
+                    actual: key.len() as u64,
+                })),
+            });
+        }
+        custom_bytes += key.len() as u64 + primitive_value_bytes(value);
+    }
+
+    if custom_bytes > limits.max_custom_total_bytes {
+        return Err(pb::JobRejection {
+            reason: Some(Reason::CustomMapTooLarge(pb::CustomMapTooLarge {
+                limit: limits.max_custom_total_bytes,
+                actual: custom_bytes,
+            })),
+        });
+    }
+
+    if let Some(at) = &job.scheduled_at
+        && timestamp_to_millis(at)
+            > now_ms().saturating_add(limits.max_schedule_horizon_ms as i64)
+    {
+        return Err(pb::JobRejection {
+            reason: Some(Reason::ScheduledTooFar(pb::ScheduledTooFar {
+                horizon: Some(millis_to_duration(limits.max_schedule_horizon_ms)),
+                actual: Some(*at),
+            })),
+        });
+    }
+
+    Ok(())
+}
+
+pub(crate) fn classify_enqueue(
+    job: &EnqueueRequest,
+    registry: &QueueRegistry,
+    strict_queues: bool,
+    server: &ServerLimits,
+) -> Result<(), pb::JobRejection> {
+    use pb::job_rejection::Reason;
+    if let Err(message) = validate::enqueue_request(job) {
+        return Err(pb::JobRejection {
+            reason: Some(Reason::InvalidRequest(pb::InvalidRequest { message })),
+        });
+    }
+
+    if strict_queues && !registry.is_declared(&job.queue) {
+        return Err(pb::JobRejection {
+            reason: Some(Reason::UnknownQueue(pb::UnknownQueue {
+                queue: job.queue.clone(),
+            })),
+        });
+    }
+
+    let limits = registry.effective(&job.queue);
+    check_enqueue_limits(job, &limits, server)
+}
+
 // Record the distinct queues and job types a batch touched. For the common
 // single-job batch these collapse to the one queue and job type; for a fan-out
 // batch they give the full set without per-job cardinality blowup (the batch is
@@ -277,8 +281,8 @@ fn nack_strategy_label(req: &NackRequest) -> &'static str {
     }
 }
 
-// For metrics
-fn rejection_label(rejection: &pb::JobRejection) -> &'static str {
+// For metrics and the admin enqueue route's rejection reason.
+pub(crate) fn rejection_label(rejection: &pb::JobRejection) -> &'static str {
     use pb::job_rejection::Reason;
     match rejection
         .reason
@@ -363,7 +367,7 @@ impl QueueService for QueueServer {
             let mut valid = Vec::new();
             let mut slots: Vec<Option<JobResult>> = Vec::with_capacity(req.jobs.len());
             for job in req.jobs {
-                match self.classify_enqueue(&job, &registry, strict_queues, &server_limits) {
+                match classify_enqueue(&job, &registry, strict_queues, &server_limits) {
                     Ok(()) => {
                         slots.push(None);
                         valid.push(job);
@@ -465,7 +469,7 @@ impl QueueService for QueueServer {
             let mut errors: Vec<pb::JobValidationError> = Vec::new();
             let mut valid: Vec<EnqueueRequest> = Vec::with_capacity(req.jobs.len());
             for (index, job) in req.jobs.into_iter().enumerate() {
-                match self.classify_enqueue(&job, &registry, strict_queues, &server_limits) {
+                match classify_enqueue(&job, &registry, strict_queues, &server_limits) {
                     Ok(()) => valid.push(job),
                     Err(rejection) => {
                         let label = rejection_label(&rejection);
