@@ -17,6 +17,7 @@ use std::{time::Duration, time::Instant as StdInstant};
 use opentelemetry::metrics::ObservableGauge;
 
 use crate::validate;
+use tokio::sync::watch;
 use tokio::time::{Instant, sleep_until};
 use tonic::{Request, Response, Status};
 use tracing::Instrument;
@@ -51,6 +52,7 @@ pub struct QueueServer {
     config: SharedConfig,
     dead_letter_retention_enabled: bool,
     metrics: Metrics,
+    shutdown: watch::Receiver<bool>,
     _command_queue_gauge: ObservableGauge<u64>,
     _queue_depth_gauges: Vec<ObservableGauge<u64>>,
 }
@@ -59,6 +61,7 @@ impl QueueServer {
     pub fn new(
         config: SharedConfig,
         registry: SharedRegistry,
+        shutdown: watch::Receiver<bool>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let (storage, metrics, dead_letter_retention_enabled) = {
             let cfg = config.load();
@@ -79,6 +82,7 @@ impl QueueServer {
             config,
             dead_letter_retention_enabled,
             metrics,
+            shutdown,
             _command_queue_gauge: command_queue_gauge,
             _queue_depth_gauges: queue_depth_gauges,
         })
@@ -608,6 +612,7 @@ impl QueueService for QueueServer {
                 .min(server_limits.max_wait_timeout_ms);
             let deadline = Instant::now() + Duration::from_millis(wait);
             let waiter = self.storage.job_waiter(&req.queues);
+            let mut shutdown = self.shutdown.clone();
 
             let span = tracing::Span::current();
             span.record("lease_ms", lease);
@@ -663,8 +668,23 @@ impl QueueService for QueueServer {
                     return Ok(Response::new(ReserveResponse { jobs: Vec::new() }));
                 }
 
+                // A clone made after the shutdown flag flipped has already
+                // seen it, so changed() below would never fire.
+                if *shutdown.borrow() {
+                    span.record("job_count", 0u64);
+                    span.record("timed_out", false);
+
+                    return Ok(Response::new(ReserveResponse { jobs: Vec::new() }));
+                }
+
                 tokio::select! {
                     _ = armed => {}
+                    _ = shutdown.changed() => {
+                        span.record("job_count", 0u64);
+                        span.record("timed_out", false);
+
+                        return Ok(Response::new(ReserveResponse { jobs: Vec::new() }));
+                    }
                     _ = sleep_until(deadline) => {
                         span.record("job_count", 0u64);
                         span.record("timed_out", true);

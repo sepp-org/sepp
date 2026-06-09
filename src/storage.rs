@@ -520,64 +520,25 @@ fn run_rpc_cycle(
     let mut cycle = Cycle::new(store.metrics.is_enabled());
     let mut responders: Vec<Responder> = Vec::with_capacity(rpcs.len());
 
-    for cmd in rpcs {
-        match cmd {
-            Command::Enqueue { jobs, resp } => {
-                match apply_enqueue(store, indexes, &mut tx, &mut cycle, jobs) {
-                    Ok(enqueued) => responders.push(Responder::Enqueue(resp, enqueued)),
-                    Err(e) => {
-                        let _ = resp.send(Err(e));
-                    }
-                }
-            }
-            Command::Reserve {
-                queues,
-                lease_ms,
-                max_jobs,
-                resp,
-            } => match apply_reserve(
-                store, indexes, &mut tx, &mut cycle, &queues, lease_ms, max_jobs,
-            ) {
-                Ok(jobs) => responders.push(Responder::Reserve(resp, jobs)),
-                Err(e) => {
-                    let _ = resp.send(Err(e));
-                }
-            },
-            Command::Ack {
-                job_id,
-                attempt,
-                resp,
-            } => match apply_ack(store, indexes, &mut tx, &mut cycle, &job_id, attempt) {
-                Ok(outcome) => responders.push(Responder::Ack(resp, outcome)),
-                Err(e) => {
-                    let _ = resp.send(Err(e));
-                }
-            },
-            Command::Nack { req, resp } => {
-                match apply_nack(store, indexes, &mut tx, &mut cycle, req) {
-                    Ok(outcome) => responders.push(Responder::Nack(resp, outcome)),
-                    Err(e) => {
-                        let _ = resp.send(Err(e));
-                    }
-                }
-            }
-            Command::Extend { req, resp } => {
-                match apply_extend(store, indexes, &mut tx, &mut cycle, req) {
-                    Ok(outcome) => responders.push(Responder::Extend(resp, outcome)),
-                    Err(e) => {
-                        let _ = resp.send(Err(e));
-                    }
-                }
-            }
-            Command::DrainDeadLetters { queue, max, resp } => {
-                match apply_drain(store, indexes, &mut tx, &mut cycle, queue, max) {
-                    Ok(records) => responders.push(Responder::Drain(resp, records)),
-                    Err(e) => {
-                        let _ = resp.send(Err(e));
-                    }
-                }
-            }
+    let mut rpcs = rpcs.into_iter();
+    let fatal = rpcs.by_ref().find_map(|cmd| {
+        apply_command(store, indexes, &mut tx, &mut cycle, cmd, &mut responders).err()
+    });
+
+    // A storage-level failure can leave the shared transaction holding partial
+    // writes of a command whose caller was already told it failed; committing
+    // those would persist effects of a failed RPC (and break EnqueueAtomic's
+    // all-or-nothing contract). Drop the transaction and fail the whole cycle.
+    if let Some(status) = fatal {
+        drop(tx);
+        resync(store, indexes);
+        for responder in responders {
+            responder.respond(&Err(status.clone()));
         }
+        for cmd in rpcs {
+            fail_command(cmd, &status);
+        }
+        return;
     }
 
     let outcome = if cycle.dirty {
@@ -602,6 +563,93 @@ fn run_rpc_cycle(
         // entry if the commit ultimately fails or is rolled back.
         for queue in &cycle.new_ready {
             notifiers.wake(queue);
+        }
+    }
+}
+
+// Applies one command to the cycle's shared transaction, answering business
+// rejections immediately. Returns Err only for storage-level failures, which
+// poison the whole cycle (see run_rpc_cycle).
+fn apply_command(
+    store: &Store,
+    indexes: &mut Indexes,
+    tx: &mut WriteTransaction<'_>,
+    cycle: &mut Cycle,
+    cmd: Command,
+    responders: &mut Vec<Responder>,
+) -> Result<(), Status> {
+    match cmd {
+        Command::Enqueue { jobs, resp } => match apply_enqueue(store, indexes, tx, cycle, jobs) {
+            Ok(enqueued) => responders.push(Responder::Enqueue(resp, enqueued)),
+            Err(e) => return reject(resp, e),
+        },
+        Command::Reserve {
+            queues,
+            lease_ms,
+            max_jobs,
+            resp,
+        } => match apply_reserve(store, indexes, tx, cycle, &queues, lease_ms, max_jobs) {
+            Ok(jobs) => responders.push(Responder::Reserve(resp, jobs)),
+            Err(e) => return reject(resp, e),
+        },
+        Command::Ack {
+            job_id,
+            attempt,
+            resp,
+        } => match apply_ack(store, indexes, tx, cycle, &job_id, attempt) {
+            Ok(outcome) => responders.push(Responder::Ack(resp, outcome)),
+            Err(e) => return reject(resp, e),
+        },
+        Command::Nack { req, resp } => match apply_nack(store, indexes, tx, cycle, req) {
+            Ok(outcome) => responders.push(Responder::Nack(resp, outcome)),
+            Err(e) => return reject(resp, e),
+        },
+        Command::Extend { req, resp } => match apply_extend(store, indexes, tx, cycle, req) {
+            Ok(outcome) => responders.push(Responder::Extend(resp, outcome)),
+            Err(e) => return reject(resp, e),
+        },
+        Command::DrainDeadLetters { queue, max, resp } => {
+            match apply_drain(store, indexes, tx, cycle, queue, max) {
+                Ok(records) => responders.push(Responder::Drain(resp, records)),
+                Err(e) => return reject(resp, e),
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// Storage failures are always Status::internal; business rejections (NotFound,
+// FailedPrecondition, ResourceExhausted) never are and never mutate the
+// transaction before returning.
+fn reject<T>(resp: oneshot::Sender<Result<T, Status>>, e: Status) -> Result<(), Status> {
+    let fatal = (e.code() == tonic::Code::Internal).then(|| e.clone());
+    let _ = resp.send(Err(e));
+    match fatal {
+        Some(status) => Err(status),
+        None => Ok(()),
+    }
+}
+
+fn fail_command(cmd: Command, status: &Status) {
+    match cmd {
+        Command::Enqueue { resp, .. } => {
+            let _ = resp.send(Err(status.clone()));
+        }
+        Command::Reserve { resp, .. } => {
+            let _ = resp.send(Err(status.clone()));
+        }
+        Command::Ack { resp, .. } => {
+            let _ = resp.send(Err(status.clone()));
+        }
+        Command::Nack { resp, .. } => {
+            let _ = resp.send(Err(status.clone()));
+        }
+        Command::Extend { resp, .. } => {
+            let _ = resp.send(Err(status.clone()));
+        }
+        Command::DrainDeadLetters { resp, .. } => {
+            let _ = resp.send(Err(status.clone()));
         }
     }
 }
@@ -1802,6 +1850,30 @@ mod tests {
             job_id,
         }
         .encode()
+    }
+
+    #[test]
+    fn reject_flags_only_storage_errors_as_fatal() {
+        let (tx, _rx) = oneshot::channel::<Result<(), Status>>();
+        assert!(reject(tx, Status::not_found("job not found")).is_ok());
+
+        let (tx, _rx) = oneshot::channel::<Result<(), Status>>();
+        assert!(reject(tx, Status::failed_precondition("attempt mismatch")).is_ok());
+
+        let (tx, _rx) = oneshot::channel::<Result<(), Status>>();
+        assert!(reject(tx, Status::resource_exhausted("queue full")).is_ok());
+
+        let (tx, _rx) = oneshot::channel::<Result<(), Status>>();
+        let fatal = reject(tx, Status::internal("storage error"));
+        assert_eq!(fatal.unwrap_err().code(), tonic::Code::Internal);
+    }
+
+    #[test]
+    fn reject_answers_the_caller_with_the_original_error() {
+        let (tx, mut rx) = oneshot::channel::<Result<(), Status>>();
+        let _ = reject(tx, Status::internal("storage error"));
+        let sent = rx.try_recv().expect("responder is answered immediately");
+        assert_eq!(sent.unwrap_err().code(), tonic::Code::Internal);
     }
 
     #[test]

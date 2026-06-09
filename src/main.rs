@@ -97,7 +97,8 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
 
     let registry = registry.into_shared();
     let shared_config = config.clone().into_shared();
-    let svc = QueueServer::new(shared_config.clone(), registry.clone())?;
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let svc = QueueServer::new(shared_config.clone(), registry.clone(), shutdown_rx)?;
     let queue_service = QueueServiceServer::new(svc)
         .max_decoding_message_size(config.limits.max_message_bytes as usize);
     let interceptor = ApiKeyInterceptor::new(&config.auth.api_keys);
@@ -155,7 +156,12 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     builder
         .add_service(health_service)
         .add_service(service)
-        .serve_with_incoming_shutdown(incoming, shutdown_signal())
+        .serve_with_incoming_shutdown(incoming, async move {
+            shutdown_signal().await;
+            // Unblocks long-poll reserves so the drain doesn't wait out
+            // max_wait_timeout.
+            let _ = shutdown_tx.send(true);
+        })
         .await?;
 
     info!("queue server stopped");
