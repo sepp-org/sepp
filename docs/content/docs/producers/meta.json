@@ -1,11 +1,6 @@
 {
   "title": "Producers",
   "pages": [
-    "index",
-    "enqueue",
-    "batch-enqueue",
-    "scheduling",
-    "idempotent-enqueue",
-    "handling-rejections"
+    "index"
   ]
 }

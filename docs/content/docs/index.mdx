@@ -41,8 +41,8 @@ server crash or restart.
 
 ## Core feature map
 
-- **Fully durable by default** — every job is persisted to disk before responding. [Durability](/docs/operations/durability)
-- **At-least-once delivery** — leased jobs return to ready if a worker dies. [Delivery guarantees](/docs/concepts/delivery-guarantees)
+- **Fully durable by default** — every job is persisted to disk before responding. [Durability](/docs/operations/configuration)
+- **At-least-once delivery** — leased jobs return to ready if a worker dies. [Delivery guarantees](/docs/concepts/job-lifecycle#delivery-guarantees)
 - **Priority & scheduling** — run-at timestamps and per-job priority. [Scheduling](/docs/concepts/priority-and-scheduling)
 - **Retries & dead-letter** — bounded retries, then sideline for inspection. [Retries](/docs/concepts/retries-and-dead-letter)
 - **Idempotent enqueue** — dedup keys collapse duplicate producers. [Idempotency](/docs/concepts/idempotency-and-dedup)

@@ -3,12 +3,8 @@
   "pages": [
     "index",
     "configuration",
-    "durability",
     "security",
-    "limits",
-    "storage-tuning",
-    "dead-letter-management",
     "deployment",
-    "upgrading"
+    "dead-letter-management"
   ]
 }

@@ -103,15 +103,15 @@ The window is measured from the first enqueue, not the most recent one. Enqueuin
 
 Every enqueue returns an ack with the job id and a `deduplicated` flag. On a fresh enqueue the flag is `false` and the id belongs to the job you just created. On a hit it is `true` and the id is the original job, so the call is a confirmation that the job already exists rather than a second one.
 
-One subtlety is worth knowing: the id you get back can point to a job that has already run or even been dead-lettered, because the dedup record outlives the job and lasts the full window. Read `deduplicated` as "this enqueue is already accounted for", not "a live job with this id exists right now". In a batch each result carries its own flag, so you can still tell which jobs were new (see [batch & atomic enqueue](/docs/producers/batch-enqueue)).
+One subtlety is worth knowing: the id you get back can point to a job that has already run or even been dead-lettered, because the dedup record outlives the job and lasts the full window. Read `deduplicated` as "this enqueue is already accounted for", not "a live job with this id exists right now". In a batch each result carries its own flag, so you can still tell which jobs were new (see [batch & atomic enqueue](/docs/producers#batch--atomic-enqueue)).
 
 ## Enqueue-side dedup vs idempotent handlers
 
 It is tempting to read an idempotency key as exactly-once processing. It is not. The key deduplicates the *enqueue*: it stops a producer's retry from creating a second job. It says nothing about how many times that one job then runs.
 
-Delivery is at-least-once, so a single job can still be reserved and processed more than once, for example when a worker's lease expires and the job is redelivered while the original worker is still going (see [leasing & redelivery](/docs/concepts/leasing)). Guarding against that is a separate concern: make the handler itself idempotent so doing the work twice is harmless.
+Delivery is at-least-once, so a single job can still be reserved and processed more than once, for example when a worker's lease expires and the job is redelivered while the original worker is still going (see [leasing & redelivery](/docs/concepts/job-lifecycle#lease-expiry-redelivery-and-fencing)). Guarding against that is a separate concern: make the handler itself idempotent so doing the work twice is harmless.
 
-The two layers answer different questions. The idempotency key answers "was this job created once". An idempotent handler answers "did this work happen once". Use the key on the producer and idempotent handlers on the worker; most systems want both. See [idempotent workers](/docs/workers/idempotent-workers) for the handler side.
+The two layers answer different questions. The idempotency key answers "was this job created once". An idempotent handler answers "did this work happen once". Use the key on the producer and idempotent handlers on the worker; most systems want both. See [idempotent handlers](/docs/workers#idempotent-handlers) for the handler side.
 
 ## Limits and tuning
 
@@ -123,7 +123,6 @@ Keys count against `max_idempotency_key_bytes` (256 bytes by default). Keep them
 
 ## See also
 
-- [Idempotent workers](/docs/workers/idempotent-workers): making the work itself safe to run more than once.
-- [Leasing & redelivery](/docs/concepts/leasing): why one job can still be processed twice.
-- [Delivery guarantees](/docs/concepts/delivery-guarantees): at-least-once delivery and exactly-once enqueue.
-- [Idempotent enqueue](/docs/producers/idempotent-enqueue): the producer-side recipe in depth.
+- [Idempotent handlers](/docs/workers#idempotent-handlers): making the work itself safe to run more than once.
+- [Job lifecycle & delivery](/docs/concepts/job-lifecycle): leasing, redelivery and the at-least-once guarantee.
+- [Producing jobs](/docs/producers): setting an idempotency key when enqueueing.

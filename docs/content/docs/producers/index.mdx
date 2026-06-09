@@ -1,16 +1,405 @@
 ---
 title: "Producing jobs"
-description: "Overview of the producer API and how to choose between single, batch, and atomic enqueue."
+description: "The producer API end to end: build an enqueue request field by field, schedule and batch jobs, and stay within server limits."
 ---
 
-{/* SCAFFOLD — layout only, no prose written yet. */}
-{/* TODO(content): Section hub. Maps producer tasks to RPCs and to GetServerInfo-driven local validation. Links to per-task pages. */}
+A producer is any code that puts work on a queue. The job is to connect a client, build an `EnqueueRequest` (at minimum a queue and a job type) and send it. The server stores the job durably and hands back its ID. Everything else, payloads, custom fields, priority, scheduling, idempotency keys, is optional detail you attach to that request. This page is the producer's home base: the calls you make, the single `enqueue` walked field by field, scheduling, batching and the limits your requests are validated against.
+
+The snippets below assume a connected `client`. See [connecting](/docs/clients) to set one up, or the [quickstart](/docs/get-started/quickstart) for the end-to-end version.
 
 ## The producer surface
 
-## Single vs batch vs atomic
+The producer side of sepp is small: three enqueue calls and one request message, plus a capabilities call you rarely touch directly.
+
+- **`enqueue`** sends a single job and returns whether it was enqueued.
+- **`enqueueBatch`** sends many jobs in one round-trip and returns a per-job result list, so some can succeed while others are refused.
+- **`enqueueAtomic`** sends many jobs with an all-or-none guarantee: either every job lands or none do.
+- **`getServerInfo`** returns the server's version, feature flags and advertised limits. Clients use it to [validate locally](#validating-against-server-limits) before sending.
+
+All three enqueue calls carry the same building block, the `EnqueueRequest`. Two fields are required, the rest are optional knobs you set only when you need them:
+
+| Field | Required | What it carries |
+| --- | --- | --- |
+| `queue` | yes | The target queue. |
+| `jobType` | yes | A type tag the worker dispatches on. |
+| `payload` | no | An opaque byte blob plus an [encoding hint](#set-the-payload-and-encoding) the worker reads back. |
+| `custom` | no | A map of [lightweight primitive fields](#custom-metadata-map) handed to the worker as-is. |
+| `priority` | no | A [0 to 9 override](#priority-and-max_attempts-overrides); defaults to the queue's priority. |
+| `maxAttempts` | no | A [retry-ceiling override](#priority-and-max_attempts-overrides); defaults to the queue's setting. |
+| `scheduledAt` | no | A [future run time](#schedule-a-job); the job stays invisible until then. |
+| `idempotencyKey` | no | A [dedup key](/docs/concepts/idempotency-and-dedup) that makes a retried enqueue safe. |
+| `traceContext` | no | [Trace context](/docs/observability/tracing) that links the worker's run back to this producer. |
+
+## Build an enqueue request
+
+The smallest possible request is two fields: a `queue` and a `jobType`. The queue routes the job and decides which limits apply to it. The job type is a tag sepp stores but never interprets; the worker reads it back to decide how to handle the job. Whether the queue has to exist first depends on the server's mode: in [strict mode](/docs/concepts/queues) an undeclared queue is rejected, otherwise it is created on demand.
+
+<LangTabs items={['Rust', 'Python', 'TypeScript']} groupId="enqueue">
+
+```rust
+use sepp_rs::EnqueueRequest;
+
+let ack = client.enqueue(EnqueueRequest::new("emails", "welcome")?).await?;
+println!("enqueued {}", ack.job_id);
+```
+
+```python
+from sepp import EnqueueRequest
+
+ack = await client.enqueue(EnqueueRequest("emails", "welcome"))
+print(f"enqueued {ack.job_id}")
+```
+
+```ts
+const ack = await client.enqueue({ queue: "emails", jobType: "welcome" });
+console.log(`enqueued ${ack.jobId}`);
+```
+
+</LangTabs>
+
+Everything past those two fields is an optional knob on the same request, covered in the sections below.
+
+## Set the payload and encoding
+
+A payload is the job's body: a blob of bytes plus an encoding hint. Sepp treats the bytes as opaque and stores both untouched, so you can carry JSON, Protobuf, MessagePack or any format you like. The encoding is a free-form label, usually a MIME type such as `application/json`, that the worker reads back to know how to decode the bytes.
+
+<LangTabs items={['Rust', 'Python', 'TypeScript']} groupId="payload">
+
+```rust
+use sepp_rs::{EnqueueRequest, Payload};
+
+let payload = Payload::new(br#"{"user_id": 42}"#.to_vec(), "application/json");
+let ack = client
+    .enqueue(EnqueueRequest::new("emails", "welcome")?.with_payload(payload))
+    .await?;
+```
+
+```python
+from sepp import EnqueueRequest, Payload
+
+payload = Payload(b'{"user_id": 42}', "application/json")
+ack = await client.enqueue(EnqueueRequest("emails", "welcome", payload=payload))
+```
+
+```ts
+import { Payload } from "sepp";
+
+// Payload.json serializes the value and tags it "application/json".
+const payload = Payload.json({ userId: 42 });
+const ack = await client.enqueue({ queue: "emails", jobType: "welcome", payload });
+```
+
+</LangTabs>
+
+<Callout type="warn" title="The encoding is a label, not a contract">
+Sepp never validates the hint, so the producer and worker have to agree on the format themselves. The payload also rides inline through every enqueue and reservation, so keep it small: queues cap it at `max_payload_bytes` (1 MiB by default) and reject anything larger with `PayloadTooLarge`. For bigger data, store it externally and enqueue only a reference. See [payloads](/docs/concepts/queues#opaque-payloads-and-encoding-hints) for the full picture.
+</Callout>
+
+## Priority and max_attempts overrides
+
+Every queue has a default priority and a default attempt ceiling. Both can be overridden per job.
+
+Priority runs from 0 (lowest) to 9 (highest), and the server hands out higher-priority jobs first. It reorders work within a queue, not across queues, so use it to let a time-sensitive job jump ahead of routine ones on the same queue. `maxAttempts` sets how many times this job may be delivered before it goes to dead-letter; raise it for work worth retrying harder, lower it for work that should give up fast. See [retries & dead-letter](/docs/concepts/retries-and-dead-letter) for what happens when the ceiling is hit.
+
+<LangTabs items={['Rust', 'Python', 'TypeScript']} groupId="overrides">
+
+```rust
+use sepp_rs::{EnqueueRequest, Priority};
+
+let request = EnqueueRequest::new("emails", "welcome")?
+    .with_priority(Priority::P7)
+    .with_max_attempts(5);
+let ack = client.enqueue(request).await?;
+```
+
+```python
+from sepp import EnqueueRequest, Priority
+
+request = EnqueueRequest("emails", "welcome", priority=Priority.P7, max_attempts=5)
+ack = await client.enqueue(request)
+```
+
+```ts
+import { Priority } from "sepp";
+
+const ack = await client.enqueue({
+  queue: "emails",
+  jobType: "welcome",
+  priority: Priority.P7,
+  maxAttempts: 5,
+});
+```
+
+</LangTabs>
+
+## Custom metadata map
+
+The `custom` map carries a handful of structured fields alongside the job: key/value pairs whose values are primitives (string, integer, float or boolean). Sepp stores them as typed values and hands them to the worker as-is, so there is no encoding to agree on and nothing to decode. This is the simplest way to attach a record ID, a locale or a flag. Reach for a payload only when the body is larger or arbitrarily structured.
+
+<LangTabs items={['Rust', 'Python', 'TypeScript']} groupId="custom">
+
+```rust
+let request = EnqueueRequest::new("emails", "welcome")?
+    .with_custom_entry("user_id", 42)
+    .with_custom_entry("locale", "en-US")
+    .with_custom_entry("vip", true);
+let ack = client.enqueue(request).await?;
+```
+
+```python
+request = EnqueueRequest(
+    "emails",
+    "welcome",
+    custom={"user_id": 42, "locale": "en-US", "vip": True},
+)
+ack = await client.enqueue(request)
+```
+
+```ts
+const ack = await client.enqueue({
+  queue: "emails",
+  jobType: "welcome",
+  custom: { userId: 42, locale: "en-US", vip: true },
+});
+```
+
+</LangTabs>
+
+The map is bounded per queue on three axes: how many entries it holds, its total size in bytes and the length of each key. Crossing any of them is a deterministic rejection (`CustomEntriesTooMany`, `CustomMapTooLarge` or `CustomKeyTooLong`), so keep it to lightweight metadata rather than using it as a stand-in for the payload.
+
+## Schedule a job
+
+Set `scheduledAt` to a future time and the job lands as `Scheduled` instead of `Ready`: it stays invisible to workers until its time arrives, when the sweep promotes it. With no `scheduledAt` the job is ready immediately. The server caps how far ahead you can schedule at `max_schedule_horizon` and rejects anything past it with `ScheduledTooFar`. See [priority & scheduling](/docs/concepts/priority-and-scheduling) for how scheduled jobs are ordered and promoted.
+
+<LangTabs items={['Rust', 'Python', 'TypeScript']} groupId="schedule">
+
+```rust
+use std::time::{Duration, SystemTime};
+use sepp_rs::EnqueueRequest;
+
+let run_at = SystemTime::now() + Duration::from_secs(3600); // one hour out
+let request = EnqueueRequest::new("emails", "reminder")?.with_scheduled_at(run_at);
+let ack = client.enqueue(request).await?;
+```
+
+```python
+from datetime import datetime, timedelta, timezone
+from sepp import EnqueueRequest
+
+run_at = datetime.now(timezone.utc) + timedelta(hours=1)
+request = EnqueueRequest("emails", "reminder", scheduled_at=run_at)
+ack = await client.enqueue(request)
+```
+
+```ts
+const ack = await client.enqueue({
+  queue: "emails",
+  jobType: "reminder",
+  scheduledAt: new Date(Date.now() + 3_600_000), // one hour out
+});
+```
+
+</LangTabs>
+
+## Read the enqueue response
+
+A successful enqueue returns an `EnqueueAck` with two fields: the server-assigned `jobId` (a UUID) and a `deduplicated` flag. Once the ack is in hand the job is durably on disk, so a crash will not lose it. See [durability](/docs/operations/configuration) for the guarantee behind that.
+
+`deduplicated` is `true` only when the request carried an [idempotency key](/docs/concepts/idempotency-and-dedup) that matched a job already enqueued in the queue's window. In that case `jobId` points at the original job and no second copy was created, so reading the flag tells a fresh enqueue apart from a deduplicated retry.
+
+<LangTabs items={['Rust', 'Python', 'TypeScript']} groupId="response">
+
+```rust
+let ack = client
+    .enqueue(EnqueueRequest::new("emails", "welcome")?.with_idempotency_key("welcome-user-42"))
+    .await?;
+
+if ack.deduplicated {
+    println!("already enqueued as {}", ack.job_id);
+} else {
+    println!("enqueued {}", ack.job_id);
+}
+```
+
+```python
+ack = await client.enqueue(
+    EnqueueRequest("emails", "welcome", idempotency_key="welcome-user-42")
+)
+
+if ack.deduplicated:
+    print(f"already enqueued as {ack.job_id}")
+else:
+    print(f"enqueued {ack.job_id}")
+```
+
+```ts
+const ack = await client.enqueue({
+  queue: "emails",
+  jobType: "welcome",
+  idempotencyKey: "welcome-user-42",
+});
+
+if (ack.deduplicated) {
+  console.log(`already enqueued as ${ack.jobId}`);
+} else {
+  console.log(`enqueued ${ack.jobId}`);
+}
+```
+
+</LangTabs>
+
+## Batch & atomic enqueue
+
+Enqueuing one job at a time is simple, but each call is its own network round-trip and, in the sync persist modes, its own fsync. The batch calls amortize both: the jobs ride in one request and the committer folds them into a single disk sync, so a batch of 100 costs far less than 100 separate enqueues. They carry the same `EnqueueRequest` you just built. Both are capped at `max_enqueue_batch` (256 by default); an over-cap or empty batch is refused with `InvalidArgument` before any job is stored.
+
+`enqueueBatch` is **best-effort**: each job is validated on its own, so some can succeed while others are refused. You get one result per job in request order, each an ack or a per-job rejection.
+
+<LangTabs items={['Rust', 'Python', 'TypeScript']} groupId="batch">
+
+```rust
+use sepp_rs::EnqueueRequest;
+
+let results = client
+    .enqueue_batch([
+        EnqueueRequest::new("emails", "welcome")?,
+        EnqueueRequest::new("emails", "receipt")?,
+    ])
+    .await?;
+
+// One result per job, in order: some may be acks, others rejections.
+for (i, result) in results.into_iter().enumerate() {
+    match result {
+        Ok(ack) => println!("job {i} enqueued: {}", ack.job_id),
+        Err(rejection) => eprintln!("job {i} rejected: {rejection}"),
+    }
+}
+```
+
+```python
+from sepp import EnqueueRequest, JobRejection
+
+results = await client.enqueue_batch([
+    EnqueueRequest("emails", "welcome"),
+    EnqueueRequest("emails", "receipt"),
+])
+
+# One result per job, in order: some may be acks, others rejections.
+for i, result in enumerate(results):
+    if isinstance(result, JobRejection):
+        print(f"job {i} rejected: {result.message}")
+    else:
+        print(f"job {i} enqueued: {result.job_id}")
+```
+
+```ts
+import { isJobRejection, describeJobRejection } from "sepp";
+
+const results = await client.enqueueBatch([
+  { queue: "emails", jobType: "welcome" },
+  { queue: "emails", jobType: "receipt" },
+]);
+
+// One result per job, in order: some may be acks, others rejections.
+results.forEach((result, i) => {
+  if (isJobRejection(result)) {
+    console.warn(`job ${i} rejected: ${describeJobRejection(result)}`);
+  } else {
+    console.log(`job ${i} enqueued: ${result.jobId}`);
+  }
+});
+```
+
+</LangTabs>
+
+`enqueueAtomic` is **all-or-none**: it validates the whole batch first, and if any job fails, nothing is enqueued and you get back every failure tagged with its index. Use it when the jobs are coordinated steps and a partial enqueue would be a bug.
+
+<LangTabs items={['Rust', 'Python', 'TypeScript']} groupId="atomic">
+
+```rust
+use sepp_rs::{AtomicEnqueueError, EnqueueRequest};
+
+match client
+    .enqueue_atomic([
+        EnqueueRequest::new("checkout", "reserve_seat")?,
+        EnqueueRequest::new("checkout", "charge_card")?,
+    ])
+    .await
+{
+    Ok(acks) => println!("all {} jobs enqueued", acks.len()),
+    // One or more failed validation, so none were enqueued.
+    Err(AtomicEnqueueError::Validation(errors)) => {
+        for e in errors {
+            eprintln!("job {} rejected: {}", e.index, e.rejection);
+        }
+    }
+    // Transport or protocol failure; nothing was enqueued.
+    Err(e) => return Err(e.into()),
+}
+```
+
+```python
+from sepp import EnqueueRequest, BatchValidationError
+
+try:
+    acks = await client.enqueue_atomic([
+        EnqueueRequest("checkout", "reserve_seat"),
+        EnqueueRequest("checkout", "charge_card"),
+    ])
+    print(f"all {len(acks)} jobs enqueued")
+except BatchValidationError as e:
+    # One or more failed validation, so none were enqueued.
+    for err in e.errors:
+        print(f"job {err.index} rejected: {err.rejection.message}")
+```
+
+```ts
+import { BatchValidationError, describeJobRejection } from "sepp";
+
+try {
+  const acks = await client.enqueueAtomic([
+    { queue: "checkout", jobType: "reserve_seat" },
+    { queue: "checkout", jobType: "charge_card" },
+  ]);
+  console.log(`all ${acks.length} jobs enqueued`);
+} catch (err) {
+  if (err instanceof BatchValidationError) {
+    // One or more failed validation, so none were enqueued.
+    for (const e of err.errors) {
+      console.warn(`job ${e.index} rejected: ${describeJobRejection(e.rejection)}`);
+    }
+  } else {
+    throw err; // transport or protocol failure
+  }
+}
+```
+
+</LangTabs>
+
+Default to `enqueueBatch` for fan-out and keep `enqueueAtomic` for jobs that genuinely belong together. Both honor idempotency keys, so a batch is as safe to retry as a single enqueue.
 
 ## Validating against server limits
 
+Most enqueue failures are not bugs in transit; they are the server understanding the request and refusing it. These rejections are deterministic, so the same request always fails the same way and the fix is to correct the request rather than retry it. The common ones a producer hits are an unknown queue (in [strict mode](/docs/concepts/queues)), a payload over `max_payload_bytes`, a disallowed encoding, a `custom` map that is too large or has too many entries, a `scheduledAt` past the schedule horizon and over-length names or keys. The full set lives in the [rejection catalogue](/docs/reference/rejections).
+
+You do not have to discover these limits by hitting them. `getServerInfo` advertises the server's limits and feature flags, so a client can validate a request locally and fail fast before sending. One ceiling is not advertised: `max_message_bytes`, the whole-request gRPC cap (16 MiB by default), which always sits at or above `max_payload_bytes` and bounds the size of a batch as a whole.
+
+Keep the two failure shapes distinct, because they call for opposite responses:
+
+- A **rejection** is deterministic. Re-sending the same request fails identically, so fix the request.
+- A **transport or protocol error** (a dropped connection, a passed deadline, the server shedding load) never reached a per-job verdict. These are often transient, so backing off and retrying is reasonable, and safe if the job carries an idempotency key.
+
 ## Producer best practices
 
+- **Set an idempotency key on anything you might retry.** A retry the server already committed comes back deduplicated instead of as a second copy, which turns an uncertain network blip into a safe no-op. See [idempotency & deduplication](/docs/concepts/idempotency-and-dedup).
+- **Batch when you have more than a handful of jobs.** It amortizes the round-trip and, in the sync modes, the fsync, for a large throughput win at no extra safety cost.
+- **Keep payloads small.** Put large blobs in object storage and enqueue a reference (a URL or key) instead.
+- **Prefer the `custom` map for a few structured fields.** It needs no encoding to agree on and arrives typed on the worker. Reach for a payload only when the body is larger or arbitrarily structured.
+- **Validate against advertised limits at startup.** Read `getServerInfo` once and check requests locally if you would rather fail fast than per-enqueue.
+- **Use priority sparingly.** It reorders work within a queue, not across queues.
+
+## See also
+
+- [Queues & payloads](/docs/concepts/queues): what a queue is and what its jobs carry.
+- [Idempotency & deduplication](/docs/concepts/idempotency-and-dedup): making a retried enqueue safe.
+- [Processing jobs](/docs/workers): the other side, reserving and running work.
+- [Rejection catalogue](/docs/reference/rejections): every deterministic rejection reason and its limit.

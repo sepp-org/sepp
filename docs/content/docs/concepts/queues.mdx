@@ -1,7 +1,9 @@
 ---
-title: "Queues & strict mode"
-description: "Named queues, auto-create versus strict declaration and per-queue configuration overrides."
+title: "Queues & payloads"
+description: "Named queues and strict mode, per-queue configuration, and what a job carries: opaque payloads, the custom map and their limits."
 ---
+
+A queue is a named channel jobs flow through, and every queue carries its own configuration and limits. A job on it carries two kinds of data: an opaque payload and a typed custom map. This page covers both halves: defining queues, and the shape of the jobs they hold.
 
 ## Auto-create vs strict mode
 
@@ -13,9 +15,10 @@ To enable strict mode, set the `strict_queues` field in the server configuration
 strict_queues = true
 ```
 
-## Named queues
+## Named queues and overrides
 
-You can declare queues in the configuration by adding a `[[queues]]` section for each queue, with its name and any specific configuration overrides:
+You can declare queues in the configuration by adding a `[[queues]]` section for each queue, with its name and any specific configuration overrides. Most global defaults can be overridden per queue, in both auto-create and strict mode, so you might allow larger payloads on one queue and a different attempt ceiling on another.
+
 ```toml
 [[queues]]
 name = "emails"
@@ -25,48 +28,149 @@ default_priority = 5
 allowed_job_types = ["send_welcome", "send_receipt"]
 
 [[queues]]
-name = "reports"
-
-[[queues]]
 name = "large_payloads"
 max_payload_bytes = 8388608
 dedup_window_ms = 3600000
 ```
 
+An `allowed_job_types` list restricts which job types a queue accepts, a simple way to enforce separation between queues and catch a producer enqueueing the wrong type. The full set of per-queue overrides (`max_lease_duration_ms`, `default_max_attempts`, `max_attempts_ceiling`, `default_priority`, `max_payload_bytes`, `allowed_encodings`, `max_schedule_horizon_ms`, `max_custom_entries`, `max_custom_total_bytes`, `max_custom_key_bytes`, `dedup_window_ms`, `max_queue_depth`) is listed in the [configuration reference](/docs/reference/configuration).
+
 <Callout type="info" title="Hot reloading">
-Queues declared in the configuration are hot-reloadable, so you can add, remove or change them on the fly without restarting the server. Just edit the config file, save and the server will pick up the changes automatically.
+Queues declared in the configuration are hot-reloadable, so you can add, remove or change them on the fly without restarting the server. Just edit the config file, save and the server picks up the changes automatically.
 </Callout>
 
-## Per-queue overrides
+## Opaque payloads and encoding hints
 
-You can override many of the global defaults on a per-queue basis in the configuration. For example, you might want to allow larger payloads on a specific queue or set a different max attempts for another. This works both in auto-create and strict mode.
+The payload is just bytes. Sepp stores it untouched and never parses it, so the format is yours: JSON, Protobuf, Avro, MessagePack, a packed binary struct, whatever suits the job. Alongside the bytes you set an encoding hint, a free-form string that is usually a MIME type like `application/json`. The server does not interpret the hint either, unless you turn on an allow-list (below); it rides along so the worker knows how to decode what it gets. The format contract is between your producer and worker, not with sepp.
 
-```toml
-# Overridable fields (all optional):
-#   max_lease_duration_ms
-#   default_max_attempts
-#   max_attempts_ceiling
-#   default_priority
-#   max_payload_bytes
-#   allowed_encodings
-#   max_schedule_horizon_ms
-#   max_custom_entries
-#   max_custom_total_bytes
-#   max_custom_key_bytes
-#   dedup_window_ms
-#   max_queue_depth
+You [attach a payload on the producer](/docs/producers#set-the-payload-and-encoding); the worker reads the encoding back to decide how to decode the bytes:
+
+<LangTabs items={['Rust', 'Python', 'TypeScript']} groupId="decode">
+
+```rust
+use sepp_rs::worker::HandlerError;
+
+// In a handler, `payload` is Option<Payload>: read the encoding to decode.
+if let Some(payload) = &payload {
+    match payload.encoding.as_str() {
+        "application/json" => {
+            let body: MyBody = serde_json::from_slice(&payload.data)?;
+            // ... use body
+        }
+        other => return Err(HandlerError::permanent(format!("unexpected encoding: {other}"))),
+    }
+}
 ```
 
-You can also set an `allowed_job_types` list to restrict which job types can be enqueued onto that queue. This is a simple way to enforce some separation of concerns between different queues, and can help catch mistakes where a producer might enqueue the wrong type of job onto a queue that a worker is consuming from.
+```python
+import json
+from sepp import HandlerError
+
+# In a handler, `payload` is Payload | None: read the encoding to decode.
+if payload is not None:
+    if payload.encoding == "application/json":
+        body = json.loads(payload.data)
+        # ... use body
+    else:
+        raise HandlerError.permanent(f"unexpected encoding: {payload.encoding}")
+```
+
+```ts
+import { HandlerError } from "sepp";
+
+// In a handler, `payload` is Payload | undefined: read the encoding to decode.
+if (payload) {
+  if (payload.encoding === "application/json") {
+    const body = payload.json(); // Payload decodes its own bytes
+    // ... use body
+  } else {
+    throw HandlerError.permanent(`unexpected encoding: ${payload.encoding}`);
+  }
+}
+```
+
+</LangTabs>
+
+## The custom value map
+
+For small structured fields, a record id, a flag, a locale, reach for the custom map instead of a payload. It is a set of key-value pairs whose values are typed primitives: strings, integers, floats and booleans. Sepp stores them as typed values and hands them back on `ctx.custom`, so unlike a payload there is no encoding to agree on and nothing to decode. Because the values are typed, integers survive as 64-bit integers across languages, so the precision loss that bites large integers in a JSON payload does not happen here (in TypeScript a value beyond 2<sup>53</sup> comes back as a `bigint`).
+
+Queues cap the map so it stays lightweight: a maximum number of entries (64 by default), a per-key length (256 bytes) and a combined size across keys and values (16 KiB). Go over and the enqueue is rejected with `CustomEntriesTooMany`, `CustomKeyTooLong` or `CustomMapTooLarge`. Keep it to metadata; if you find yourself packing real data in here, that belongs in a payload.
+
+## Payload size and the claim-check pattern
+
+A payload travels inline with the job and is held in memory until the job finishes, so large blobs cost throughput and memory on the hot path. To keep that bounded, each queue caps payload size at `max_payload_bytes`, 1 MiB by default, and rejects anything larger with `PayloadTooLarge`. You can raise it per queue, but only up to `max_message_bytes` (16 MiB by default), the hard ceiling on a single gRPC message that the payload has to fit inside.
 
 ```toml
+[limits]
+max_payload_bytes = 1048576   # 1 MiB, the default per-job payload cap
+max_message_bytes = 16777216  # 16 MiB ceiling on a whole gRPC message
+
 [[queues]]
-name = "emails"
-allowed_job_types = ["send_welcome", "send_receipt"]
+name = "imports"
+max_payload_bytes = 8388608   # allow 8 MiB payloads on this queue
+```
+
+When the data is bigger than a payload should be, keep it out of the queue entirely. Put the blob in object storage (S3, GCS, a database) and enqueue only a reference to it, a key or URL, in a custom field or a small payload, then let the worker fetch the blob when it runs. This is the **claim-check** pattern: the queue only ever moves the reference and the blob lives wherever storage is cheap.
+
+<LangTabs items={['Rust', 'Python', 'TypeScript']} groupId="claim-check">
+
+```rust
+use sepp_rs::EnqueueRequest;
+
+// Store the blob in object storage and enqueue only a reference to it.
+let key = upload_to_s3(&big_blob).await?; // your code
+let request = EnqueueRequest::new("imports", "process_file")?
+    .with_custom_entry("s3_bucket", "uploads")
+    .with_custom_entry("s3_key", key);
+client.enqueue(request).await?;
+```
+
+```python
+from sepp import EnqueueRequest
+
+# Store the blob in object storage and enqueue only a reference to it.
+key = await upload_to_s3(big_blob)  # your code
+request = EnqueueRequest(
+    "imports",
+    "process_file",
+    custom={"s3_bucket": "uploads", "s3_key": key},
+)
+await client.enqueue(request)
+```
+
+```ts
+// Store the blob in object storage and enqueue only a reference to it.
+const key = await uploadToS3(bigBlob); // your code
+await client.enqueue({
+  queue: "imports",
+  jobType: "process_file",
+  custom: { s3Bucket: "uploads", s3Key: key },
+});
+```
+
+</LangTabs>
+
+## Encoding allow-lists
+
+By default a queue accepts any encoding; the hint is a free label and the server never checks it. Set `allowed_encodings` to a list and the queue accepts only those, rejecting the rest with `EncodingNotAllowed`. An empty list rejects every payload, so the queue takes payload-free jobs only. The check runs only when a job actually carries a payload, so a job with no payload is never caught by it.
+
+Like the other limits, `allowed_encodings` is global with a per-queue override: a queue without its own list inherits the global one. The capability shows up as `restricts_encodings` and `allowed_encodings` in the server info, so a producer can see the rule before sending.
+
+```toml
+[limits]
+# Unset (the default) accepts any encoding. A list restricts every queue.
+allowed_encodings = ["application/json"]
+
+[[queues]]
+name = "events"
+# Overrides the global list for this queue.
+allowed_encodings = ["application/json", "application/x-protobuf"]
 ```
 
 ## See also
 
-- [Limits & quotas](/docs/operations/limits): the global defaults that per-queue overrides replace.
+- [Producing jobs](/docs/producers): attaching payloads and custom fields when enqueueing.
 - [Configuration](/docs/operations/configuration): the config file, environment variables and hot reload.
-- [Configuration reference](/docs/reference/configuration): every config key in one place.
+- [Configuration reference](/docs/reference/configuration): every queue and limit key in one place.
+- [Rejection catalogue](/docs/reference/rejections): the errors a job hits when it breaks a limit.

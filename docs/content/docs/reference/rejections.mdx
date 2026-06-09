@@ -4,7 +4,7 @@ description: "Every deterministic JobRejection reason, what triggers it, and how
 ---
 
 {/* SCAFFOLD — layout only, no prose written yet. */}
-{/* TODO(content): The 12 JobRejection variants (UnknownQueue, PayloadTooLarge, EncodingNotAllowed, JobTypeNotAllowed, CustomEntriesTooMany, CustomMapTooLarge, CustomKeyTooLong, QueueNameTooLong, JobTypeNameTooLong, IdempotencyKeyTooLong, ScheduledTooFar, InvalidRequest) with trigger, fields, governing limit. CANONICAL home — how-to pages link here. */}
+{/* TODO(content): The 12 JobRejection variants (UnknownQueue, PayloadTooLarge, EncodingNotAllowed, JobTypeNotAllowed, CustomEntriesTooMany, CustomMapTooLarge, CustomKeyTooLong, QueueNameTooLong, JobTypeNameTooLong, IdempotencyKeyTooLong, ScheduledTooFar, InvalidRequest) with trigger, fields, governing limit. CANONICAL home — how-to pages link here. ABSORBED error-codes: the gRPC status codes (INVALID_ARGUMENT, FAILED_PRECONDITION, NOT_FOUND, UNAUTHENTICATED, INTERNAL=transient/retryable) and their per-RPC mapping, as the transient counterpart to these deterministic rejections. */}
 
 ## Rejections vs gRPC status errors
 
@@ -15,4 +15,6 @@ description: "Every deterministic JobRejection reason, what triggers it, and how
 ## Custom-map rejections
 
 ## Schedule and validation rejections
+
+## gRPC status codes per RPC
 

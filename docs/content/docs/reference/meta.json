@@ -5,7 +5,6 @@
     "grpc-protocol",
     "configuration",
     "rejections",
-    "error-codes",
     "server-capabilities",
     "cli"
   ]

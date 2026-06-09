@@ -13,7 +13,7 @@ A nack carries a retry directive that picks one of three outcomes:
 - **Retry after a delay** (`After`): the job waits in `Scheduled` and becomes `Ready` once the delay has elapsed.
 - **Dead-letter** (`DeadLetter`): the job skips any remaining attempts and is dead-lettered right away.
 
-`nack` returns a boolean that is `true` when the job was dead-lettered, either because you asked for `DeadLetter` or because the failing attempt hit the limit, so you can log or alert on a terminal failure. If you drive jobs through the `Worker` instead of `nack` directly, its `HandlerError` variants map onto these: retry, retry-after and permanent (see [your first worker](/docs/get-started/first-worker#report-success-or-failure)).
+`nack` returns a boolean that is `true` when the job was dead-lettered, either because you asked for `DeadLetter` or because the failing attempt hit the limit, so you can log or alert on a terminal failure. If you drive jobs through the `Worker` instead of `nack` directly, its `HandlerError` variants map onto these: retry, retry-after and permanent (see [processing jobs](/docs/workers#report-success-or-failure)).
 
 <LangTabs items={['Rust', 'Python', 'TypeScript']} groupId="directive">
 
@@ -183,7 +183,7 @@ A job leaves for the dead-letter store in exactly one of three ways, recorded as
 - `rejected`: a worker nacked with the `DeadLetter` directive, skipping any remaining attempts.
 - `lease_expired`: the lease expired while the job was on its final attempt, so there was no attempt left to redeliver into.
 
-The first two arrive through a nack; the third comes from a worker that simply went away on the last attempt (see [leasing & redelivery](/docs/concepts/leasing)). Dead-lettered jobs are terminal and are never redelivered.
+The first two arrive through a nack; the third comes from a worker that simply went away on the last attempt (see [leasing & redelivery](/docs/concepts/job-lifecycle#lease-expiry-redelivery-and-fencing)). Dead-lettered jobs are terminal and are never redelivered.
 
 ## Retention and replay
 
@@ -252,7 +252,6 @@ for (const record of records) {
 
 ## See also
 
-- [Leasing & redelivery](/docs/concepts/leasing): how lease expiry feeds the attempt counter.
-- [Job lifecycle](/docs/concepts/job-lifecycle): where dead-letter sits among the states.
+- [Job lifecycle & delivery](/docs/concepts/job-lifecycle): how lease expiry feeds the attempt counter and where dead-letter sits.
 - [Dead-letter management](/docs/operations/dead-letter-management): operating the dead-letter store.
-- [Handling poison & dead-lettered jobs](/docs/guides/poison-jobs): patterns for jobs that keep failing.
+- [Processing jobs](/docs/workers#idempotent-handlers): handling poison jobs that keep failing.

@@ -2,8 +2,6 @@
   "title": "Get Started",
   "pages": [
     "install",
-    "quickstart",
-    "first-producer",
-    "first-worker"
+    "quickstart"
   ]
 }

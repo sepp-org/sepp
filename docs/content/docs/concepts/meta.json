@@ -4,12 +4,8 @@
     "index",
     "job-lifecycle",
     "queues",
-    "delivery-guarantees",
-    "leasing",
     "idempotency-and-dedup",
     "priority-and-scheduling",
-    "retries-and-dead-letter",
-    "payloads",
-    "batching"
+    "retries-and-dead-letter"
   ]
 }

@@ -1,7 +1,9 @@
 ---
-title: "Job lifecycle"
-description: "The state machine a job moves through"
+title: "Job lifecycle & delivery"
+description: "The states a job moves through, how leasing drives redelivery, and the at-least-once guarantee that results."
 ---
+
+A job moves through a small set of states between enqueue and completion. Leasing is the mechanism that moves it safely even when workers crash, and the at-least-once guarantee falls straight out of it. This page is the state machine and the delivery semantics it produces.
 
 ## States and transitions
 
@@ -38,7 +40,13 @@ When a producer enqueues a job, the committer writes it straight into the queue.
 
 A worker reserves the next `Ready` job, highest priority first, then oldest. Reserving moves it to `In-flight` and attaches a **lease**: a deadline by which the worker must ack, nack, or extend. Until then the job is invisible to every other worker, so exactly one worker owns it at a time.
 
-## Ack, nack, and redelivery
+The lease duration a worker asks for is a request, not a guarantee. Each queue has a `max_lease_duration` the server will not exceed, and `reserve` silently clamps the request down to it (to the smallest max among the queues when reserving from several). So a worker should never assume its lease lasts exactly as long as it asked.
+
+<Callout type="info" title="Trust the expiry, not the request">
+The lease expiry carried on each job's `ctx` is the real deadline, after any clamping. A worker should budget its handler against that, not against the duration it asked for. The effective maximum is advertised in `GetServerInfo`.
+</Callout>
+
+## Ack, nack and redelivery
 
 Once it holds a job, the worker reports the outcome:
 
@@ -61,8 +69,19 @@ sequenceDiagram
   Note over S: removed
 `} />
 
+## Lease expiry, redelivery and fencing
+
+If a lease elapses with no ack, nack or extend, sepp treats the worker as gone. If attempts remain the job returns to `Ready` with its `attempt` incremented and the next worker picks it up; if it was already on its final attempt it is dead-lettered with cause `lease_expired`. Either way a crashed worker's jobs flow back into the system on their own.
+
+The catch is that the server cannot tell a crashed worker from a merely slow one. A worker stuck on a long call looks exactly like one that died, so its lease expires and the job is redelivered while the original is still running. For a window, two workers hold the same job.
+
+The original worker finds out it lost the race through the **attempt number**. Every reservation increments it, and every ack, nack and extend carries the attempt it was issued for. The server refuses anything stale with one of two errors, and both mean the same thing to a worker: you no longer own the job, so stop.
+
+- `NOT_FOUND`: there is no in-flight job with this id. It was already acked, its lease expired and it has not been re-reserved, it was dead-lettered, or it never existed.
+- `FAILED_PRECONDITION`: the job is in-flight but under a newer attempt than yours. The lease was reassigned.
+
 <Callout type="warn" title="Delivery is at-least-once">
-Because a lost lease redelivers the job, a handler can run more than once for the same job. A crash after the work but before the ack looks identical to a crash before the work. Make handlers idempotent; see [idempotent workers](/docs/workers/idempotent-workers).
+Because a lost lease redelivers the job, a handler can run more than once for the same job. A crash after the work but before the ack looks identical to a crash before the work. Make handlers idempotent; see [idempotent workers](/docs/workers#idempotent-handlers). The worker page covers catching the two fencing errors in code.
 </Callout>
 
 ## Terminal: completed or dead-lettered
@@ -73,9 +92,17 @@ A job leaves the queue in exactly one of two ways. A successful **ack** complete
 
 Every delivery carries an `attempt` number, starting at 1, and each retry, whether from a nack or a lease expiry, increments it. A job is delivered up to `max_attempts` times (default 3, configurable per queue); once the attempt that fails has reached `max_attempts`, sepp dead-letters it instead of retrying. Both values are on the job's `ctx`, so a handler can tell when it's on its last attempt and act accordingly.
 
+## Delivery guarantees
+
+Two guarantees follow from the lifecycle above.
+
+**At-least-once delivery.** Because a lost lease redelivers the job, every job runs to completion at least once even if workers crash, but a job can also run more than once: a worker may finish the work and then fail to ack (a crash or network blip), and the redelivery looks identical to a job that never ran. You cannot get exactly-once *processing* from delivery alone, so make handlers idempotent and lean on the `attempt` number when the last try needs different handling.
+
+**Exactly-once enqueue.** On the producer side, an idempotency key collapses duplicate enqueues within the dedup window onto the original job, so a producer can retry an uncertain enqueue without creating a second job. This holds only inside the window. See [idempotency & deduplication](/docs/concepts/idempotency-and-dedup) for how keys and the window behave.
+
 ## See also
 
-- [Leasing & redelivery](/docs/concepts/leasing): the lease lifecycle and redelivery in depth.
+- [Processing jobs](/docs/workers): reserving, leasing and the ack/nack/extend calls in code.
+- [Idempotency & deduplication](/docs/concepts/idempotency-and-dedup): dedup keys and idempotent handlers.
 - [Retries & dead-letter](/docs/concepts/retries-and-dead-letter): attempt counting and the dead-letter paths.
-- [Delivery guarantees](/docs/concepts/delivery-guarantees): the at-least-once and exactly-once guarantees behind these states.
 - [Priority & scheduling](/docs/concepts/priority-and-scheduling): how ready and scheduled jobs are ordered and promoted.

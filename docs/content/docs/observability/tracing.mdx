@@ -4,13 +4,15 @@ description: "Export OTLP traces and follow a job across producer, server, and w
 ---
 
 {/* SCAFFOLD — layout only, no prose written yet. */}
-{/* TODO(content): Tracing how-to. [tracing] enabled/otlp_endpoint/sample_ratio/service_name. Head sampling vs inherited caller context (always honored). View in Jaeger/collector. */}
+{/* TODO(content): Tracing how-to (server) + merged client-side propagation. [tracing] enabled/otlp_endpoint/sample_ratio/service_name. Head sampling vs inherited caller context (always honored). ABSORBED client-side propagation (was clients/tracing-propagation): the enqueue RPC's traceparent gRPC metadata is extracted server-side (set_parent_from_metadata) so the call nests in the caller's trace; EnqueueRequest.trace_context (traceparent/tracestate) is stored on the job and the worker's processing span is LINKED to it (link_from_proto — a span link, not a parent, because it runs later); clients auto-inject from the active OTel span (current_trace_context). View in Jaeger/collector. */}
 
 ## Enabling tracing
 
 ## OTLP exporter and sampling
 
 ## End-to-end trace propagation
+
+## Client trace propagation
 
 ## Service name and resource attributes
 
