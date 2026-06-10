@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap};
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -144,7 +144,7 @@ pub(super) async fn run_hub(state: Arc<AdminState>, mut shutdown: watch::Receive
             let mut history = state.history.write().expect("history lock");
             history.retain(|name, _| names.contains(name));
             for (name, sample) in &rates {
-                let ring = history.entry(name.clone()).or_insert_with(VecDeque::new);
+                let ring = history.entry(name.clone()).or_default();
                 ring.push_back(*sample);
                 if ring.len() > HISTORY_CAP {
                     ring.pop_front();
