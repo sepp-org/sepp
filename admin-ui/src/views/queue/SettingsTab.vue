@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query'
 import { computed, reactive, ref, watch } from 'vue'
 import { AdminApiError, api } from '../../api/client'
 import type { QueueOverridesPatch, QueueUpdateRequest } from '../../api/types'
+import TagInput from '../../components/TagInput.vue'
 
 const props = defineProps<{ queue: string }>()
 
@@ -71,6 +72,19 @@ function effectiveText(f: FieldDef): string {
   return Array.isArray(v) ? v.join(', ') : String(v)
 }
 
+// List fields stay comma-joined strings in `form` so the dirty/baseline
+// machinery is untouched; the pills are just a view over that string.
+function listValue(key: ListKey): string[] {
+  return (form[key] ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s) => s !== '')
+}
+
+function setList(key: ListKey, tags: string[]) {
+  form[key] = tags.join(', ')
+}
+
 function buildOverrides(): QueueOverridesPatch | null {
   const out: QueueOverridesPatch = {}
   for (const f of fields) {
@@ -128,7 +142,7 @@ function reset() {
 </script>
 
 <template>
-  <div class="flex max-w-2xl flex-col gap-4">
+  <div class="flex flex-col gap-4">
     <p class="text-sm text-ink-400">
       Per-queue overrides for <span class="font-mono text-ink-200">{{ queue }}</span
       >. Empty fields fall back to the global limits.
@@ -147,7 +161,15 @@ function reset() {
       <div class="grid grid-cols-2 gap-4">
         <div v-for="f in fields" :key="f.key" class="flex flex-col gap-1">
           <label class="text-xs text-ink-400" :for="`qset-${f.key}`">{{ f.label }}</label>
+          <TagInput
+            v-if="f.kind === 'list'"
+            :id="`qset-${f.key}`"
+            :model-value="listValue(f.key)"
+            :placeholder="effectiveText(f)"
+            @update:model-value="(v) => setList(f.key as ListKey, v)"
+          />
           <input
+            v-else
             :id="`qset-${f.key}`"
             v-model="form[f.key]"
             :placeholder="effectiveText(f)"

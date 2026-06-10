@@ -4,6 +4,7 @@ import { computed, reactive, ref } from 'vue'
 import { AdminApiError, api } from '../api/client'
 import type { ConfigChange, EffectiveConfig, JsonValue } from '../api/types'
 import ConfigField from '../components/ConfigField.vue'
+import { matchesPath } from '../lib/paths'
 
 type FieldKind = 'string' | 'number' | 'boolean' | 'string[]'
 
@@ -11,7 +12,8 @@ interface FieldSpec {
   key: string
   kind: FieldKind
   options?: string[]
-  redacted?: boolean
+  // Offers a "Generate" button that appends a random secret to the list.
+  generate?: boolean
 }
 
 type SectionTable = Exclude<keyof EffectiveConfig, 'queues'>
@@ -27,7 +29,7 @@ const sections: { table: SectionTable; fields: FieldSpec[] }[] = [
       { key: 'strict_queues', kind: 'boolean' },
     ],
   },
-  { table: 'auth', fields: [{ key: 'api_keys', kind: 'string', redacted: true }] },
+  { table: 'auth', fields: [{ key: 'api_keys', kind: 'string[]', generate: true }] },
   {
     table: 'limits',
     fields: [
@@ -98,8 +100,6 @@ const sections: { table: SectionTable; fields: FieldSpec[] }[] = [
     fields: [
       { key: 'enabled', kind: 'boolean' },
       { key: 'listen_addr', kind: 'string' },
-      { key: 'keys', kind: 'string', redacted: true },
-      { key: 'session_ttl_ms', kind: 'number' },
     ],
   },
 ]
@@ -137,7 +137,12 @@ function same(a: JsonValue | null, b: JsonValue | null): boolean {
 
 function onChange(table: SectionTable, key: string, value: JsonValue | null) {
   const path = `${table}.${key}`
-  if (same(value, fieldValue(table, key))) delete pending[path]
+  const base = fieldValue(table, key)
+  // Zero pills normally means "unset the key", but when the saved value is an
+  // explicit [] (reject-all), removing and re-adding a pill must not turn
+  // into a destructive delete-the-key change.
+  if (value === null && Array.isArray(base) && base.length === 0) value = base
+  if (same(value, base)) delete pending[path]
   else pending[path] = value
 }
 
@@ -150,10 +155,6 @@ function discardAll() {
   saveError.value = ''
 }
 
-function matchesPath(list: string[], path: string): boolean {
-  return list.some((p) => p === path || path.startsWith(p + '.'))
-}
-
 function pinned(path: string): boolean {
   return matchesPath(data.value?.env_pinned ?? [], path)
 }
@@ -162,16 +163,8 @@ function restartOnly(path: string): boolean {
   return matchesPath(data.value?.restart_only ?? [], path)
 }
 
-function redactedText(table: SectionTable, key: string): string {
-  if (table === 'auth' && key === 'api_keys') {
-    const v = data.value?.effective.auth.api_keys
-    return v ? `${v.count} key${v.count === 1 ? '' : 's'} configured` : 'none (auth disabled)'
-  }
-  if (table === 'admin' && key === 'keys') {
-    const v = data.value?.effective.admin.keys
-    return v && v.length > 0 ? v.map((k) => k.name).join(', ') : 'none (auth disabled)'
-  }
-  return ''
+function pendingRestart(path: string): boolean {
+  return matchesPath(data.value?.pending_restart ?? [], path)
 }
 
 async function save() {
@@ -209,7 +202,15 @@ async function reloadAfterConflict() {
     <h1 class="mb-4 text-lg font-semibold">Config</h1>
 
     <div
-      v-if="restartFields.length > 0"
+      v-if="data && data.pending_restart.length > 0"
+      class="mb-4 rounded border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm text-amber-300"
+    >
+      sepp.toml changed since the server started; the running values still apply for:
+      <span class="font-mono">{{ data.pending_restart.join(', ') }}</span>.
+      Restart the server to pick {{ data.pending_restart.length === 1 ? 'it' : 'them' }} up.
+    </div>
+    <div
+      v-else-if="restartFields.length > 0"
       class="mb-4 rounded border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm text-amber-300"
     >
       Saved. These fields require a server restart to take effect:
@@ -230,30 +231,22 @@ async function reloadAfterConflict() {
           [{{ section.table }}]
         </h2>
         <div class="divide-y divide-ink-800/60">
-          <template v-for="field in section.fields" :key="field.key">
-            <div v-if="field.redacted" class="flex items-center gap-3 px-4 py-2">
-              <span class="w-64 shrink-0 font-mono text-sm text-ink-200">{{ field.key }}</span>
-              <div class="min-w-0 flex-1">
-                <span class="text-sm text-ink-300">{{ redactedText(section.table, field.key) }}</span>
-                <p class="text-xs text-ink-500">
-                  Secret values are redacted; edit sepp.toml directly to change them.
-                </p>
-              </div>
-            </div>
-            <ConfigField
-              v-else
-              :path="`${section.table}.${field.key}`"
-              :label="field.key"
-              :kind="field.kind"
-              :options="field.options"
-              :value="shownValue(section.table, field.key)"
-              :dirty="`${section.table}.${field.key}` in pending"
-              :env-pinned="pinned(`${section.table}.${field.key}`)"
-              :restart-only="restartOnly(`${section.table}.${field.key}`)"
-              @change="(v) => onChange(section.table, field.key, v)"
-              @revert="revert(`${section.table}.${field.key}`)"
-            />
-          </template>
+          <ConfigField
+            v-for="field in section.fields"
+            :key="field.key"
+            :path="`${section.table}.${field.key}`"
+            :label="field.key"
+            :kind="field.kind"
+            :options="field.options"
+            :generate="field.generate"
+            :value="shownValue(section.table, field.key)"
+            :dirty="`${section.table}.${field.key}` in pending"
+            :env-pinned="pinned(`${section.table}.${field.key}`)"
+            :restart-only="restartOnly(`${section.table}.${field.key}`)"
+            :pending-restart="pendingRestart(`${section.table}.${field.key}`)"
+            @change="(v) => onChange(section.table, field.key, v)"
+            @revert="revert(`${section.table}.${field.key}`)"
+          />
         </div>
       </section>
 

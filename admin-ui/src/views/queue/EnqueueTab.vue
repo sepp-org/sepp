@@ -1,9 +1,12 @@
 <script setup lang="ts">
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query'
-import { computed, ref, watch } from 'vue'
+import { computed, defineAsyncComponent, ref, watch } from 'vue'
 import { AdminApiError, api } from '../../api/client'
 import type { EnqueueJobRequest, EnqueuePayload, EnqueueRejection } from '../../api/types'
 import CopyButton from '../../components/CopyButton.vue'
+
+// CodeMirror is heavy; load it only when the enqueue form actually renders.
+const CodeTextarea = defineAsyncComponent(() => import('../../components/CodeTextarea.vue'))
 
 const props = defineProps<{ queue: string }>()
 
@@ -23,7 +26,8 @@ type PayloadTab = (typeof payloadTabs)[number]['id']
 const jobType = ref('')
 const payloadTab = ref<PayloadTab>('json')
 const payloadText = ref('')
-const encoding = ref('json')
+const encoding = ref('application/json')
+const encodingTouched = ref(false)
 const priority = ref(0)
 const priorityTouched = ref(false)
 const maxAttempts = ref('')
@@ -36,7 +40,6 @@ const rejection = ref<EnqueueRejection | null>(null)
 const lastJobId = ref('')
 
 const allowedEncodings = computed(() => queueInfo.value?.effective.allowed_encodings ?? null)
-const encodingSuggestions = computed(() => allowedEncodings.value ?? ['json', 'text'])
 
 watch(
   () => queueInfo.value?.effective.default_priority,
@@ -46,12 +49,36 @@ watch(
   { immediate: true },
 )
 
-const tabDefaults: Record<PayloadTab, string> = { json: 'json', text: 'text', base64: '' }
-watch(payloadTab, (next, prev) => {
-  if (encoding.value === tabDefaults[prev] || encoding.value === '') {
-    encoding.value = tabDefaults[next]
-  }
-})
+const MIME_DEFAULTS: Record<PayloadTab, string> = {
+  json: 'application/json',
+  text: 'text/plain',
+  base64: 'application/octet-stream',
+}
+
+// The natural MIME type for the tab, unless the queue restricts encodings, in
+// which case the closest allowed value wins so the default is never rejected.
+function defaultEncoding(tab: PayloadTab): string {
+  const mime = MIME_DEFAULTS[tab]
+  const allowed = allowedEncodings.value
+  if (!allowed || allowed.length === 0 || allowed.includes(mime)) return mime
+  const hint = { json: 'json', text: 'text', base64: 'octet' }[tab]
+  return allowed.find((e) => e.toLowerCase().includes(hint)) ?? allowed[0]
+}
+
+// Follow the tab (and late-arriving queue limits) until the user edits the
+// field; a cleared field re-arms the default on the next tab switch.
+// `immediate` matters: on a warm vue-query cache, allowedEncodings starts at
+// its final value and the watcher would otherwise never fire.
+watch(
+  [payloadTab, allowedEncodings],
+  ([tab]) => {
+    if (!encodingTouched.value || encoding.value === '') {
+      encodingTouched.value = false
+      encoding.value = defaultEncoding(tab)
+    }
+  },
+  { immediate: true },
+)
 
 function addCustomRow() {
   customRows.value.push({ key: '', value: '' })
@@ -140,7 +167,7 @@ function submit() {
 </script>
 
 <template>
-  <form class="flex max-w-xl flex-col gap-4" @submit.prevent="submit">
+  <form class="flex flex-col gap-4" @submit.prevent="submit">
     <div class="flex flex-col gap-1">
       <label class="text-xs text-ink-400" for="enq-type">Job type</label>
       <input
@@ -167,11 +194,10 @@ function submit() {
           {{ t.label }}
         </button>
       </div>
-      <textarea
+      <CodeTextarea
         v-model="payloadText"
-        rows="6"
+        :highlight="payloadTab === 'json' ? 'json' : 'none'"
         :placeholder="payloadTab === 'json' ? '{ }' : payloadTab === 'base64' ? 'base64 bytes' : 'plain text'"
-        class="rounded border border-ink-700 bg-ink-950 px-3 py-2 font-mono text-sm outline-none focus:border-accent"
       />
     </div>
 
@@ -180,12 +206,9 @@ function submit() {
       <input
         id="enq-encoding"
         v-model="encoding"
-        list="enq-encodings"
         class="rounded border border-ink-700 bg-ink-950 px-3 py-1.5 text-sm outline-none focus:border-accent"
+        @input="encodingTouched = true"
       />
-      <datalist id="enq-encodings">
-        <option v-for="e in encodingSuggestions" :key="e" :value="e" />
-      </datalist>
       <p v-if="allowedEncodings" class="text-xs text-ink-500">
         Allowed: {{ allowedEncodings.join(', ') }}
       </p>

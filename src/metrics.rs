@@ -183,6 +183,10 @@ pub struct CycleMetrics {
     pub sweep_dedup_expirations_by_queue: HashMap<String, u64>,
     pub dead_letters_expired: u64,
     pub dead_letters_drained: u64,
+    // Queues fully emptied by an admin purge this cycle. Not a metric: the
+    // committer uses it to drop the queue's admin totals immediately instead
+    // of waiting out the 15-minute idle eviction.
+    pub purged_queues: Vec<String>,
 }
 
 #[derive(Clone)]

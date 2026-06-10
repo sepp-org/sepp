@@ -15,22 +15,6 @@ export interface ApiErrorBody {
   rejection?: EnqueueRejection
 }
 
-// POST /session
-export interface SessionLoginRequest {
-  key: string
-}
-
-export interface SessionLoginResponse {
-  name: string
-  expires_at_ms: number
-}
-
-// GET /session
-export interface SessionInfo {
-  name: string | null
-  auth_enabled: boolean
-}
-
 // Stats frame: SSE `stats` event payload, also `frame` in /overview and the hello event.
 export interface QueueTotals {
   enqueued: number
@@ -242,6 +226,12 @@ export interface EnqueueRejection {
   detail: string
 }
 
+// POST /queues/{name}/jobs:dead-letter
+export interface DeadLetterJobsResult {
+  dead_lettered: number
+  missing: number
+}
+
 // POST /queues/{name}/dead-letters:requeue and :delete
 export interface DeadLetterKeysRequest {
   keys_b64: string[]
@@ -271,7 +261,7 @@ export interface ServerConfigView {
 }
 
 export interface AuthConfigView {
-  api_keys: { count: number } | null
+  api_keys: string[] | null
 }
 
 export interface LimitsConfigView {
@@ -332,8 +322,6 @@ export interface MetricsConfigView {
 export interface AdminConfigView {
   enabled: boolean
   listen_addr: string
-  keys: { name: string }[] | null
-  session_ttl_ms: number
 }
 
 export interface EffectiveConfig {
@@ -353,6 +341,9 @@ export interface ConfigResponse {
   etag: string
   env_pinned: string[]
   restart_only: string[]
+  // Restart-only paths whose on-disk value differs from the running (boot)
+  // value; they take effect on the next restart.
+  pending_restart: string[]
 }
 
 // PUT /config

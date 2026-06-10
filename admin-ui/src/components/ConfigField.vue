@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { ref, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
 import type { JsonValue } from '../api/types'
+import TagInput from './TagInput.vue'
 
 const props = defineProps<{
   path: string
@@ -10,7 +11,9 @@ const props = defineProps<{
   dirty: boolean
   envPinned: boolean
   restartOnly: boolean
+  pendingRestart?: boolean
   options?: string[]
+  generate?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -31,6 +34,8 @@ watch(
     text.value = format(v)
   },
 )
+
+const tags = computed(() => (Array.isArray(props.value) ? props.value.map(String) : []))
 
 const envVar =
   'SEPP_' +
@@ -53,24 +58,35 @@ function commit() {
     }
     text.value = String(n)
     emit('change', n)
-  } else if (props.kind === 'string[]') {
-    const parts = raw
-      .split(',')
-      .map((s) => s.trim())
-      .filter((s) => s !== '')
-    text.value = parts.join(', ')
-    emit('change', parts.length > 0 ? parts : null)
   } else {
     emit('change', raw)
   }
 }
 
-function onToggle(ev: Event) {
-  emit('change', (ev.target as HTMLInputElement).checked)
+function onTags(next: string[]) {
+  // Zero pills means "unset, fall back to the default", mirroring the empty
+  // text input on scalar fields.
+  emit('change', next.length > 0 ? next : null)
 }
 
-function onSelect(ev: Event) {
-  emit('change', (ev.target as HTMLSelectElement).value)
+const copied = ref(false)
+
+function generateSecret() {
+  const bytes = new Uint8Array(32)
+  crypto.getRandomValues(bytes)
+  const b64 = btoa(String.fromCharCode(...bytes))
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '')
+  const key = `sepp_${b64}`
+  emit('change', [...tags.value, key])
+  navigator.clipboard
+    ?.writeText(key)
+    .then(() => {
+      copied.value = true
+      setTimeout(() => (copied.value = false), 1500)
+    })
+    .catch(() => {})
 }
 </script>
 
@@ -79,7 +95,14 @@ function onSelect(ev: Event) {
     <div class="flex w-64 shrink-0 items-center gap-2">
       <span class="truncate font-mono text-sm text-ink-200">{{ label }}</span>
       <span
-        v-if="restartOnly"
+        v-if="pendingRestart"
+        class="rounded bg-amber-500/30 px-1.5 py-0.5 text-[10px] font-medium text-amber-300"
+        title="Changed on disk since the server started; the running value applies until a restart"
+      >
+        restart pending
+      </span>
+      <span
+        v-else-if="restartOnly"
         class="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-400"
         title="Changing this field requires a server restart"
       >
@@ -88,23 +111,60 @@ function onSelect(ev: Event) {
       <span v-if="dirty" class="size-1.5 shrink-0 rounded-full bg-accent" title="Unsaved change"></span>
     </div>
     <div class="flex min-w-0 flex-1 items-center gap-2">
-      <input
+      <button
         v-if="kind === 'boolean'"
-        type="checkbox"
-        :checked="value === true"
+        type="button"
+        role="switch"
+        :aria-checked="value === true"
         :disabled="envPinned"
-        class="size-4 accent-accent disabled:opacity-50"
-        @change="onToggle"
-      />
-      <select
-        v-else-if="options"
-        :value="format(value)"
-        :disabled="envPinned"
-        class="rounded border border-ink-700 bg-ink-950 px-2 py-1 text-sm outline-none focus:border-accent disabled:opacity-50"
-        @change="onSelect"
+        class="relative h-5 w-9 shrink-0 rounded-full transition-colors disabled:opacity-50"
+        :class="value === true ? 'bg-accent' : 'bg-ink-700'"
+        @click="emit('change', value !== true)"
       >
-        <option v-for="o in options" :key="o" :value="o">{{ o }}</option>
-      </select>
+        <span
+          class="absolute top-0.5 left-0.5 size-4 rounded-full bg-ink-100 transition-transform"
+          :class="value === true ? 'translate-x-4' : ''"
+        />
+      </button>
+      <div
+        v-else-if="options"
+        class="flex overflow-hidden rounded border border-ink-700"
+        :class="envPinned ? 'opacity-50' : ''"
+      >
+        <button
+          v-for="o in options"
+          :key="o"
+          type="button"
+          :disabled="envPinned"
+          class="border-l border-ink-700 px-2.5 py-1 font-mono text-sm transition-colors first:border-l-0"
+          :class="
+            o === format(value)
+              ? 'bg-ink-700 text-ink-100'
+              : 'bg-ink-950 text-ink-400 hover:text-ink-100'
+          "
+          @click="emit('change', o)"
+        >
+          {{ o }}
+        </button>
+      </div>
+      <template v-else-if="kind === 'string[]'">
+        <TagInput
+          :model-value="tags"
+          :disabled="envPinned"
+          :placeholder="Array.isArray(value) ? 'reject all (empty list in sepp.toml)' : 'default'"
+          @update:model-value="onTags"
+        />
+        <button
+          v-if="generate"
+          type="button"
+          class="shrink-0 rounded border border-ink-700 px-2 py-1 text-xs text-ink-300 hover:text-ink-100 disabled:opacity-50"
+          :disabled="envPinned"
+          title="Generate a random key, add it to the list, and copy it to the clipboard"
+          @click="generateSecret"
+        >
+          {{ copied ? 'Copied!' : 'Generate' }}
+        </button>
+      </template>
       <input
         v-else
         v-model="text"
@@ -118,7 +178,7 @@ function onSelect(ev: Event) {
       />
       <span
         v-if="envPinned"
-        class="cursor-help text-ink-500"
+        class="shrink-0 cursor-help text-ink-500"
         :title="`Pinned by ${envVar}; unset the environment variable to edit`"
       >
         <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" class="size-3.5">
@@ -129,7 +189,11 @@ function onSelect(ev: Event) {
           />
         </svg>
       </span>
-      <button v-if="dirty" class="text-xs text-ink-400 hover:text-ink-100" @click="emit('revert')">
+      <button
+        v-if="dirty"
+        class="shrink-0 text-xs text-ink-400 hover:text-ink-100"
+        @click="emit('revert')"
+      >
         revert
       </button>
     </div>

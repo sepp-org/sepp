@@ -1,12 +1,16 @@
 <script setup lang="ts">
-import { useQuery } from '@tanstack/vue-query'
-import { computed } from 'vue'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query'
+import { computed, ref } from 'vue'
 import { api } from '../../api/client'
 import type { JobState, JobSummary } from '../../api/types'
+import ConfirmDialog from '../../components/ConfirmDialog.vue'
 import CopyButton from '../../components/CopyButton.vue'
 import PayloadView from '../../components/PayloadView.vue'
+import { useStatsStream } from '../../composables/useStatsStream'
 
 const props = defineProps<{ queue: string; state: JobState; job: JobSummary }>()
+
+const emit = defineEmits<{ gone: [notice: string] }>()
 
 const { data: detail, error } = useQuery({
   queryKey: computed(() =>
@@ -20,6 +24,51 @@ const { data: detail, error } = useQuery({
       : api.job(props.job.id),
   retry: false,
 })
+
+const queryClient = useQueryClient()
+const { server } = useStatsStream()
+// In-flight jobs are excluded: a worker holds their lease.
+const canDeadLetter = computed(() => props.state === 'ready' || props.state === 'scheduled')
+const canRequeue = computed(() => props.state === 'dead_letter')
+const retentionOff = computed(() => server.value?.dead_letter_retention_ms === 0)
+const confirm = ref<'dead_letter' | 'requeue' | null>(null)
+const actionError = ref('')
+
+function finish(notice: string) {
+  confirm.value = null
+  void queryClient.invalidateQueries({ queryKey: ['jobs', props.queue] })
+  emit('gone', notice)
+}
+
+function fail(e: unknown, fallback: string) {
+  confirm.value = null
+  actionError.value = e instanceof Error ? e.message : fallback
+}
+
+const { mutate: deadLetter, isPending: deadLettering } = useMutation({
+  mutationFn: () =>
+    api.deadLetterJobs(props.queue, props.state as 'ready' | 'scheduled', [props.job.key_b64]),
+  onSuccess: (res) => {
+    finish(
+      res.dead_lettered === 1
+        ? retentionOff.value
+          ? 'Job dropped (dead-letter retention is disabled)'
+          : 'Job dead-lettered'
+        : 'Job was already gone',
+    )
+  },
+  onError: (e) => fail(e, 'dead-lettering failed'),
+})
+
+const { mutate: requeue, isPending: requeueing } = useMutation({
+  mutationFn: () => api.requeueDeadLetters(props.queue, [props.job.key_b64]),
+  onSuccess: (res) => {
+    finish(res.requeued === 1 ? 'Job requeued to ready' : 'Job was already gone')
+  },
+  onError: (e) => fail(e, 'requeue failed'),
+})
+
+const actionBusy = computed(() => deadLettering.value || requeueing.value)
 
 const full = computed<JobSummary>(() => detail.value ?? props.job)
 const payloadB64 = computed(() => detail.value?.payload.data_b64 ?? props.job.payload.data_b64)
@@ -83,8 +132,25 @@ function relTime(ms: number): string {
       <span class="rounded-full bg-ink-800 px-2 py-0.5 text-xs text-ink-300">
         {{ stateLabels[state] }}
       </span>
+      <button
+        v-if="canDeadLetter"
+        class="ml-auto rounded border border-red-500/40 px-2.5 py-1 text-sm text-red-400 hover:bg-red-500/10 disabled:opacity-50"
+        :disabled="actionBusy"
+        @click="confirm = 'dead_letter'"
+      >
+        Dead-letter
+      </button>
+      <button
+        v-else-if="canRequeue"
+        class="ml-auto rounded border border-emerald-500/40 px-2.5 py-1 text-sm text-emerald-400 hover:bg-emerald-500/10 disabled:opacity-50"
+        :disabled="actionBusy"
+        @click="confirm = 'requeue'"
+      >
+        Requeue
+      </button>
     </div>
 
+    <p v-if="actionError" class="text-sm text-red-400">{{ actionError }}</p>
     <p v-if="error" class="text-sm text-amber-400">{{ error.message }}</p>
 
     <dl class="grid grid-cols-2 gap-x-6 gap-y-3 text-sm sm:grid-cols-3">
@@ -138,5 +204,36 @@ function relTime(ms: number): string {
         :download-name="downloadName"
       />
     </div>
+
+    <ConfirmDialog
+      v-if="confirm === 'dead_letter'"
+      title="Dead-letter job"
+      confirm-label="Dead-letter"
+      danger
+      :busy="actionBusy"
+      @confirm="deadLetter()"
+      @cancel="confirm = null"
+    >
+      <p>
+        Move this {{ state }} job to the dead-letter queue? Workers will never see it.
+      </p>
+      <p v-if="retentionOff" class="mt-1 text-amber-400">
+        Dead-letter retention is disabled
+        (<span class="font-mono">dead_letter_retention_ms = 0</span>), so the job is dropped
+        permanently instead of kept for replay.
+      </p>
+    </ConfirmDialog>
+    <ConfirmDialog
+      v-else-if="confirm === 'requeue'"
+      title="Requeue dead letter"
+      confirm-label="Requeue"
+      :busy="actionBusy"
+      @confirm="requeue()"
+      @cancel="confirm = null"
+    >
+      <p>
+        Requeue this dead-lettered job back to ready with the attempt counter reset?
+      </p>
+    </ConfirmDialog>
   </div>
 </template>

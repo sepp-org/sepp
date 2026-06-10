@@ -11,7 +11,6 @@ const router = createRouter({
       meta: { drawer: true },
     },
     { path: '/config', name: 'config', component: () => import('./views/ConfigView.vue') },
-    { path: '/login', name: 'login', component: () => import('./views/LoginView.vue') },
   ],
 })
 

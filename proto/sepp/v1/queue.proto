@@ -507,9 +507,9 @@ message ExtendResponse {
 // Dead-letter
 // ============================================================================
 
-// Why a job was moved to dead-letter. Mirrors the three terminal paths on the
-// server: a worker explicitly rejected it, it ran out of attempts, or its lease
-// expired with no attempts left.
+// Why a job was moved to dead-letter. Mirrors the terminal paths on the
+// server: a worker explicitly rejected it, it ran out of attempts, its lease
+// expired with no attempts left, or an operator dead-lettered it by hand.
 enum DeadLetterCause {
   DEAD_LETTER_CAUSE_UNSPECIFIED = 0;
 
@@ -522,6 +522,9 @@ enum DeadLetterCause {
   // The lease expired while the job was on its final attempt, so it could not
   // be redelivered.
   DEAD_LETTER_CAUSE_LEASE_EXPIRED = 3;
+
+  // An operator dead-lettered the job through the admin API.
+  DEAD_LETTER_CAUSE_ADMIN = 4;
 }
 
 // A terminal record of a job that was dead-lettered. Retained only when the

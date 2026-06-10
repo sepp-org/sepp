@@ -1,9 +1,9 @@
-import router from '../router'
 import type {
   ApiErrorBody,
   ConfigResponse,
   ConfigUpdateRequest,
   ConfigWriteResult,
+  DeadLetterJobsResult,
   DeleteResult,
   EnqueueJobRequest,
   EnqueueJobResponse,
@@ -17,8 +17,6 @@ import type {
   QueueUpdateRequest,
   RequeueResult,
   ServerInfo,
-  SessionInfo,
-  SessionLoginResponse,
 } from './types'
 
 export const API_BASE = '/admin/api/v1'
@@ -58,11 +56,7 @@ async function request<T>(
   }
   const res = await fetch(API_BASE + path, init)
   if (!res.ok) {
-    const err = new AdminApiError(res.status, await parseError(res))
-    if (res.status === 401 && router.currentRoute.value.name !== 'login') {
-      void router.push('/login')
-    }
-    throw err
+    throw new AdminApiError(res.status, await parseError(res))
   }
   if (res.status === 204) return undefined as unknown as T
   return (await res.json()) as T
@@ -73,10 +67,6 @@ function seg(part: string): string {
 }
 
 export const api = {
-  login: (key: string) => request<SessionLoginResponse>('POST', '/session', { key }),
-  logout: () => request<void>('DELETE', '/session'),
-  session: () => request<SessionInfo>('GET', '/session'),
-
   overview: () => request<Overview>('GET', '/overview'),
   serverInfo: () => request<ServerInfo>('GET', '/server-info'),
 
@@ -103,6 +93,17 @@ export const api = {
     request<JobDetail>('GET', `/queues/${seg(name)}/dead-letters/${seg(keyB64)}`),
   enqueue: (name: string, body: EnqueueJobRequest) =>
     request<EnqueueJobResponse>('POST', `/queues/${seg(name)}/jobs`, body),
+  deadLetterJobs: (
+    name: string,
+    state: 'ready' | 'scheduled',
+    keysB64: string[],
+    reason?: string,
+  ) =>
+    request<DeadLetterJobsResult>('POST', `/queues/${seg(name)}/jobs:dead-letter`, {
+      state,
+      keys_b64: keysB64,
+      reason,
+    }),
   requeueDeadLetters: (name: string, keysB64: string[]) =>
     request<RequeueResult>('POST', `/queues/${seg(name)}/dead-letters:requeue`, {
       keys_b64: keysB64,

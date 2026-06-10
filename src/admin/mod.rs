@@ -1,5 +1,4 @@
 pub mod assets;
-pub mod auth;
 pub mod config_edit;
 pub mod routes;
 pub mod stats;
@@ -18,11 +17,10 @@ use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 use tracing::{error, info};
 
-use crate::config::SharedConfig;
+use crate::config::{Config, SharedConfig};
 use crate::queues::SharedRegistry;
 use crate::storage::{AdminSnapshot, ReadHandle, Storage, now_ms};
 
-use auth::SessionStore;
 use stats::RateSample;
 
 // Pre-serialized broadcast events fanned out to every SSE subscriber.
@@ -40,8 +38,11 @@ pub struct AdminState {
     pub read: ReadHandle,
     pub stats: Arc<ArcSwap<AdminSnapshot>>,
     pub config: SharedConfig,
+    // The config the server booted with. Hot reloads store the whole on-disk
+    // config into `config`, including restart-only fields whose running
+    // values never change; for those, `boot` is the truth.
+    pub boot: Arc<Config>,
     pub registry: SharedRegistry,
-    pub sessions: SessionStore,
     pub hub: broadcast::Sender<Event>,
     pub history: History,
     // The latest StatsHub frame, reused by /overview and the SSE hello event.
@@ -57,6 +58,7 @@ impl AdminState {
     pub fn new(
         storage: Storage,
         config: SharedConfig,
+        boot: Config,
         registry: SharedRegistry,
         config_path: PathBuf,
         reload_seq: watch::Receiver<u64>,
@@ -67,8 +69,8 @@ impl AdminState {
             stats: storage.admin_stats(),
             storage,
             config,
+            boot: Arc::new(boot),
             registry,
-            sessions: SessionStore::default(),
             hub,
             history: Arc::new(RwLock::new(HashMap::new())),
             latest_frame: Arc::new(ArcSwap::from_pointee(serde_json::Value::Null)),
@@ -114,10 +116,6 @@ pub async fn spawn(
 
 fn router(state: Arc<AdminState>) -> Router {
     Router::new()
-        .route(
-            "/admin/api/v1/session",
-            post(auth::login).get(auth::session).delete(auth::logout),
-        )
         .route("/admin/api/v1/overview", get(routes::overview))
         .route("/admin/api/v1/queues", get(routes::list_queues))
         .route(
@@ -135,6 +133,10 @@ fn router(state: Arc<AdminState>) -> Router {
             get(routes::get_dead_letter),
         )
         .route(
+            "/admin/api/v1/queues/{name}/jobs:dead-letter",
+            post(routes::dead_letter_jobs),
+        )
+        .route(
             "/admin/api/v1/queues/{name}/dead-letters:requeue",
             post(routes::requeue_dead_letters),
         )
@@ -149,10 +151,6 @@ fn router(state: Arc<AdminState>) -> Router {
         )
         .route("/admin/api/v1/server-info", get(routes::server_info))
         .route("/admin/api/v1/events", get(stats::events))
-        .route_layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            auth::require,
-        ))
         .fallback(assets::serve)
         .with_state(state)
 }

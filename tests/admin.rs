@@ -1,8 +1,8 @@
-//! End-to-end tests for the admin web UI plane: HTTP API, auth, SSE stats,
-//! job inspection, dead-letter operations, queue deletion and the config
-//! editor, driven against a real server process. Mirrors the harness in
-//! `tests/integration.rs`, plus a raw HTTP/1.1 client over `TcpStream` so no
-//! extra dependencies are needed.
+//! End-to-end tests for the admin web UI plane: HTTP API, SSE stats, job
+//! inspection, dead-letter operations, queue creation and deletion and the
+//! config editor, driven against a real server process. Mirrors the harness
+//! in `tests/integration.rs`, plus a raw HTTP/1.1 client over `TcpStream` so
+//! no extra dependencies are needed.
 
 use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
@@ -288,18 +288,10 @@ async fn nack_dead_letter(client: &Client, job: &Job, reason: &str) -> bool {
 
 struct HttpResponse {
     status: u16,
-    headers: Vec<(String, String)>,
     body: String,
 }
 
 impl HttpResponse {
-    fn header(&self, name: &str) -> Option<&str> {
-        self.headers
-            .iter()
-            .find(|(n, _)| n == name)
-            .map(|(_, v)| v.as_str())
-    }
-
     fn json(&self) -> Value {
         serde_json::from_str(&self.body)
             .unwrap_or_else(|e| panic!("response body is not JSON ({e}): {:?}", self.body))
@@ -364,11 +356,7 @@ fn parse_response(raw: &[u8]) -> HttpResponse {
         String::from_utf8_lossy(rest).into_owned()
     };
 
-    HttpResponse {
-        status,
-        headers,
-        body,
-    }
+    HttpResponse { status, body }
 }
 
 async fn http(
@@ -514,157 +502,7 @@ fn stats_frames(body: &str) -> Vec<Value> {
 }
 
 // ---------------------------------------------------------------------------
-// 1. Auth
-// ---------------------------------------------------------------------------
-
-fn admin_cfg_with_key(key: &str) -> String {
-    format!(
-        "[admin]\nenabled = true\nlisten_addr = \"127.0.0.1:0\"\nkeys = [{{ name = \"ops\", key = \"{key}\" }}]\n"
-    )
-}
-
-#[tokio::test]
-async fn admin_auth_gates_login_bearer_and_logout() {
-    let (_guard, _client, port) =
-        start_admin_server("auth", &admin_cfg_with_key("test-secret"), &[]).await;
-
-    // No credentials at all.
-    let resp = http(port, "GET", "/admin/api/v1/overview", &[], None).await;
-    assert_eq!(resp.status, 401);
-    assert_eq!(resp.json()["code"], "unauthorized");
-
-    // A wrong key does not create a session.
-    let body = json!({ "key": "wrong" }).to_string();
-    let resp = http(port, "POST", "/admin/api/v1/session", &[], Some(&body)).await;
-    assert_eq!(resp.status, 401);
-
-    // Login names the key and sets an HttpOnly session cookie.
-    let body = json!({ "key": "test-secret" }).to_string();
-    let resp = http(port, "POST", "/admin/api/v1/session", &[], Some(&body)).await;
-    assert_eq!(resp.status, 200, "login failed: {}", resp.body);
-    let login = resp.json();
-    assert_eq!(login["name"], "ops");
-    assert!(login["expires_at_ms"].as_i64().unwrap() > epoch_ms_in(Duration::ZERO));
-    let set_cookie = resp
-        .header("set-cookie")
-        .expect("login sets a cookie")
-        .to_string();
-    assert!(set_cookie.contains("HttpOnly"), "cookie flags: {set_cookie}");
-    assert!(set_cookie.contains("SameSite=Strict"));
-    let cookie = set_cookie.split(';').next().unwrap().to_string();
-    assert!(cookie.starts_with("sepp_admin="));
-
-    // The cookie authenticates API calls.
-    let resp = http(
-        port,
-        "GET",
-        "/admin/api/v1/session",
-        &[("Cookie", cookie.as_str())],
-        None,
-    )
-    .await;
-    assert_eq!(resp.status, 200);
-    let session = resp.json();
-    assert_eq!(session["name"], "ops");
-    assert_eq!(session["auth_enabled"], json!(true));
-
-    // A raw Bearer key works without a session, for curl.
-    let resp = http(
-        port,
-        "GET",
-        "/admin/api/v1/overview",
-        &[("Authorization", "Bearer test-secret")],
-        None,
-    )
-    .await;
-    assert_eq!(resp.status, 200);
-
-    // Logout invalidates the session server-side.
-    let resp = http(
-        port,
-        "DELETE",
-        "/admin/api/v1/session",
-        &[("Cookie", cookie.as_str())],
-        None,
-    )
-    .await;
-    assert_eq!(resp.status, 204);
-    let resp = http(
-        port,
-        "GET",
-        "/admin/api/v1/overview",
-        &[("Cookie", cookie.as_str())],
-        None,
-    )
-    .await;
-    assert_eq!(resp.status, 401, "a logged-out cookie is rejected");
-}
-
-#[tokio::test]
-async fn key_rotation_via_hot_reload_invalidates_sessions() {
-    let (guard, _client, port) =
-        start_admin_server("rotate", &admin_cfg_with_key("old-secret"), &[]).await;
-
-    let body = json!({ "key": "old-secret" }).to_string();
-    let resp = http(port, "POST", "/admin/api/v1/session", &[], Some(&body)).await;
-    assert_eq!(resp.status, 200);
-    let cookie = resp
-        .header("set-cookie")
-        .expect("login sets a cookie")
-        .split(';')
-        .next()
-        .unwrap()
-        .to_string();
-    let resp = http(
-        port,
-        "GET",
-        "/admin/api/v1/overview",
-        &[("Cookie", cookie.as_str())],
-        None,
-    )
-    .await;
-    assert_eq!(resp.status, 200, "the session works before the rotation");
-
-    // Rotate the key on disk: the session stores the old key's hash, so the
-    // reload must invalidate it. Rewrite periodically so a single missed
-    // filesystem event cannot wedge the test.
-    let rotated = admin_cfg_with_key("new-secret");
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let mut invalidated = false;
-    while Instant::now() < deadline && !invalidated {
-        std::fs::write(&guard.cfg_path, &rotated).expect("rewrite config");
-        let window = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < window {
-            let resp = http(
-                port,
-                "GET",
-                "/admin/api/v1/overview",
-                &[("Cookie", cookie.as_str())],
-                None,
-            )
-            .await;
-            if resp.status == 401 {
-                invalidated = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    }
-    assert!(
-        invalidated,
-        "rotating the admin keys never invalidated the session"
-    );
-
-    // The rotated key logs in, proving the reload applied rather than auth
-    // breaking wholesale.
-    let body = json!({ "key": "new-secret" }).to_string();
-    let resp = http(port, "POST", "/admin/api/v1/session", &[], Some(&body)).await;
-    assert_eq!(resp.status, 200);
-    assert_eq!(resp.json()["name"], "ops");
-}
-
-// ---------------------------------------------------------------------------
-// 2. Overview + queues
+// 1. Overview + queues
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -726,7 +564,7 @@ async fn overview_and_queues_report_depths_and_totals() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. Peek + cursor paging
+// 2. Peek + cursor paging
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -830,7 +668,7 @@ async fn peek_lists_ready_jobs_and_pages_with_cursors() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. Enqueue over HTTP
+// 3. Enqueue over HTTP
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -911,7 +749,7 @@ async fn http_enqueue_round_trips_and_rejects_bad_encoding() {
 }
 
 // ---------------------------------------------------------------------------
-// 5. Dead letters: peek, requeue, delete
+// 4. Dead letters: peek, requeue, delete
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -1041,9 +879,198 @@ async fn dead_letters_peek_requeue_and_delete() {
     assert!(page["jobs"].as_array().unwrap().is_empty());
 }
 
+#[tokio::test]
+async fn admin_dead_letters_ready_and_scheduled_jobs() {
+    let cfg = format!("{ADMIN_CFG}\n[storage]\ndead_letter_retention_ms = 600000\n");
+    let (_guard, client, port) = start_admin_server("adl", &cfg, &[]).await;
+    let jobs_path = |state: &str| format!("/admin/api/v1/queues/adm-adl-q/jobs?state={state}");
+
+    enqueue(
+        &client,
+        EnqueueRequest {
+            payload: Some(Payload {
+                data: b"poison".to_vec(),
+                encoding: "text/plain".to_string(),
+            }),
+            ..enqueue_req("adm-adl-q")
+        },
+    )
+    .await;
+    enqueue(&client, enqueue_req("adm-adl-q")).await;
+    enqueue(
+        &client,
+        EnqueueRequest {
+            scheduled_at: Some(ts_ms(epoch_ms_in(Duration::from_secs(3600)))),
+            ..enqueue_req("adm-adl-q")
+        },
+    )
+    .await;
+
+    // Dead-letter one ready job; a junk key counts as missing, not an error.
+    let page = http(port, "GET", &jobs_path("ready"), &[], None).await.json();
+    let ready = page["jobs"].as_array().unwrap();
+    assert_eq!(ready.len(), 2);
+    let victim = ready
+        .iter()
+        .find(|j| j["payload"]["data_b64"].as_str().is_some_and(|d| !d.is_empty()))
+        .expect("the payload-carrying job is listed");
+    let victim_id = victim["id"].as_str().unwrap().to_string();
+    let victim_key = victim["key_b64"].as_str().unwrap().to_string();
+
+    let body = json!({
+        "state": "ready",
+        "keys_b64": [victim_key, B64.encode(b"junk")],
+        "reason": "poison payload",
+    })
+    .to_string();
+    let resp = http(
+        port,
+        "POST",
+        "/admin/api/v1/queues/adm-adl-q/jobs:dead-letter",
+        &[],
+        Some(&body),
+    )
+    .await;
+    assert_eq!(resp.status, 200, "dead-letter failed: {}", resp.body);
+    let outcome = resp.json();
+    assert_eq!(outcome["dead_lettered"], json!(1));
+    assert_eq!(outcome["missing"], json!(1));
+
+    let page = http(port, "GET", &jobs_path("ready"), &[], None).await.json();
+    assert_eq!(page["jobs"].as_array().unwrap().len(), 1, "one ready job remains");
+
+    let page = http(port, "GET", &jobs_path("dead_letter"), &[], None)
+        .await
+        .json();
+    let records = page["jobs"].as_array().unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["id"], victim_id.as_str());
+    assert_eq!(records[0]["cause"], "admin");
+    assert_eq!(records[0]["last_reason"], "poison payload");
+
+    // The record kept its payload: requeue it and run it like any other job.
+    let key_b64 = records[0]["key_b64"].as_str().unwrap().to_string();
+    let body = json!({ "keys_b64": [key_b64] }).to_string();
+    let resp = http(
+        port,
+        "POST",
+        "/admin/api/v1/queues/adm-adl-q/dead-letters:requeue",
+        &[],
+        Some(&body),
+    )
+    .await;
+    assert_eq!(resp.status, 200);
+    let job = reserve(&client, "adm-adl-q", LEASE, WAIT)
+        .await
+        .expect("requeued job is reservable");
+    let mut seen = vec![job];
+    if seen[0].id != victim_id {
+        seen.push(
+            reserve(&client, "adm-adl-q", LEASE, WAIT)
+                .await
+                .expect("victim job is reservable"),
+        );
+    }
+    let revived = seen
+        .iter()
+        .find(|j| j.id == victim_id)
+        .expect("the dead-lettered job came back");
+    assert_eq!(
+        revived.payload.as_ref().map(|p| p.data.as_slice()),
+        Some(&b"poison"[..])
+    );
+
+    // Scheduled jobs dead-letter the same way.
+    let page = http(port, "GET", &jobs_path("scheduled"), &[], None)
+        .await
+        .json();
+    let key = page["jobs"][0]["key_b64"].as_str().unwrap().to_string();
+    let body = json!({ "state": "scheduled", "keys_b64": [key] }).to_string();
+    let resp = http(
+        port,
+        "POST",
+        "/admin/api/v1/queues/adm-adl-q/jobs:dead-letter",
+        &[],
+        Some(&body),
+    )
+    .await;
+    assert_eq!(resp.status, 200, "scheduled dead-letter failed: {}", resp.body);
+    assert_eq!(resp.json()["dead_lettered"], json!(1));
+    let page = http(port, "GET", &jobs_path("scheduled"), &[], None)
+        .await
+        .json();
+    assert!(page["jobs"].as_array().unwrap().is_empty());
+
+    // In-flight jobs are refused outright.
+    let body = json!({ "state": "inflight", "keys_b64": [] }).to_string();
+    let resp = http(
+        port,
+        "POST",
+        "/admin/api/v1/queues/adm-adl-q/jobs:dead-letter",
+        &[],
+        Some(&body),
+    )
+    .await;
+    assert_eq!(resp.status, 400);
+}
+
 // ---------------------------------------------------------------------------
-// 6. Queue deletion + purge
+// 5. Queue creation, deletion + purge
 // ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn put_queue_with_no_overrides_declares_it() {
+    let (guard, _client, port) = start_admin_server("addq", ADMIN_CFG, &[]).await;
+
+    let config = http(port, "GET", "/admin/api/v1/config", &[], None)
+        .await
+        .json();
+    let etag = config["etag"].as_str().unwrap().to_string();
+
+    let body = json!({ "etag": etag, "overrides": {} }).to_string();
+    let resp = http(
+        port,
+        "PUT",
+        "/admin/api/v1/queues/adm-new-q",
+        &[],
+        Some(&body),
+    )
+    .await;
+    assert_eq!(resp.status, 200, "queue create failed: {}", resp.body);
+    let put = resp.json();
+    assert_eq!(put["applied"], json!(true));
+    assert!(put["requires_restart"].as_array().unwrap().is_empty());
+
+    let on_disk = std::fs::read_to_string(&guard.cfg_path).expect("config file still exists");
+    assert!(
+        on_disk.contains("name = \"adm-new-q\""),
+        "the declaration landed in the file:\n{on_disk}"
+    );
+
+    // The watcher applied the write before the PUT returned, so the queue is
+    // already declared in the running registry.
+    let resp = http(port, "GET", "/admin/api/v1/queues/adm-new-q", &[], None).await;
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.json()["declared"], json!(true));
+
+    // An invalid name never lands on disk: config validation rejects it.
+    let etag = put["etag"].as_str().unwrap().to_string();
+    let long_name = "q".repeat(600);
+    let body = json!({ "etag": etag, "overrides": {} }).to_string();
+    let resp = http(
+        port,
+        "PUT",
+        &format!("/admin/api/v1/queues/{long_name}"),
+        &[],
+        Some(&body),
+    )
+    .await;
+    assert_eq!(
+        resp.status, 422,
+        "an over-long name is rejected: {}",
+        resp.body
+    );
+}
 
 #[tokio::test]
 async fn delete_queue_guards_then_purges_and_removes_declaration() {
@@ -1155,10 +1182,31 @@ async fn delete_queue_guards_then_purges_and_removes_declaration() {
             "{state} still holds jobs after the purge"
         );
     }
+
+    // The queue leaves the stats frames promptly: depths and admin totals are
+    // dropped by the purge, and the declaration leaves the registry on reload.
+    // Without the immediate totals eviction this would linger for 15 minutes.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let overview = http(port, "GET", "/admin/api/v1/overview", &[], None)
+            .await
+            .json();
+        if overview["frame"]["queues"]
+            .as_object()
+            .is_some_and(|q| !q.contains_key("adm-del-q"))
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the deleted queue never left the stats frame: {overview}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 }
 
 // ---------------------------------------------------------------------------
-// 7. Config editor
+// 6. Config editor
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -1177,6 +1225,10 @@ async fn config_editor_applies_validates_and_guards() {
     assert!(pinned.contains("server.listen_addr"), "env_pinned: {pinned}");
     let restart_only = config["restart_only"].to_string();
     assert!(restart_only.contains("admin.listen_addr"));
+    assert!(
+        config["pending_restart"].as_array().unwrap().is_empty(),
+        "nothing pends a restart at boot: {config}"
+    );
 
     // A hot-reloadable change applies live.
     let body = json!({
@@ -1238,6 +1290,23 @@ async fn config_editor_applies_validates_and_guards() {
     assert_eq!(put["requires_restart"], json!(["limits.max_message_bytes"]));
     let etag = put["etag"].as_str().unwrap().to_string();
 
+    // The drift between the running (boot) config and the file is reported
+    // until a restart applies it.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let config = http(port, "GET", "/admin/api/v1/config", &[], None)
+            .await
+            .json();
+        if config["pending_restart"] == json!(["limits.max_message_bytes"]) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "pending_restart never reported the drift: {config}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
     // Env-pinned paths are rejected outright.
     let body = json!({
         "etag": etag,
@@ -1267,7 +1336,7 @@ async fn config_editor_applies_validates_and_guards() {
 }
 
 // ---------------------------------------------------------------------------
-// 8. SSE smoke
+// 7. SSE smoke
 // ---------------------------------------------------------------------------
 
 #[tokio::test]

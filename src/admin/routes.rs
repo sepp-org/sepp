@@ -134,7 +134,9 @@ pub(super) async fn overview(State(state): State<Arc<AdminState>>) -> Json<Value
             "started_at_ms": state.started_at_ms,
             "now_ms": now_ms(),
             "strict_queues": config.server.strict_queues,
-            "dead_letter_retention_ms": config.storage.dead_letter_retention_ms,
+            // Restart-only: the storage engine runs with the boot value even
+            // after the on-disk config changed.
+            "dead_letter_retention_ms": state.boot.storage.dead_letter_retention_ms,
             "command_queue_len": state.storage.command_queue_depth(),
         },
         "frame": &*frame,
@@ -144,14 +146,16 @@ pub(super) async fn overview(State(state): State<Arc<AdminState>>) -> Json<Value
 
 pub(super) async fn server_info(State(state): State<Arc<AdminState>>) -> Json<Value> {
     let config = state.config.load();
+    // listen_addr, TLS, and db_path are restart-only: report the values the
+    // server actually runs with, not whatever landed on disk since boot.
     Json(json!({
         "version": env!("CARGO_PKG_VERSION"),
         "started_at_ms": state.started_at_ms,
-        "listen_addr": config.server.listen_addr.to_string(),
-        "tls": config.server.tls_enabled(),
+        "listen_addr": state.boot.server.listen_addr.to_string(),
+        "tls": state.boot.server.tls_enabled(),
         "auth_enforcing": config.auth.api_keys.is_some(),
         "strict_queues": config.server.strict_queues,
-        "db_path": config.server.db_path,
+        "db_path": &state.boot.server.db_path,
     }))
 }
 
@@ -241,6 +245,10 @@ pub(super) async fn put_queue(
     check_etag(&current, &body.etag)?;
 
     let mut doc = parse_doc(&current)?;
+    // Declares the queue even when no overrides are sent; this is how the UI
+    // creates queues.
+    config_edit::ensure_queue(&mut doc, &name)
+        .map_err(|e| ApiError::bad_request("invalid_change", e))?;
     for (field, value) in &body.overrides {
         config_edit::upsert_queue_field(&mut doc, &name, field, value)
             .map_err(|e| ApiError::bad_request("invalid_change", e))?;
@@ -413,6 +421,7 @@ fn cause_label(cause: i32) -> &'static str {
         Ok(pb::DeadLetterCause::AttemptsExhausted) => "attempts_exhausted",
         Ok(pb::DeadLetterCause::Rejected) => "rejected",
         Ok(pb::DeadLetterCause::LeaseExpired) => "lease_expired",
+        Ok(pb::DeadLetterCause::Admin) => "admin",
         _ => "unspecified",
     }
 }
@@ -710,6 +719,39 @@ fn decode_keys(keys_b64: &[String]) -> Result<Vec<Vec<u8>>, ApiError> {
     keys_b64.iter().map(|k| decode_b64("keys_b64", k)).collect()
 }
 
+#[derive(Deserialize)]
+pub struct DeadLetterJobsBody {
+    state: String,
+    keys_b64: Vec<String>,
+    reason: Option<String>,
+}
+
+pub(super) async fn dead_letter_jobs(
+    State(state): State<Arc<AdminState>>,
+    Path(name): Path<String>,
+    Json(body): Json<DeadLetterJobsBody>,
+) -> ApiResult<Json<Value>> {
+    let peek_state = match body.state.as_str() {
+        "ready" => PeekState::Ready,
+        "scheduled" => PeekState::Scheduled,
+        other => {
+            return Err(ApiError::bad_request(
+                "invalid_argument",
+                format!("state must be ready or scheduled, got {other:?}"),
+            ));
+        }
+    };
+    let keys = decode_keys(&body.keys_b64)?;
+    let outcome = state
+        .storage
+        .dead_letter_jobs(name, peek_state, keys, body.reason)
+        .await?;
+    Ok(Json(json!({
+        "dead_lettered": outcome.dead_lettered,
+        "missing": outcome.missing,
+    })))
+}
+
 pub(super) async fn requeue_dead_letters(
     State(state): State<Arc<AdminState>>,
     Path(name): Path<String>,
@@ -736,26 +778,6 @@ pub(super) async fn delete_dead_letters(
 
 // ---------------------------------------------------------------------------
 // Config
-
-fn redact_config(mut v: Value) -> Value {
-    if let Some(api_keys) = v.pointer_mut("/auth/api_keys") {
-        *api_keys = match api_keys.as_array() {
-            Some(keys) => json!({ "count": keys.len() }),
-            None => Value::Null,
-        };
-    }
-    if let Some(admin_keys) = v.pointer_mut("/admin/keys") {
-        *admin_keys = match admin_keys.as_array() {
-            Some(keys) => Value::Array(
-                keys.iter()
-                    .map(|k| json!({ "name": k.get("name").cloned().unwrap_or(Value::Null) }))
-                    .collect(),
-            ),
-            None => Value::Null,
-        };
-    }
-    v
-}
 
 fn env_pinned() -> Vec<String> {
     let mut paths: Vec<String> = std::env::vars()
@@ -842,11 +864,17 @@ pub(super) async fn get_config(State(state): State<Arc<AdminState>>) -> ApiResul
     let etag = config_edit::file_etag(&state.config_path)
         .map_err(|e| ApiError::internal(format!("hashing config file: {e}")))?;
 
+    // Worker API keys are served unredacted: the admin plane is loopback-only
+    // and PUT /config already lets any local caller rewrite them, so hiding
+    // them on read protects nothing while blocking legitimate key management.
     Ok(Json(json!({
-        "effective": redact_config(effective),
+        "effective": effective,
         "etag": etag,
         "env_pinned": env_pinned(),
         "restart_only": RESTART_ONLY,
+        // Restart-only fields whose on-disk value drifted from the running
+        // (boot) value; they apply on the next restart.
+        "pending_restart": config_watch::restart_only_changes(&state.boot, &config),
     })))
 }
 
@@ -893,29 +921,3 @@ pub(super) async fn put_config(
     })))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::AdminKey;
-
-    #[test]
-    fn redaction_hides_worker_keys_and_admin_key_material() {
-        let mut cfg = Config::default();
-        cfg.auth.api_keys = Some(vec!["secret-a".into(), "secret-b".into()]);
-        cfg.admin.keys = Some(vec![AdminKey {
-            name: "ops".into(),
-            key: "hunter2".into(),
-        }]);
-
-        let v = redact_config(serde_json::to_value(&cfg).unwrap());
-        assert_eq!(v["auth"]["api_keys"], json!({ "count": 2 }));
-        assert_eq!(v["admin"]["keys"], json!([{ "name": "ops" }]));
-        let flat = v.to_string();
-        assert!(!flat.contains("secret-a"));
-        assert!(!flat.contains("hunter2"));
-
-        let none = redact_config(serde_json::to_value(&Config::default()).unwrap());
-        assert_eq!(none["auth"]["api_keys"], Value::Null);
-        assert_eq!(none["admin"]["keys"], Value::Null);
-    }
-}

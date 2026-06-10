@@ -29,20 +29,10 @@ strict_queues = false
 # server and the metrics endpoints.
 enabled = false
 
-# host:port the admin UI binds to. Binding a non-loopback address requires
-# keys below.
+# host:port the admin UI binds to. The admin UI has no authentication yet, so
+# only loopback addresses are accepted; use an SSH tunnel or an authenticating
+# reverse proxy for remote access.
 listen_addr = "127.0.0.1:9465"
-
-# Named keys for admin UI logins. The browser exchanges a key for a session
-# cookie; curl can send one directly as `Authorization: Bearer <key>`. If
-# omitted, admin auth is disabled and only a loopback listen_addr is allowed.
-# Separate from worker keys in [auth].
-#keys = [
-#  { name = "ops", key = "change-me" },
-#]
-
-# How long a browser session stays valid after login. Default 12 hours.
-session_ttl_ms = 43200000
 
 [auth]
 # Primitive API key authentication. If omitted, every caller is allowed.

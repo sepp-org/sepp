@@ -164,6 +164,7 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
         let state = AdminState::new(
             storage,
             shared_config.clone(),
+            config.clone(),
             registry.clone(),
             watch_path.into(),
             reload_seq_rx,

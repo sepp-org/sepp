@@ -112,6 +112,19 @@ impl ReadyIndex {
 
         Some((key, attempt))
     }
+
+    fn attempt(&self, ready_key: &[u8]) -> Option<u32> {
+        self.keys.get(ready_key).copied()
+    }
+
+    fn remove(&mut self, ready_key: &[u8]) -> Option<u32> {
+        let attempt = self.keys.remove(ready_key)?;
+        if let Some(queue) = read_queue(ready_key) {
+            drop_queue(&mut self.by_queue, queue);
+        }
+
+        Some(attempt)
+    }
 }
 
 // Timer keys are `deadline | job_id` and carry no queue, so each key stores
@@ -303,6 +316,11 @@ pub struct RequeueOutcome {
     pub missing: u64,
 }
 
+pub struct DeadLetterJobsOutcome {
+    pub dead_lettered: u64,
+    pub missing: u64,
+}
+
 #[derive(Debug)]
 pub struct DeleteOutcome {
     pub deleted: u64,
@@ -380,6 +398,13 @@ enum Command {
         keys: Vec<Vec<u8>>,
         resp: oneshot::Sender<Result<RequeueOutcome, Status>>,
     },
+    DeadLetterJobs {
+        queue: String,
+        state: PeekState,
+        keys: Vec<Vec<u8>>,
+        reason: Option<String>,
+        resp: oneshot::Sender<Result<DeadLetterJobsOutcome, Status>>,
+    },
     DeleteDeadLetters {
         queue: String,
         keys: Vec<Vec<u8>>,
@@ -412,6 +437,10 @@ enum Responder {
         oneshot::Sender<Result<RequeueOutcome, Status>>,
         RequeueOutcome,
     ),
+    DeadLetterJobs(
+        oneshot::Sender<Result<DeadLetterJobsOutcome, Status>>,
+        DeadLetterJobsOutcome,
+    ),
     DeleteDeadLetters(
         oneshot::Sender<Result<DeleteOutcome, Status>>,
         DeleteOutcome,
@@ -441,6 +470,9 @@ impl Responder {
                 let _ = resp.send(outcome.clone().map(|()| payload));
             }
             Responder::Requeue(resp, payload) => {
+                let _ = resp.send(outcome.clone().map(|()| payload));
+            }
+            Responder::DeadLetterJobs(resp, payload) => {
                 let _ = resp.send(outcome.clone().map(|()| payload));
             }
             Responder::DeleteDeadLetters(resp, payload) => {
@@ -498,6 +530,12 @@ impl Cycle {
     fn deduplicated(&mut self, queue: &str) {
         if let Some(m) = self.metrics.as_mut() {
             bump_queue(&mut m.deduplicated_by_queue, queue);
+        }
+    }
+
+    fn queue_purged(&mut self, queue: &str) {
+        if let Some(m) = self.metrics.as_mut() {
+            m.purged_queues.push(queue.to_string());
         }
     }
 
@@ -655,6 +693,13 @@ fn run_committer(
             if store.params.admin_enabled
                 && let Some(m) = cycle_metrics
             {
+                // Purged-queue totals die with the queue; removing before the
+                // fold keeps counts for jobs enqueued after the purge in the
+                // same batch.
+                for queue in &m.purged_queues {
+                    totals.remove(queue);
+                    last_active.remove(queue);
+                }
                 fold_admin_totals(&mut totals, &mut last_active, &m);
             }
         }
@@ -805,6 +850,16 @@ fn apply_command(
                 Err(e) => return reject(resp, e),
             }
         }
+        Command::DeadLetterJobs {
+            queue,
+            state,
+            keys,
+            reason,
+            resp,
+        } => match apply_dead_letter_jobs(store, indexes, tx, cycle, &queue, state, keys, reason) {
+            Ok(outcome) => responders.push(Responder::DeadLetterJobs(resp, outcome)),
+            Err(e) => return reject(resp, e),
+        },
         Command::DeleteDeadLetters { queue, keys, resp } => {
             let outcome = apply_delete_dead_letters(store, indexes, tx, cycle, &queue, keys);
             responders.push(Responder::DeleteDeadLetters(resp, outcome));
@@ -856,6 +911,9 @@ fn fail_command(cmd: Command, status: &Status) {
             let _ = resp.send(Err(status.clone()));
         }
         Command::RequeueDeadLetters { resp, .. } => {
+            let _ = resp.send(Err(status.clone()));
+        }
+        Command::DeadLetterJobs { resp, .. } => {
             let _ = resp.send(Err(status.clone()));
         }
         Command::DeleteDeadLetters { resp, .. } => {
@@ -1552,6 +1610,135 @@ fn apply_requeue_dead_letters(
     Ok(RequeueOutcome { requeued, missing })
 }
 
+// The reverse of apply_requeue_dead_letters: moves live ready/scheduled jobs
+// into the dead-letter queue (or drops them when retention is disabled),
+// exactly as a nack with the dead_letter strategy would.
+#[allow(clippy::too_many_arguments)]
+fn apply_dead_letter_jobs(
+    store: &Store,
+    indexes: &mut Indexes,
+    tx: &mut WriteTransaction<'_>,
+    cycle: &mut Cycle,
+    queue: &str,
+    state: PeekState,
+    keys: Vec<Vec<u8>>,
+    reason: Option<String>,
+) -> Result<DeadLetterJobsOutcome, Status> {
+    if !matches!(state, PeekState::Ready | PeekState::Scheduled) {
+        return Err(Status::invalid_argument(
+            "only ready or scheduled jobs can be dead-lettered",
+        ));
+    }
+
+    let now = now_ms();
+    let mut dead_lettered = 0u64;
+    let mut missing = 0u64;
+
+    for key in keys {
+        // Peeked keys can be consumed (reserved, promoted, purged) between
+        // peek and this command; gone keys count as missing, not errors.
+        let job_id: Vec<u8> = match state {
+            PeekState::Ready => {
+                let Some(rk) = ReadyKey::decode(&key) else {
+                    missing += 1;
+                    continue;
+                };
+                if rk.queue != queue {
+                    missing += 1;
+                    continue;
+                }
+                let id = rk.job_id.as_bytes().to_vec();
+                if tx.get(&store.ready, &key).map_err(stg_err)?.is_none() {
+                    indexes.ready.remove(&key);
+                    missing += 1;
+                    continue;
+                }
+                id
+            }
+            PeekState::Scheduled => {
+                let Some(id) = TimerKey::job_id(&key) else {
+                    missing += 1;
+                    continue;
+                };
+                let id = id.to_vec();
+                if tx.get(&store.scheduled, &key).map_err(stg_err)?.is_none() {
+                    indexes.scheduled.remove(&key);
+                    missing += 1;
+                    continue;
+                }
+                id
+            }
+            _ => unreachable!("state validated above"),
+        };
+
+        // Timer keys carry no queue, so the job record is the queue authority
+        // for both states; a mismatch means the key belongs to another queue.
+        let Some(stored) = tx.get(&store.jobs, &job_id).map_err(stg_err)? else {
+            missing += 1;
+            continue;
+        };
+        let job_queue = match JobValue::decode(&stored) {
+            Ok((q, _)) => q,
+            Err(e) => {
+                warn!(error = %e, "dead-letter: skipping corrupt job record");
+                missing += 1;
+                continue;
+            }
+        };
+        if job_queue != queue {
+            missing += 1;
+            continue;
+        }
+
+        // Jobs that never reached a worker are on their stored attempt
+        // (1 for fresh enqueues, higher for nack-rescheduled ones).
+        let attempt = match state {
+            PeekState::Ready => indexes.ready.attempt(&key).unwrap_or(1),
+            _ => tx
+                .get(&store.scheduled, &key)
+                .map_err(stg_err)?
+                .and_then(|v| v.as_ref().try_into().ok().map(u32::from_be_bytes))
+                .unwrap_or(1),
+        };
+
+        maybe_store_dead_letter(
+            store,
+            indexes,
+            tx,
+            &job_id,
+            DeadLetterMeta {
+                cause: DeadLetterCause::Admin,
+                failed_at: now,
+                attempt,
+                last_reason: reason.clone(),
+            },
+        )?;
+
+        match state {
+            PeekState::Ready => {
+                tx.remove(&store.ready, key.clone());
+                indexes.ready.remove(&key);
+            }
+            PeekState::Scheduled => {
+                tx.remove(&store.scheduled, key.clone());
+                indexes.scheduled.remove(&key);
+            }
+            _ => unreachable!("state validated above"),
+        }
+        tx.remove(&store.jobs, job_id.clone());
+        tx.remove(&store.payloads, job_id);
+
+        cycle.dead_lettered(queue, "admin");
+        cycle.dirty = true;
+        dead_lettered += 1;
+    }
+
+    Ok(DeadLetterJobsOutcome {
+        dead_lettered,
+        missing,
+    })
+}
+
 fn apply_delete_dead_letters(
     store: &Store,
     indexes: &mut Indexes,
@@ -1663,6 +1850,9 @@ fn apply_purge_queue_chunk(
         || indexes.scheduled.by_queue.contains_key(queue)
         || indexes.dead_letter.by_queue.contains_key(queue)
         || indexes.dedup_timers.by_queue.contains_key(queue);
+    if !remaining {
+        cycle.queue_purged(queue);
+    }
 
     Ok(PurgeOutcome {
         purged: purged as u64,
@@ -2559,6 +2749,23 @@ impl Storage {
     ) -> Result<RequeueOutcome, Status> {
         self.send(|resp| Command::RequeueDeadLetters { queue, keys, resp })
             .await?
+    }
+
+    pub async fn dead_letter_jobs(
+        &self,
+        queue: String,
+        state: PeekState,
+        keys: Vec<Vec<u8>>,
+        reason: Option<String>,
+    ) -> Result<DeadLetterJobsOutcome, Status> {
+        self.send(|resp| Command::DeadLetterJobs {
+            queue,
+            state,
+            keys,
+            reason,
+            resp,
+        })
+        .await?
     }
 
     pub async fn delete_dead_letters(

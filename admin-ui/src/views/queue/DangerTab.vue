@@ -55,7 +55,7 @@ function run(purge: boolean) {
 </script>
 
 <template>
-  <div class="flex max-w-xl flex-col gap-4">
+  <div class="flex flex-col gap-4">
     <div class="rounded border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-400">
       Deleting a queue removes its declaration from sepp.toml. Purging permanently deletes all
       ready, scheduled and dead-lettered jobs.

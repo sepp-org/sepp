@@ -25,3 +25,17 @@
     color: var(--color-ink-100);
   }
 }
+
+/* JSON token colors for jsonHighlight.ts output (CodeTextarea, JsonView). */
+.tok-key {
+  color: #f0976b;
+}
+.tok-str {
+  color: #a9c79b;
+}
+.tok-num {
+  color: #8fb8e0;
+}
+.tok-lit {
+  color: #d9b66f;
+}

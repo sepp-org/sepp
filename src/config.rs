@@ -351,10 +351,8 @@ impl Default for MetricsConfig {
 #[serde(deny_unknown_fields, default)]
 pub struct AdminConfig {
     pub enabled: bool,
+    // Loopback only until the admin UI grows real authentication.
     pub listen_addr: SocketAddr,
-    // None = auth disabled; only allowed on a loopback listen_addr.
-    pub keys: Option<Vec<AdminKey>>,
-    pub session_ttl_ms: u64,
 }
 
 impl Default for AdminConfig {
@@ -362,17 +360,8 @@ impl Default for AdminConfig {
         Self {
             enabled: false,
             listen_addr: SocketAddr::from(([127, 0, 0, 1], 9465)),
-            keys: None,
-            session_ttl_ms: 12 * 60 * 60 * 1000,
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AdminKey {
-    pub name: String,
-    pub key: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -463,11 +452,12 @@ impl Config {
             }
         }
 
-        if self.admin.enabled
-            && !self.admin.listen_addr.ip().is_loopback()
-            && self.admin.keys.is_none()
-        {
-            return Err("admin UI on a non-loopback address requires [admin] keys".into());
+        if self.admin.enabled && !self.admin.listen_addr.ip().is_loopback() {
+            return Err(
+                "the admin UI has no authentication yet; admin.listen_addr must be a loopback \
+                 address (use an SSH tunnel or an authenticating reverse proxy for remote access)"
+                    .into(),
+            );
         }
 
         let defaults = EffectiveLimits::from_globals(&self.limits, &self.storage);
@@ -481,6 +471,11 @@ impl Config {
         for q in &self.queues {
             if q.name.is_empty() {
                 return Err("queues[].name must not be empty".into());
+            }
+            // "." and ".." are unaddressable over HTTP: browsers collapse them
+            // out of URL paths before the request is sent.
+            if q.name == "." || q.name == ".." {
+                return Err(format!("queues[].name {:?} is not a valid queue name", q.name).into());
             }
             if q.name.len() > self.limits.max_queue_name_bytes as usize {
                 return Err(format!(
@@ -625,6 +620,20 @@ mod tests {
     }
 
     #[test]
+    fn dot_queue_names_are_rejected() {
+        for name in [".", ".."] {
+            let cfg = Config {
+                queues: vec![QueueConfig {
+                    name: name.into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            assert!(cfg.validate().is_err(), "{name:?} must be rejected");
+        }
+    }
+
+    #[test]
     fn queue_name_over_the_byte_limit_is_rejected() {
         let cfg = Config {
             limits: LimitsConfig {
@@ -672,24 +681,24 @@ mod tests {
     }
 
     #[test]
-    fn admin_on_non_loopback_requires_keys() {
+    fn admin_requires_a_loopback_listen_addr() {
         let mut cfg = Config::default();
         cfg.admin.enabled = true;
         cfg.admin.listen_addr = SocketAddr::from(([0, 0, 0, 0], 9465));
         assert!(
             cfg.validate().is_err(),
-            "a non-loopback admin bind without keys must be rejected"
+            "a non-loopback admin bind must be rejected while the UI has no auth"
         );
 
-        cfg.admin.keys = Some(vec![AdminKey {
-            name: "ops".into(),
-            key: "secret".into(),
-        }]);
+        cfg.admin.listen_addr = SocketAddr::from(([127, 0, 0, 1], 9465));
         assert!(cfg.validate().is_ok());
 
-        let mut loopback = Config::default();
-        loopback.admin.enabled = true;
-        assert!(loopback.validate().is_ok(), "loopback admin needs no keys");
+        let mut disabled = Config::default();
+        disabled.admin.listen_addr = SocketAddr::from(([0, 0, 0, 0], 9465));
+        assert!(
+            disabled.validate().is_ok(),
+            "the bind address is irrelevant while the admin UI is disabled"
+        );
     }
 
     #[test]

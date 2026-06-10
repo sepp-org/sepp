@@ -1,6 +1,6 @@
 import { useQueryClient, type QueryClient } from '@tanstack/vue-query'
 import { reactive, ref } from 'vue'
-import { AdminApiError, API_BASE, api } from '../api/client'
+import { API_BASE, api } from '../api/client'
 import type { HelloEvent, OverviewServer, RateHistory, RateSample, StatsFrame } from '../api/types'
 
 export type StreamStatus = 'live' | 'polling' | 'connecting'
@@ -33,6 +33,11 @@ function appendSample(name: string, sample: RateSample) {
 function applyFrame(f: StatsFrame) {
   frame.value = f
   lastFrameAt = Date.now()
+  // Frames carry the authoritative queue set; drop history for queues that
+  // vanished (deleted/evicted) so a recreated queue starts a fresh sparkline.
+  for (const name of Object.keys(history)) {
+    if (!(name in f.queues)) delete history[name]
+  }
   for (const [name, q] of Object.entries(f.queues)) {
     appendSample(name, {
       ts_ms: f.ts_ms,
@@ -95,8 +100,8 @@ async function pollOnce() {
     server.value = o.server
     frame.value = o.frame
     replaceHistory(o.history)
-  } catch (e) {
-    if (e instanceof AdminApiError && e.status === 401) stop()
+  } catch {
+    // Transient fetch failure; the poll timer or SSE retry recovers.
   }
 }
 

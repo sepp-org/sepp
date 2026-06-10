@@ -93,6 +93,17 @@ async fn wait_for_port(book: &PortBook, key: &str, timeout: Duration) -> Option<
     }
 }
 
+/// An empty config file in the temp dir, shared by every test server that
+/// does not bring its own config. The server treats an empty file as
+/// all-defaults; concurrent re-writes of identical content are harmless.
+fn isolated_config_path() -> std::path::PathBuf {
+    let path = std::env::temp_dir().join("sepp-integration-defaults.toml");
+    if !path.exists() {
+        let _ = std::fs::write(&path, "");
+    }
+    path
+}
+
 /// Spawns the server binary with `extra_env`, binding `127.0.0.1:0` so the OS
 /// hands out a free, unique port. Returns the child and a [`PortBook`] the
 /// caller queries (via [`wait_for_port`]) for the actual bound port(s).
@@ -109,6 +120,11 @@ fn spawn_server_process(
     command
         .env("SEPP_SERVER__LISTEN_ADDR", "127.0.0.1:0")
         .env("SEPP_SERVER__DB_PATH", db_path)
+        // Isolate from any sepp.toml in the developer's working directory:
+        // a local file enabling the admin UI's fixed port or strict_queues
+        // would break concurrently spawned test servers. Tests that need a
+        // config override SEPP_CONFIG through `extra_env`.
+        .env("SEPP_CONFIG", isolated_config_path())
         // Force info so the startup "listening" lines are always emitted,
         // whatever level a test's config might otherwise set.
         .env("RUST_LOG", "sepp=info")

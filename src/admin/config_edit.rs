@@ -123,22 +123,8 @@ fn set_section_value(
     Ok(())
 }
 
-pub(super) fn upsert_queue_field(
-    doc: &mut DocumentMut,
-    name: &str,
-    field: &str,
-    value: &Value,
-) -> Result<(), String> {
-    if !QUEUE_FIELDS.contains(&field) {
-        return Err(format!("unknown queue override field {field:?}"));
-    }
-    // Convert before creating the entry so a bad value cannot leave behind an
-    // empty [[queues]] table.
-    let item = match value.is_null() {
-        true => None,
-        false => Some(Item::Value(toml_value(value)?)),
-    };
-
+// Locates the [[queues]] entry with this name, declaring it if absent.
+fn queue_entry<'a>(doc: &'a mut DocumentMut, name: &str) -> Result<&'a mut Table, String> {
     let arr = doc
         .entry("queues")
         .or_insert(Item::ArrayOfTables(ArrayOfTables::new()))
@@ -157,8 +143,30 @@ pub(super) fn upsert_queue_field(
             arr.len() - 1
         }
     };
+    Ok(arr.get_mut(idx).expect("entry just located or pushed"))
+}
 
-    let table = arr.get_mut(idx).expect("entry just located or pushed");
+pub(super) fn ensure_queue(doc: &mut DocumentMut, name: &str) -> Result<(), String> {
+    queue_entry(doc, name).map(|_| ())
+}
+
+pub(super) fn upsert_queue_field(
+    doc: &mut DocumentMut,
+    name: &str,
+    field: &str,
+    value: &Value,
+) -> Result<(), String> {
+    if !QUEUE_FIELDS.contains(&field) {
+        return Err(format!("unknown queue override field {field:?}"));
+    }
+    // Convert before creating the entry so a bad value cannot leave behind an
+    // empty [[queues]] table.
+    let item = match value.is_null() {
+        true => None,
+        false => Some(Item::Value(toml_value(value)?)),
+    };
+
+    let table = queue_entry(doc, name)?;
     match item {
         Some(item) => table[field] = item,
         None => {
@@ -210,6 +218,19 @@ mod tests {
         let mut d = doc("");
         apply_change(&mut d, "server.strict_queues", &json!(true)).unwrap();
         assert!(d.to_string().contains("strict_queues = true"));
+    }
+
+    #[test]
+    fn ensure_queue_declares_once_and_preserves_existing_fields() {
+        let mut d = doc("");
+        ensure_queue(&mut d, "emails").unwrap();
+        assert!(d.to_string().contains("name = \"emails\""));
+
+        upsert_queue_field(&mut d, "emails", "default_priority", &json!(5)).unwrap();
+        ensure_queue(&mut d, "emails").unwrap();
+        let out = d.to_string();
+        assert_eq!(out.matches("name = \"emails\"").count(), 1);
+        assert!(out.contains("default_priority = 5"));
     }
 
     #[test]

@@ -3,22 +3,25 @@ import uPlot from 'uplot'
 import 'uplot/dist/uPlot.min.css'
 import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import type { RateSample } from '../api/types'
+import { RATE_METRICS } from '../lib/metrics'
 
-const props = defineProps<{ samples: RateSample[] }>()
+const props = withDefaults(defineProps<{ samples: RateSample[]; height?: number }>(), {
+  height: 64,
+})
 
 const host = ref<HTMLDivElement | null>(null)
 let chart: uPlot | null = null
+let resize: ResizeObserver | null = null
 
 function toData(samples: RateSample[]): uPlot.AlignedData {
   return [
     samples.map((s) => s.ts_ms / 1000),
-    samples.map((s) => s.enqueued),
-    samples.map((s) => s.acked),
+    ...RATE_METRICS.map((m) => samples.map((s) => s[m.key])),
   ]
 }
 
-function series(stroke: string): uPlot.Series {
-  return { stroke, width: 1.5, points: { show: false } }
+function hostWidth(): number {
+  return Math.max(host.value?.clientWidth ?? 0, 40)
 }
 
 function render() {
@@ -35,8 +38,8 @@ function render() {
   }
   chart = new uPlot(
     {
-      width: 120,
-      height: 36,
+      width: hostWidth(),
+      height: props.height,
       cursor: { show: false },
       legend: { show: false },
       scales: {
@@ -44,22 +47,41 @@ function render() {
         y: { range: (_u, _min, max) => [0, Math.max(max, 1)] },
       },
       axes: [{ show: false }, { show: false }],
-      series: [{}, series('#ec6a2e'), series('#f5854d')],
+      series: [
+        {},
+        ...RATE_METRICS.map((m) => ({
+          stroke: m.stroke,
+          fill: m.fill,
+          width: 1.5,
+          points: { show: false },
+        })),
+      ],
     },
     data,
     host.value,
   )
 }
 
-onMounted(render)
+onMounted(() => {
+  render()
+  resize = new ResizeObserver(() => {
+    if (chart) chart.setSize({ width: hostWidth(), height: props.height })
+  })
+  if (host.value) resize.observe(host.value)
+})
+
 watch(() => props.samples, render, { deep: true })
 
 onBeforeUnmount(() => {
+  resize?.disconnect()
+  resize = null
   chart?.destroy()
   chart = null
 })
 </script>
 
 <template>
-  <div ref="host" class="h-9 w-30 shrink-0"></div>
+  <!-- min-w floor makes a crowded flex-wrap row push the chart onto its own
+       full-width line instead of crushing it to zero. -->
+  <div ref="host" class="min-w-48 flex-1" :style="{ height: `${height}px` }"></div>
 </template>

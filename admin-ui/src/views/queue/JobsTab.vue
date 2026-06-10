@@ -22,14 +22,16 @@ const states: { id: JobState; label: string }[] = [
 const state = ref<JobState>('ready')
 const selected = ref<JobSummary | null>(null)
 const checked = ref(new Set<string>())
-const confirmAction = ref<'requeue' | 'delete' | null>(null)
+const confirmAction = ref<'requeue' | 'delete' | 'dead_letter' | null>(null)
 const actionNotice = ref('')
 
 const { server } = useStatsStream()
 const isDl = computed(() => state.value === 'dead_letter')
-const retentionDisabled = computed(
-  () => isDl.value && server.value?.dead_letter_retention_ms === 0,
-)
+// In-flight jobs are excluded: a worker holds their lease.
+const canDeadLetter = computed(() => state.value === 'ready' || state.value === 'scheduled')
+const selectable = computed(() => isDl.value || canDeadLetter.value)
+const retentionOff = computed(() => server.value?.dead_letter_retention_ms === 0)
+const retentionDisabled = computed(() => isDl.value && retentionOff.value)
 
 const queryClient = useQueryClient()
 const { data, error, isPending, hasNextPage, isFetchingNextPage, fetchNextPage } =
@@ -102,8 +104,29 @@ const {
   },
 })
 
-const actionBusy = computed(() => requeueing.value || removing.value)
-const actionError = computed(() => requeueError.value ?? removeError.value)
+const {
+  mutate: deadLetter,
+  isPending: deadLettering,
+  error: deadLetterError,
+} = useMutation({
+  mutationFn: (keys: string[]) =>
+    api.deadLetterJobs(props.queue, state.value as 'ready' | 'scheduled', keys),
+  onSuccess: (res) => {
+    const n = res.dead_lettered
+    actionNotice.value =
+      (retentionOff.value ? `Dropped ${n} job${n === 1 ? '' : 's'}` : `Dead-lettered ${n} job${n === 1 ? '' : 's'}`) +
+      (res.missing > 0 ? `; ${res.missing} already gone` : '')
+    afterDlAction()
+  },
+  onError: () => {
+    confirmAction.value = null
+  },
+})
+
+const actionBusy = computed(() => requeueing.value || removing.value || deadLettering.value)
+const actionError = computed(
+  () => requeueError.value ?? removeError.value ?? deadLetterError.value,
+)
 const actionCount = computed(() => Math.min(checked.value.size, MAX_KEYS_PER_ACTION))
 
 function runAction() {
@@ -112,6 +135,13 @@ function runAction() {
   actionNotice.value = ''
   if (confirmAction.value === 'requeue') requeue(keys)
   else if (confirmAction.value === 'delete') remove(keys)
+  else if (confirmAction.value === 'dead_letter') deadLetter(keys)
+}
+
+function onDetailGone(notice: string) {
+  selected.value = null
+  checked.value = new Set()
+  actionNotice.value = notice
 }
 
 const timeHeader = computed(() =>
@@ -154,7 +184,7 @@ function relTime(ms: number): string {
         &larr; Back to list
       </button>
     </div>
-    <JobDetail :queue="queue" :state="state" :job="selected" />
+    <JobDetail :queue="queue" :state="state" :job="selected" @gone="onDetailGone" />
   </div>
   <div v-else class="flex flex-col gap-3">
     <div class="flex gap-1">
@@ -178,21 +208,31 @@ function relTime(ms: number): string {
       instead of kept here.
     </div>
     <template v-else>
-      <div v-if="isDl && jobs.length > 0" class="flex items-center gap-2">
+      <div v-if="selectable && jobs.length > 0" class="flex items-center gap-2">
         <span class="text-xs text-ink-400">{{ checked.size }} selected</span>
+        <template v-if="isDl">
+          <button
+            class="rounded border border-ink-700 px-2.5 py-1 text-sm text-ink-300 hover:text-ink-100 disabled:opacity-50"
+            :disabled="checked.size === 0 || actionBusy"
+            @click="confirmAction = 'requeue'"
+          >
+            Requeue
+          </button>
+          <button
+            class="rounded border border-red-500/40 px-2.5 py-1 text-sm text-red-400 hover:bg-red-500/10 disabled:opacity-50"
+            :disabled="checked.size === 0 || actionBusy"
+            @click="confirmAction = 'delete'"
+          >
+            Delete
+          </button>
+        </template>
         <button
-          class="rounded border border-ink-700 px-2.5 py-1 text-sm text-ink-300 hover:text-ink-100 disabled:opacity-50"
-          :disabled="checked.size === 0 || actionBusy"
-          @click="confirmAction = 'requeue'"
-        >
-          Requeue
-        </button>
-        <button
+          v-else
           class="rounded border border-red-500/40 px-2.5 py-1 text-sm text-red-400 hover:bg-red-500/10 disabled:opacity-50"
           :disabled="checked.size === 0 || actionBusy"
-          @click="confirmAction = 'delete'"
+          @click="confirmAction = 'dead_letter'"
         >
-          Delete
+          Dead-letter
         </button>
       </div>
 
@@ -201,18 +241,20 @@ function relTime(ms: number): string {
       <p v-if="error" class="text-sm text-red-400">{{ error.message }}</p>
 
       <p v-if="isPending" class="text-sm text-ink-400">Loading jobs…</p>
-      <table v-else-if="jobs.length > 0" class="w-full text-left text-sm">
+      <!-- Fixed layout: the sized columns stay compact and the unsized ones
+           (ID, type, last reason) absorb whatever width the drawer has. -->
+      <table v-else-if="jobs.length > 0" class="w-full table-fixed text-left text-sm">
         <thead>
           <tr class="border-b border-ink-800 text-xs text-ink-400">
-            <th v-if="isDl" class="w-8 py-2">
+            <th v-if="selectable" class="w-8 py-2">
               <input type="checkbox" class="accent-accent" :checked="allChecked" @change="toggleAll" />
             </th>
             <th class="py-2 pr-3 font-medium">ID</th>
             <th class="py-2 pr-3 font-medium">Type</th>
-            <th class="py-2 pr-3 font-medium">Priority</th>
-            <th class="py-2 pr-3 font-medium">Attempt</th>
-            <th class="py-2 pr-3 font-medium">{{ timeHeader }}</th>
-            <th v-if="isDl" class="py-2 pr-3 font-medium">Cause</th>
+            <th class="w-14 py-2 pr-3 font-medium">Priority</th>
+            <th class="w-16 py-2 pr-3 font-medium">Attempt</th>
+            <th class="w-28 py-2 pr-3 font-medium">{{ timeHeader }}</th>
+            <th v-if="isDl" class="w-28 py-2 pr-3 font-medium">Cause</th>
             <th v-if="isDl" class="py-2 font-medium">Last reason</th>
           </tr>
         </thead>
@@ -223,7 +265,7 @@ function relTime(ms: number): string {
             class="cursor-pointer border-b border-ink-800/60 hover:bg-ink-800/40"
             @click="selected = job"
           >
-            <td v-if="isDl" class="py-2" @click.stop>
+            <td v-if="selectable" class="py-2" @click.stop>
               <input
                 type="checkbox"
                 class="accent-accent"
@@ -233,18 +275,18 @@ function relTime(ms: number): string {
             </td>
             <td class="py-2 pr-3">
               <div class="flex items-center gap-1">
-                <span class="max-w-36 truncate font-mono text-xs" :title="job.id">
+                <span class="min-w-0 truncate font-mono text-xs" :title="job.id">
                   {{ job.id }}
                 </span>
                 <CopyButton :text="job.id" />
               </div>
             </td>
-            <td class="py-2 pr-3">{{ job.job_type }}</td>
+            <td class="truncate py-2 pr-3" :title="job.job_type">{{ job.job_type }}</td>
             <td class="py-2 pr-3">{{ job.priority }}</td>
             <td class="py-2 pr-3">{{ job.attempt }}/{{ job.max_attempts }}</td>
-            <td class="py-2 pr-3 text-ink-300">{{ jobTime(job) }}</td>
-            <td v-if="isDl" class="py-2 pr-3">{{ job.cause ?? '' }}</td>
-            <td v-if="isDl" class="max-w-48 truncate py-2 text-ink-300" :title="job.last_reason">
+            <td class="truncate py-2 pr-3 text-ink-300">{{ jobTime(job) }}</td>
+            <td v-if="isDl" class="truncate py-2 pr-3" :title="job.cause">{{ job.cause ?? '' }}</td>
+            <td v-if="isDl" class="truncate py-2 text-ink-300" :title="job.last_reason">
               {{ job.last_reason ?? '' }}
             </td>
           </tr>
@@ -271,9 +313,17 @@ function relTime(ms: number): string {
 
   <ConfirmDialog
     v-if="confirmAction"
-    :title="confirmAction === 'requeue' ? 'Requeue dead letters' : 'Delete dead letters'"
-    :confirm-label="confirmAction === 'requeue' ? 'Requeue' : 'Delete'"
-    :danger="confirmAction === 'delete'"
+    :title="
+      confirmAction === 'requeue'
+        ? 'Requeue dead letters'
+        : confirmAction === 'delete'
+          ? 'Delete dead letters'
+          : 'Dead-letter jobs'
+    "
+    :confirm-label="
+      confirmAction === 'requeue' ? 'Requeue' : confirmAction === 'delete' ? 'Delete' : 'Dead-letter'
+    "
+    :danger="confirmAction !== 'requeue'"
     :busy="actionBusy"
     @confirm="runAction"
     @cancel="confirmAction = null"
@@ -282,10 +332,22 @@ function relTime(ms: number): string {
       Requeue {{ actionCount }} dead-lettered job{{ actionCount === 1 ? '' : 's' }} back to ready
       with the attempt counter reset?
     </p>
-    <p v-else>
+    <p v-else-if="confirmAction === 'delete'">
       Permanently delete {{ actionCount }} dead-lettered job{{ actionCount === 1 ? '' : 's' }}?
       This cannot be undone.
     </p>
+    <template v-else>
+      <p>
+        Move {{ actionCount }} {{ state }} job{{ actionCount === 1 ? '' : 's' }} to the
+        dead-letter queue? Workers will never see {{ actionCount === 1 ? 'it' : 'them' }}.
+      </p>
+      <p v-if="retentionOff" class="mt-1 text-amber-400">
+        Dead-letter retention is disabled
+        (<span class="font-mono">dead_letter_retention_ms = 0</span>), so
+        {{ actionCount === 1 ? 'this job is' : 'these jobs are' }} dropped permanently instead of
+        kept for replay.
+      </p>
+    </template>
     <p v-if="checked.size > MAX_KEYS_PER_ACTION" class="mt-1 text-xs text-ink-500">
       Capped at {{ MAX_KEYS_PER_ACTION }} per request; repeat for the rest.
     </p>

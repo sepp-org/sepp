@@ -186,8 +186,7 @@ pub fn restart_only_changes(old: &Config, new: &Config) -> Vec<&'static str> {
         changed.push("metrics");
     }
 
-    // The admin listener is bound once at startup; keys and the session TTL
-    // are read live.
+    // The admin listener is bound once at startup.
     let (a, b) = (&old.admin, &new.admin);
     if a.enabled != b.enabled {
         changed.push("admin.enabled");
@@ -257,17 +256,6 @@ mod tests {
         assert!(changed.contains(&"metrics"));
         assert!(changed.contains(&"admin.enabled"));
         assert!(changed.contains(&"admin.listen_addr"));
-    }
-
-    #[test]
-    fn admin_keys_and_session_ttl_are_hot_reloadable() {
-        let mut new = Config::default();
-        new.admin.session_ttl_ms += 1;
-        new.admin.keys = Some(vec![crate::config::AdminKey {
-            name: "ops".into(),
-            key: "secret".into(),
-        }]);
-        assert!(restart_only_changes(&Config::default(), &new).is_empty());
     }
 
     #[test]
