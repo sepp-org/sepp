@@ -29,10 +29,25 @@ strict_queues = false
 # server and the metrics endpoints.
 enabled = false
 
-# host:port the admin UI binds to. The admin UI has no authentication yet, so
-# only loopback addresses are accepted; use an SSH tunnel or an authenticating
-# reverse proxy for remote access.
+# host:port the admin UI binds to. Binding a non-loopback address requires
+# `keys` below. The listener itself is plain HTTP: for remote access put a
+# TLS-terminating reverse proxy (or an SSH tunnel) in front of it.
 listen_addr = "127.0.0.1:9465"
+
+# Named keys for the admin UI and API. Omitted = auth disabled (loopback
+# only). Each key gets a role:
+#   viewer    read-only: dashboards, queue/job inspection, redacted config
+#   operator  viewer + enqueue, dead-letter, requeue, delete dead letters
+#   admin     operator + queue create/update/delete and config edits (default)
+# Keys hot-reload; rotating or removing one signs its sessions out. This list
+# is redacted in the UI and cannot be edited through the admin API itself.
+#keys = [
+#  { name = "alice", key = "generate-a-long-random-secret", role = "admin" },
+#  { name = "dashboard", key = "another-long-random-secret", role = "viewer" },
+#]
+
+# How long a login session stays valid (default 12h).
+#session_ttl_ms = 43200000
 
 [auth]
 # Primitive API key authentication. If omitted, every caller is allowed.

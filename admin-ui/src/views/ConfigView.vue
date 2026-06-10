@@ -4,6 +4,7 @@ import { computed, reactive, ref } from 'vue'
 import { AdminApiError, api } from '../api/client'
 import type { ConfigChange, EffectiveConfig, JsonValue } from '../api/types'
 import ConfigField from '../components/ConfigField.vue'
+import { useSession } from '../composables/useSession'
 import { matchesPath } from '../lib/paths'
 
 type FieldKind = 'string' | 'number' | 'boolean' | 'string[]'
@@ -12,8 +13,6 @@ interface FieldSpec {
   key: string
   kind: FieldKind
   options?: string[]
-  // Offers a "Generate" button that appends a random secret to the list.
-  generate?: boolean
 }
 
 type SectionTable = Exclude<keyof EffectiveConfig, 'queues'>
@@ -29,7 +28,9 @@ const sections: { table: SectionTable; fields: FieldSpec[] }[] = [
       { key: 'strict_queues', kind: 'boolean' },
     ],
   },
-  { table: 'auth', fields: [{ key: 'api_keys', kind: 'string[]', generate: true }] },
+  // [auth] and [admin] key lists are redacted server-side and rendered as
+  // custom read-only rows inside the section loop below.
+  { table: 'auth', fields: [] },
   {
     table: 'limits',
     fields: [
@@ -100,10 +101,12 @@ const sections: { table: SectionTable; fields: FieldSpec[] }[] = [
     fields: [
       { key: 'enabled', kind: 'boolean' },
       { key: 'listen_addr', kind: 'string' },
+      { key: 'session_ttl_ms', kind: 'number' },
     ],
   },
 ]
 
+const { canAdmin } = useSession()
 const queryClient = useQueryClient()
 const { data, error, isLoading, refetch } = useQuery({
   queryKey: ['config'],
@@ -113,6 +116,9 @@ const { data, error, isLoading, refetch } = useQuery({
 
 const pending = reactive<Record<string, JsonValue | null>>({})
 const dirtyCount = computed(() => Object.keys(pending).length)
+
+const apiKeys = computed(() => data.value?.effective.auth.api_keys ?? null)
+const adminKeys = computed(() => data.value?.effective.admin.keys ?? null)
 
 const saving = ref(false)
 const saveError = ref('')
@@ -238,15 +244,48 @@ async function reloadAfterConflict() {
             :label="field.key"
             :kind="field.kind"
             :options="field.options"
-            :generate="field.generate"
             :value="shownValue(section.table, field.key)"
             :dirty="`${section.table}.${field.key}` in pending"
             :env-pinned="pinned(`${section.table}.${field.key}`)"
             :restart-only="restartOnly(`${section.table}.${field.key}`)"
             :pending-restart="pendingRestart(`${section.table}.${field.key}`)"
+            :readonly="!canAdmin"
             @change="(v) => onChange(section.table, field.key, v)"
             @revert="revert(`${section.table}.${field.key}`)"
           />
+
+          <div v-if="section.table === 'auth'" class="flex items-center gap-3 px-4 py-2">
+            <div class="w-64 shrink-0">
+              <span class="font-mono text-sm text-ink-200">api_keys</span>
+            </div>
+            <p class="text-sm text-ink-300">
+              <template v-if="apiKeys">{{ apiKeys.count }} key{{ apiKeys.count === 1 ? '' : 's' }} configured</template>
+              <template v-else>not set — gRPC auth is off</template>
+              <span class="text-ink-500"> · managed in sepp.toml; never shown here</span>
+            </p>
+          </div>
+
+          <div v-if="section.table === 'admin'" class="flex items-start gap-3 px-4 py-2">
+            <div class="w-64 shrink-0 pt-0.5">
+              <span class="font-mono text-sm text-ink-200">keys</span>
+            </div>
+            <div class="flex min-w-0 flex-col gap-1.5">
+              <div v-if="adminKeys && adminKeys.length > 0" class="flex flex-wrap gap-1.5">
+                <span
+                  v-for="k in adminKeys"
+                  :key="k.name"
+                  class="rounded-full bg-ink-800 px-2 py-0.5 font-mono text-xs text-ink-200"
+                >
+                  {{ k.name }} <span class="text-ink-400">· {{ k.role }}</span>
+                </span>
+              </div>
+              <p v-else class="text-sm text-ink-300">not set — admin auth is off, loopback only</p>
+              <p class="text-xs text-ink-500">
+                Admin keys are managed in sepp.toml; rotating or removing a key signs its
+                sessions out on the next request.
+              </p>
+            </div>
+          </div>
         </div>
       </section>
 

@@ -13,7 +13,8 @@ const props = defineProps<{
   restartOnly: boolean
   pendingRestart?: boolean
   options?: string[]
-  generate?: boolean
+  // Render-only mode for roles below admin; no pin icon, just disabled inputs.
+  readonly?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -44,6 +45,8 @@ const envVar =
     .map((s) => s.toUpperCase())
     .join('__')
 
+const locked = computed(() => props.envPinned || props.readonly === true)
+
 function commit() {
   const raw = text.value.trim()
   if (raw === '') {
@@ -69,25 +72,6 @@ function onTags(next: string[]) {
   emit('change', next.length > 0 ? next : null)
 }
 
-const copied = ref(false)
-
-function generateSecret() {
-  const bytes = new Uint8Array(32)
-  crypto.getRandomValues(bytes)
-  const b64 = btoa(String.fromCharCode(...bytes))
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=+$/, '')
-  const key = `sepp_${b64}`
-  emit('change', [...tags.value, key])
-  navigator.clipboard
-    ?.writeText(key)
-    .then(() => {
-      copied.value = true
-      setTimeout(() => (copied.value = false), 1500)
-    })
-    .catch(() => {})
-}
 </script>
 
 <template>
@@ -116,7 +100,7 @@ function generateSecret() {
         type="button"
         role="switch"
         :aria-checked="value === true"
-        :disabled="envPinned"
+        :disabled="locked"
         class="relative h-5 w-9 shrink-0 rounded-full transition-colors disabled:opacity-50"
         :class="value === true ? 'bg-accent' : 'bg-ink-700'"
         @click="emit('change', value !== true)"
@@ -129,13 +113,13 @@ function generateSecret() {
       <div
         v-else-if="options"
         class="flex overflow-hidden rounded border border-ink-700"
-        :class="envPinned ? 'opacity-50' : ''"
+        :class="locked ? 'opacity-50' : ''"
       >
         <button
           v-for="o in options"
           :key="o"
           type="button"
-          :disabled="envPinned"
+          :disabled="locked"
           class="border-l border-ink-700 px-2.5 py-1 font-mono text-sm transition-colors first:border-l-0"
           :class="
             o === format(value)
@@ -150,27 +134,17 @@ function generateSecret() {
       <template v-else-if="kind === 'string[]'">
         <TagInput
           :model-value="tags"
-          :disabled="envPinned"
+          :disabled="locked"
           :placeholder="Array.isArray(value) ? 'reject all (empty list in sepp.toml)' : 'default'"
           @update:model-value="onTags"
         />
-        <button
-          v-if="generate"
-          type="button"
-          class="shrink-0 rounded border border-ink-700 px-2 py-1 text-xs text-ink-300 hover:text-ink-100 disabled:opacity-50"
-          :disabled="envPinned"
-          title="Generate a random key, add it to the list, and copy it to the clipboard"
-          @click="generateSecret"
-        >
-          {{ copied ? 'Copied!' : 'Generate' }}
-        </button>
       </template>
       <input
         v-else
         v-model="text"
         :type="kind === 'number' ? 'number' : 'text'"
         step="any"
-        :disabled="envPinned"
+        :disabled="locked"
         placeholder="default"
         class="w-full max-w-md rounded border border-ink-700 bg-ink-950 px-2 py-1 font-mono text-sm outline-none focus:border-accent disabled:opacity-50"
         @change="commit"

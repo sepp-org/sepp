@@ -2,6 +2,7 @@
 import { computed, type Component } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import Drawer from '../../components/Drawer.vue'
+import { useSession } from '../../composables/useSession'
 import { useStatsStream } from '../../composables/useStatsStream'
 import DangerTab from './DangerTab.vue'
 import EnqueueTab from './EnqueueTab.vue'
@@ -9,13 +10,6 @@ import JobsTab from './JobsTab.vue'
 import SettingsTab from './SettingsTab.vue'
 
 type TabId = 'jobs' | 'settings' | 'enqueue' | 'danger'
-
-const tabs: { id: TabId; label: string }[] = [
-  { id: 'jobs', label: 'Jobs' },
-  { id: 'settings', label: 'Settings' },
-  { id: 'enqueue', label: 'Enqueue' },
-  { id: 'danger', label: 'Danger' },
-]
 
 const tabComponents: Record<TabId, Component> = {
   jobs: JobsTab,
@@ -27,6 +21,16 @@ const tabComponents: Record<TabId, Component> = {
 const route = useRoute()
 const router = useRouter()
 const { frame } = useStatsStream()
+const { canOperate, canAdmin } = useSession()
+
+// Enqueue mutates jobs (operator); Danger deletes the queue (admin). Settings
+// stays visible to everyone as a read view; its save path is gated inside.
+const tabs = computed<{ id: TabId; label: string }[]>(() => [
+  { id: 'jobs', label: 'Jobs' },
+  { id: 'settings', label: 'Settings' },
+  ...(canOperate.value ? [{ id: 'enqueue' as const, label: 'Enqueue' }] : []),
+  ...(canAdmin.value ? [{ id: 'danger' as const, label: 'Danger' }] : []),
+])
 
 const name = computed(() => {
   const n = route.params.name
@@ -36,7 +40,9 @@ const name = computed(() => {
 const tab = computed<TabId>(() => {
   const t = route.params.tab
   const v = Array.isArray(t) ? t[0] : t
-  return v === 'settings' || v === 'enqueue' || v === 'danger' ? v : 'jobs'
+  const id = v === 'settings' || v === 'enqueue' || v === 'danger' ? v : 'jobs'
+  // A deep link to a tab the role cannot use falls back to Jobs.
+  return tabs.value.some((t) => t.id === id) ? id : 'jobs'
 })
 
 const badges = computed(() => {

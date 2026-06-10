@@ -4,8 +4,11 @@ import { computed, reactive, ref, watch } from 'vue'
 import { AdminApiError, api } from '../../api/client'
 import type { QueueOverridesPatch, QueueUpdateRequest } from '../../api/types'
 import TagInput from '../../components/TagInput.vue'
+import { useSession } from '../../composables/useSession'
 
 const props = defineProps<{ queue: string }>()
+
+const { canAdmin } = useSession()
 
 type ListKey = 'allowed_encodings' | 'allowed_job_types'
 type NumberKey = Exclude<keyof QueueOverridesPatch, ListKey>
@@ -146,6 +149,7 @@ function reset() {
     <p class="text-sm text-ink-400">
       Per-queue overrides for <span class="font-mono text-ink-200">{{ queue }}</span
       >. Empty fields fall back to the global limits.
+      <span v-if="!canAdmin" class="text-ink-500">Editing requires the admin role.</span>
     </p>
 
     <div
@@ -165,6 +169,7 @@ function reset() {
             v-if="f.kind === 'list'"
             :id="`qset-${f.key}`"
             :model-value="listValue(f.key)"
+            :disabled="!canAdmin"
             :placeholder="effectiveText(f)"
             @update:model-value="(v) => setList(f.key as ListKey, v)"
           />
@@ -172,8 +177,9 @@ function reset() {
             v-else
             :id="`qset-${f.key}`"
             v-model="form[f.key]"
+            :disabled="!canAdmin"
             :placeholder="effectiveText(f)"
-            class="rounded border border-ink-700 bg-ink-950 px-3 py-1.5 text-sm outline-none focus:border-accent"
+            class="rounded border border-ink-700 bg-ink-950 px-3 py-1.5 text-sm outline-none focus:border-accent disabled:opacity-50"
           />
           <p class="text-xs text-ink-500">
             {{

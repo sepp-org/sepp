@@ -6,6 +6,7 @@ import type { JobState, JobSummary } from '../../api/types'
 import ConfirmDialog from '../../components/ConfirmDialog.vue'
 import CopyButton from '../../components/CopyButton.vue'
 import PayloadView from '../../components/PayloadView.vue'
+import { useSession } from '../../composables/useSession'
 import { useStatsStream } from '../../composables/useStatsStream'
 
 const props = defineProps<{ queue: string; state: JobState; job: JobSummary }>()
@@ -27,9 +28,12 @@ const { data: detail, error } = useQuery({
 
 const queryClient = useQueryClient()
 const { server } = useStatsStream()
+const { canOperate } = useSession()
 // In-flight jobs are excluded: a worker holds their lease.
-const canDeadLetter = computed(() => props.state === 'ready' || props.state === 'scheduled')
-const canRequeue = computed(() => props.state === 'dead_letter')
+const canDeadLetter = computed(
+  () => canOperate.value && (props.state === 'ready' || props.state === 'scheduled'),
+)
+const canRequeue = computed(() => canOperate.value && props.state === 'dead_letter')
 const retentionOff = computed(() => server.value?.dead_letter_retention_ms === 0)
 const confirm = ref<'dead_letter' | 'requeue' | null>(null)
 const actionError = ref('')

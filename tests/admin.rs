@@ -288,10 +288,18 @@ async fn nack_dead_letter(client: &Client, job: &Job, reason: &str) -> bool {
 
 struct HttpResponse {
     status: u16,
+    headers: Vec<(String, String)>,
     body: String,
 }
 
 impl HttpResponse {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+    }
+
     fn json(&self) -> Value {
         serde_json::from_str(&self.body)
             .unwrap_or_else(|e| panic!("response body is not JSON ({e}): {:?}", self.body))
@@ -357,7 +365,11 @@ fn parse_response(raw: &[u8]) -> HttpResponse {
         String::from_utf8_lossy(rest).into_owned()
     };
 
-    HttpResponse { status, body }
+    HttpResponse {
+        status,
+        headers,
+        body,
+    }
 }
 
 async fn http(
@@ -434,11 +446,20 @@ async fn read_some(stream: &mut TcpStream, into: &mut Vec<u8>) {
 }
 
 async fn sse_connect(port: u16) -> SseReader {
+    sse_connect_with(port, &[]).await
+}
+
+async fn sse_connect_with(port: u16, headers: &[(&str, &str)]) -> SseReader {
     let mut stream = TcpStream::connect(("127.0.0.1", port))
         .await
         .expect("connect to admin endpoint");
-    let req =
-        "GET /admin/api/v1/events HTTP/1.1\r\nHost: localhost\r\nAccept: text/event-stream\r\n\r\n";
+    let mut req = String::from(
+        "GET /admin/api/v1/events HTTP/1.1\r\nHost: localhost\r\nAccept: text/event-stream\r\n",
+    );
+    for (name, value) in headers {
+        req.push_str(&format!("{name}: {value}\r\n"));
+    }
+    req.push_str("\r\n");
     stream
         .write_all(req.as_bytes())
         .await
@@ -508,6 +529,402 @@ fn stats_frames(body: &str) -> Vec<Value> {
         }
     }
     frames
+}
+
+// ---------------------------------------------------------------------------
+// 0. Auth + roles
+// ---------------------------------------------------------------------------
+
+fn admin_cfg_with_key(key: &str) -> String {
+    format!(
+        "[admin]\nenabled = true\nlisten_addr = \"127.0.0.1:0\"\nkeys = [{{ name = \"ops\", key = \"{key}\" }}]\n"
+    )
+}
+
+/// One key per role, plus worker API keys to exercise config redaction.
+const ROLES_CFG: &str = "[auth]\napi_keys = [\"worker-secret-1\", \"worker-secret-2\"]\n\n\
+    [admin]\nenabled = true\nlisten_addr = \"127.0.0.1:0\"\nkeys = [\n\
+    { name = \"v\", key = \"viewer-key\", role = \"viewer\" },\n\
+    { name = \"o\", key = \"operator-key\", role = \"operator\" },\n\
+    { name = \"a\", key = \"admin-key\", role = \"admin\" },\n]\n";
+
+fn bearer(key: &str) -> (&'static str, String) {
+    ("Authorization", format!("Bearer {key}"))
+}
+
+async fn http_as(
+    port: u16,
+    key: &str,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> HttpResponse {
+    let (name, value) = bearer(key);
+    http(port, method, path, &[(name, value.as_str())], body).await
+}
+
+async fn login(port: u16, name: &str, key: &str) -> (Value, String) {
+    let body = json!({ "name": name, "key": key }).to_string();
+    let resp = http(port, "POST", "/admin/api/v1/session", &[], Some(&body)).await;
+    assert_eq!(resp.status, 200, "login failed: {}", resp.body);
+    let cookie = resp
+        .header("set-cookie")
+        .expect("login sets a cookie")
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    (resp.json(), cookie)
+}
+
+#[tokio::test]
+async fn admin_auth_gates_login_bearer_and_logout() {
+    let (_guard, _client, port) =
+        start_admin_server("auth", &admin_cfg_with_key("test-secret"), &[]).await;
+
+    // No credentials at all.
+    let resp = http(port, "GET", "/admin/api/v1/overview", &[], None).await;
+    assert_eq!(resp.status, 401);
+    assert_eq!(resp.json()["code"], "unauthorized");
+
+    // A wrong key does not create a session, nor does a right key under the
+    // wrong name.
+    let body = json!({ "name": "ops", "key": "wrong" }).to_string();
+    let resp = http(port, "POST", "/admin/api/v1/session", &[], Some(&body)).await;
+    assert_eq!(resp.status, 401);
+    let body = json!({ "name": "nope", "key": "test-secret" }).to_string();
+    let resp = http(port, "POST", "/admin/api/v1/session", &[], Some(&body)).await;
+    assert_eq!(resp.status, 401);
+
+    // Login names the key, reports its role, and sets an HttpOnly cookie.
+    let body = json!({ "name": "ops", "key": "test-secret" }).to_string();
+    let resp = http(port, "POST", "/admin/api/v1/session", &[], Some(&body)).await;
+    assert_eq!(resp.status, 200, "login failed: {}", resp.body);
+    let login = resp.json();
+    assert_eq!(login["name"], "ops");
+    assert_eq!(login["role"], "admin", "role defaults to admin");
+    assert!(login["expires_at_ms"].as_i64().unwrap() > epoch_ms_in(Duration::ZERO));
+    let set_cookie = resp
+        .header("set-cookie")
+        .expect("login sets a cookie")
+        .to_string();
+    assert!(
+        set_cookie.contains("HttpOnly"),
+        "cookie flags: {set_cookie}"
+    );
+    assert!(set_cookie.contains("SameSite=Strict"));
+    let cookie = set_cookie.split(';').next().unwrap().to_string();
+    assert!(cookie.starts_with("sepp_admin="));
+
+    // The cookie authenticates API calls.
+    let resp = http(
+        port,
+        "GET",
+        "/admin/api/v1/session",
+        &[("Cookie", cookie.as_str())],
+        None,
+    )
+    .await;
+    assert_eq!(resp.status, 200);
+    let session = resp.json();
+    assert_eq!(session["name"], "ops");
+    assert_eq!(session["role"], "admin");
+    assert_eq!(session["auth_enabled"], json!(true));
+
+    // A raw Bearer key works without a session, for curl.
+    let resp = http_as(port, "test-secret", "GET", "/admin/api/v1/overview", None).await;
+    assert_eq!(resp.status, 200);
+
+    // Logout invalidates the session server-side.
+    let resp = http(
+        port,
+        "DELETE",
+        "/admin/api/v1/session",
+        &[("Cookie", cookie.as_str())],
+        None,
+    )
+    .await;
+    assert_eq!(resp.status, 204);
+    let resp = http(
+        port,
+        "GET",
+        "/admin/api/v1/overview",
+        &[("Cookie", cookie.as_str())],
+        None,
+    )
+    .await;
+    assert_eq!(resp.status, 401, "a logged-out cookie is rejected");
+}
+
+#[tokio::test]
+async fn key_rotation_via_hot_reload_invalidates_sessions() {
+    let (guard, _client, port) =
+        start_admin_server("rotate", &admin_cfg_with_key("old-secret"), &[]).await;
+
+    let (_, cookie) = login(port, "ops", "old-secret").await;
+    let resp = http(
+        port,
+        "GET",
+        "/admin/api/v1/overview",
+        &[("Cookie", cookie.as_str())],
+        None,
+    )
+    .await;
+    assert_eq!(resp.status, 200, "the session works before the rotation");
+
+    // Rotate the key on disk: the session stores the old key's hash, so the
+    // reload must invalidate it. Rewrite periodically so a single missed
+    // filesystem event cannot wedge the test.
+    let rotated = admin_cfg_with_key("new-secret");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut invalidated = false;
+    while Instant::now() < deadline && !invalidated {
+        std::fs::write(&guard.cfg_path, &rotated).expect("rewrite config");
+        let window = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < window {
+            let resp = http(
+                port,
+                "GET",
+                "/admin/api/v1/overview",
+                &[("Cookie", cookie.as_str())],
+                None,
+            )
+            .await;
+            if resp.status == 401 {
+                invalidated = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    assert!(
+        invalidated,
+        "rotating the admin keys never invalidated the session"
+    );
+
+    // The rotated key logs in, proving the reload applied rather than auth
+    // breaking wholesale.
+    let (login, _) = login(port, "ops", "new-secret").await;
+    assert_eq!(login["name"], "ops");
+}
+
+#[tokio::test]
+async fn removing_keys_on_loopback_hot_disables_auth() {
+    let (guard, _client, port) =
+        start_admin_server("dekey", &admin_cfg_with_key("the-secret"), &[]).await;
+
+    let resp = http(port, "GET", "/admin/api/v1/overview", &[], None).await;
+    assert_eq!(resp.status, 401, "auth enforces before the key removal");
+
+    // Deleting the keys turns auth off; that is honored on a loopback bind
+    // (the non-loopback variant fails closed until restart, but binding a
+    // public address is not testable here).
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut open = false;
+    while Instant::now() < deadline && !open {
+        std::fs::write(&guard.cfg_path, ADMIN_CFG).expect("rewrite config");
+        let window = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < window {
+            let resp = http(port, "GET", "/admin/api/v1/overview", &[], None).await;
+            if resp.status == 200 {
+                open = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    assert!(open, "removing admin keys never disabled auth");
+
+    let resp = http(port, "GET", "/admin/api/v1/session", &[], None).await;
+    assert_eq!(resp.json()["role"], "admin", "implicit local admin");
+}
+
+#[tokio::test]
+async fn roles_gate_routes_by_level() {
+    let (_guard, _client, port) = start_admin_server("roles", ROLES_CFG, &[]).await;
+
+    // Reads: any role.
+    for key in ["viewer-key", "operator-key", "admin-key"] {
+        let resp = http_as(port, key, "GET", "/admin/api/v1/overview", None).await;
+        assert_eq!(resp.status, 200, "{key} can read");
+    }
+    let resp = http_as(port, "viewer-key", "GET", "/admin/api/v1/session", None).await;
+    assert_eq!(resp.json()["role"], "viewer");
+
+    // Job-level mutations: operator and up.
+    let enqueue = json!({ "job_type": "t" }).to_string();
+    let resp = http_as(
+        port,
+        "viewer-key",
+        "POST",
+        "/admin/api/v1/queues/adm-roles-q/jobs",
+        Some(&enqueue),
+    )
+    .await;
+    assert_eq!(resp.status, 403, "viewer cannot enqueue: {}", resp.body);
+    assert_eq!(resp.json()["code"], "forbidden");
+    let resp = http_as(
+        port,
+        "operator-key",
+        "POST",
+        "/admin/api/v1/queues/adm-roles-q/jobs",
+        Some(&enqueue),
+    )
+    .await;
+    assert_eq!(resp.status, 200, "operator can enqueue: {}", resp.body);
+
+    let requeue = json!({ "keys_b64": [] }).to_string();
+    let resp = http_as(
+        port,
+        "viewer-key",
+        "POST",
+        "/admin/api/v1/queues/adm-roles-q/dead-letters:requeue",
+        Some(&requeue),
+    )
+    .await;
+    assert_eq!(resp.status, 403);
+    let resp = http_as(
+        port,
+        "operator-key",
+        "POST",
+        "/admin/api/v1/queues/adm-roles-q/dead-letters:requeue",
+        Some(&requeue),
+    )
+    .await;
+    assert_eq!(resp.status, 200);
+
+    // Config-level mutations: admin only. The extractor rejects before the
+    // handler runs, so no etag or If-Match is needed for the 403s.
+    let resp = http_as(
+        port,
+        "operator-key",
+        "PUT",
+        "/admin/api/v1/config",
+        Some("{}"),
+    )
+    .await;
+    assert_eq!(resp.status, 403, "operator cannot edit config");
+    let resp = http_as(
+        port,
+        "operator-key",
+        "PUT",
+        "/admin/api/v1/queues/adm-roles-q",
+        Some("{}"),
+    )
+    .await;
+    assert_eq!(resp.status, 403, "operator cannot edit queue config");
+    let resp = http_as(
+        port,
+        "operator-key",
+        "DELETE",
+        "/admin/api/v1/queues/adm-roles-q",
+        None,
+    )
+    .await;
+    assert_eq!(resp.status, 403, "operator cannot delete queues");
+
+    let etag = http_as(port, "admin-key", "GET", "/admin/api/v1/config", None)
+        .await
+        .json()["etag"]
+        .as_str()
+        .expect("config etag")
+        .to_string();
+    let put_queue = json!({ "etag": etag, "overrides": {} }).to_string();
+    let resp = http_as(
+        port,
+        "admin-key",
+        "PUT",
+        "/admin/api/v1/queues/adm-roles-q2",
+        Some(&put_queue),
+    )
+    .await;
+    assert_eq!(resp.status, 200, "admin can declare queues: {}", resp.body);
+}
+
+#[tokio::test]
+async fn config_is_redacted_and_admin_keys_are_immutable() {
+    let (_guard, _client, port) = start_admin_server("redact", ROLES_CFG, &[]).await;
+
+    let resp = http_as(port, "viewer-key", "GET", "/admin/api/v1/config", None).await;
+    assert_eq!(resp.status, 200);
+    let config = resp.json();
+    assert_eq!(
+        config["effective"]["auth"]["api_keys"],
+        json!({ "count": 2 })
+    );
+    assert_eq!(
+        config["effective"]["admin"]["keys"],
+        json!([
+            { "name": "v", "role": "viewer" },
+            { "name": "o", "role": "operator" },
+            { "name": "a", "role": "admin" },
+        ])
+    );
+    for secret in ["worker-secret-1", "viewer-key", "admin-key"] {
+        assert!(
+            !resp.body.contains(secret),
+            "config response leaks {secret}"
+        );
+    }
+
+    // Admin credentials cannot be touched through the API, even by an admin:
+    // deleting them would hot-disable auth entirely.
+    let etag = config["etag"].as_str().expect("config etag");
+    let body = json!({
+        "etag": etag,
+        "changes": [{ "path": "admin.keys", "value": null }],
+    })
+    .to_string();
+    let resp = http_as(
+        port,
+        "admin-key",
+        "PUT",
+        "/admin/api/v1/config",
+        Some(&body),
+    )
+    .await;
+    assert_eq!(resp.status, 400, "{}", resp.body);
+    assert_eq!(resp.json()["code"], "admin_keys_immutable");
+}
+
+#[tokio::test]
+async fn sse_requires_auth_and_accepts_a_session_cookie() {
+    let (_guard, _client, port) = start_admin_server("sse-auth", ROLES_CFG, &[]).await;
+
+    let resp = http(port, "GET", "/admin/api/v1/events", &[], None).await;
+    assert_eq!(resp.status, 401, "anonymous SSE is rejected");
+
+    // EventSource cannot set headers, so the cookie is the SSE credential.
+    let (_, cookie) = login(port, "v", "viewer-key").await;
+    let mut sse = sse_connect_with(port, &[("Cookie", cookie.as_str())]).await;
+    sse.wait_for(Instant::now() + Duration::from_secs(10), |body| {
+        body.contains("event: hello")
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn auth_disabled_grants_local_admin() {
+    let (_guard, _client, port) = start_admin_server("noauth", ADMIN_CFG, &[]).await;
+
+    let resp = http(port, "GET", "/admin/api/v1/session", &[], None).await;
+    assert_eq!(resp.status, 200);
+    let session = resp.json();
+    assert_eq!(session["name"], Value::Null);
+    assert_eq!(session["role"], "admin");
+    assert_eq!(session["auth_enabled"], json!(false));
+
+    // Zero-config loopback keeps full mutate access.
+    let enqueue = json!({ "job_type": "t" }).to_string();
+    let resp = http(
+        port,
+        "POST",
+        "/admin/api/v1/queues/adm-noauth-q/jobs",
+        &[],
+        Some(&enqueue),
+    )
+    .await;
+    assert_eq!(resp.status, 200, "{}", resp.body);
 }
 
 // ---------------------------------------------------------------------------

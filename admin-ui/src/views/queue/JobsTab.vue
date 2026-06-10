@@ -5,6 +5,7 @@ import { api } from '../../api/client'
 import type { JobState, JobSummary } from '../../api/types'
 import ConfirmDialog from '../../components/ConfirmDialog.vue'
 import CopyButton from '../../components/CopyButton.vue'
+import { useSession } from '../../composables/useSession'
 import { useStatsStream } from '../../composables/useStatsStream'
 import JobDetail from './JobDetail.vue'
 
@@ -26,10 +27,12 @@ const confirmAction = ref<'requeue' | 'delete' | 'dead_letter' | null>(null)
 const actionNotice = ref('')
 
 const { server } = useStatsStream()
+const { canOperate } = useSession()
 const isDl = computed(() => state.value === 'dead_letter')
 // In-flight jobs are excluded: a worker holds their lease.
 const canDeadLetter = computed(() => state.value === 'ready' || state.value === 'scheduled')
-const selectable = computed(() => isDl.value || canDeadLetter.value)
+// Viewers get no checkboxes: every bulk action needs the operator role.
+const selectable = computed(() => canOperate.value && (isDl.value || canDeadLetter.value))
 const retentionOff = computed(() => server.value?.dead_letter_retention_ms === 0)
 const retentionDisabled = computed(() => isDl.value && retentionOff.value)
 

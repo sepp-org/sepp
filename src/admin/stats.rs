@@ -176,7 +176,10 @@ pub(super) async fn watch_reloads(state: Arc<AdminState>, mut shutdown: watch::R
     }
 }
 
-pub async fn events(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
+pub(super) async fn events(
+    _viewer: super::authz::RequireViewer,
+    State(state): State<Arc<AdminState>>,
+) -> impl IntoResponse {
     let rx = state.hub.subscribe();
 
     let hello = {

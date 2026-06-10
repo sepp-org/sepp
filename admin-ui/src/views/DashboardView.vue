@@ -6,6 +6,7 @@ import { api } from '../api/client'
 import NewQueueDialog from '../components/NewQueueDialog.vue'
 import QueueCard from '../components/QueueCard.vue'
 import StrictModeToggle from '../components/StrictModeToggle.vue'
+import { useSession } from '../composables/useSession'
 import { useStatsStream } from '../composables/useStatsStream'
 import { DEPTH_METRICS, RATE_METRICS, formatRate } from '../lib/metrics'
 import QueueDrawer from './queue/QueueDrawer.vue'
@@ -13,6 +14,8 @@ import QueueDrawer from './queue/QueueDrawer.vue'
 const route = useRoute()
 const router = useRouter()
 const { frame, history } = useStatsStream()
+// Queue creation writes the config file, like the strict-mode toggle: admin.
+const { canAdmin } = useSession()
 
 const { data: queueInfos } = useQuery({ queryKey: ['queues'], queryFn: () => api.queues() })
 
@@ -83,8 +86,9 @@ function open(name: string) {
         </span>
       </div>
       <div class="ml-auto flex items-center gap-5">
-        <StrictModeToggle />
+        <StrictModeToggle v-if="canAdmin" />
         <button
+          v-if="canAdmin"
           class="rounded bg-accent px-3 py-1.5 text-sm font-medium text-ink-950 hover:bg-accent-bright"
           @click="showNewQueue = true"
         >
@@ -99,6 +103,7 @@ function open(name: string) {
     >
       <p>No queues yet. Create one, or enqueue a job to auto-create its queue.</p>
       <button
+        v-if="canAdmin"
         class="rounded bg-accent px-3 py-1.5 text-sm font-medium text-ink-950 hover:bg-accent-bright"
         @click="showNewQueue = true"
       >

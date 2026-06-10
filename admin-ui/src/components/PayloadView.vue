@@ -86,7 +86,10 @@ function download() {
 </script>
 
 <template>
-  <div class="flex flex-col gap-2">
+  <p v-if="sizeBytes === 0" class="text-sm text-ink-400">
+    {{ encoding ? `Empty payload (${encoding}).` : 'No payload.' }}
+  </p>
+  <div v-else class="flex flex-col gap-2">
     <div class="flex items-center gap-3 text-xs text-ink-400">
       <span class="font-mono">{{ encoding || 'no encoding' }}</span>
       <span>{{ sizeBytes }} bytes</span>

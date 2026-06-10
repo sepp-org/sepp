@@ -247,6 +247,21 @@ export interface DeleteResult {
   missing: number
 }
 
+// GET/POST/DELETE /session
+export type Role = 'viewer' | 'operator' | 'admin'
+
+export interface SessionInfo {
+  name: string | null
+  role: Role | null
+  auth_enabled: boolean
+}
+
+export interface SessionLoginResponse {
+  name: string
+  role: Role
+  expires_at_ms: number
+}
+
 // GET /config: running Config as JSON with secrets redacted.
 export type PersistMode = 'sync_all' | 'sync_data' | 'buffer'
 
@@ -260,8 +275,9 @@ export interface ServerConfigView {
   strict_queues: boolean
 }
 
+// Redacted: the server never serves key material, only the count.
 export interface AuthConfigView {
-  api_keys: string[] | null
+  api_keys: { count: number } | null
 }
 
 export interface LimitsConfigView {
@@ -322,6 +338,9 @@ export interface MetricsConfigView {
 export interface AdminConfigView {
   enabled: boolean
   listen_addr: string
+  // Redacted: names and roles only.
+  keys: { name: string; role: Role }[] | null
+  session_ttl_ms: number
 }
 
 export interface EffectiveConfig {

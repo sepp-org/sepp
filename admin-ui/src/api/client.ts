@@ -17,6 +17,8 @@ import type {
   QueueUpdateRequest,
   RequeueResult,
   ServerInfo,
+  SessionInfo,
+  SessionLoginResponse,
 } from './types'
 
 export const API_BASE = '/admin/api/v1'
@@ -43,6 +45,14 @@ async function parseError(res: Response): Promise<ApiErrorBody> {
   }
 }
 
+// Fires on any 401 outside the session endpoints, so an expired or rotated-out
+// session lands on the login screen instead of surfacing per-view errors.
+let onUnauthorized: (() => void) | null = null
+
+export function setUnauthorizedHandler(handler: () => void) {
+  onUnauthorized = handler
+}
+
 async function request<T>(
   method: string,
   path: string,
@@ -56,6 +66,7 @@ async function request<T>(
   }
   const res = await fetch(API_BASE + path, init)
   if (!res.ok) {
+    if (res.status === 401 && !path.startsWith('/session')) onUnauthorized?.()
     throw new AdminApiError(res.status, await parseError(res))
   }
   if (res.status === 204) return undefined as unknown as T
@@ -115,4 +126,9 @@ export const api = {
 
   config: () => request<ConfigResponse>('GET', '/config'),
   updateConfig: (body: ConfigUpdateRequest) => request<ConfigWriteResult>('PUT', '/config', body),
+
+  session: () => request<SessionInfo>('GET', '/session'),
+  login: (name: string, key: string) =>
+    request<SessionLoginResponse>('POST', '/session', { name, key }),
+  logout: () => request<void>('DELETE', '/session'),
 }

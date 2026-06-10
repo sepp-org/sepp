@@ -351,8 +351,10 @@ impl Default for MetricsConfig {
 #[serde(deny_unknown_fields, default)]
 pub struct AdminConfig {
     pub enabled: bool,
-    // Loopback only until the admin UI grows real authentication.
     pub listen_addr: SocketAddr,
+    // None = auth disabled; only allowed on a loopback listen_addr.
+    pub keys: Option<Vec<AdminKey>>,
+    pub session_ttl_ms: u64,
 }
 
 impl Default for AdminConfig {
@@ -360,7 +362,37 @@ impl Default for AdminConfig {
         Self {
             enabled: false,
             listen_addr: SocketAddr::from(([127, 0, 0, 1], 9465)),
+            keys: None,
+            session_ttl_ms: 12 * 60 * 60 * 1000,
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminKey {
+    pub name: String,
+    pub key: String,
+    #[serde(default)]
+    pub role: Role,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    Viewer,
+    Operator,
+    #[default]
+    Admin,
+}
+
+impl std::fmt::Display for Role {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Role::Viewer => "viewer",
+            Role::Operator => "operator",
+            Role::Admin => "admin",
+        })
     }
 }
 
@@ -452,10 +484,45 @@ impl Config {
             }
         }
 
-        if self.admin.enabled && !self.admin.listen_addr.ip().is_loopback() {
+        if self.admin.enabled
+            && !self.admin.listen_addr.ip().is_loopback()
+            && self.admin.keys.is_none()
+        {
             return Err(
-                "the admin UI has no authentication yet; admin.listen_addr must be a loopback \
-                 address (use an SSH tunnel or an authenticating reverse proxy for remote access)"
+                "admin UI on a non-loopback address requires [admin] keys (note: the admin \
+                 listener itself is plain HTTP; terminate TLS in front of it for remote access)"
+                    .into(),
+            );
+        }
+        if let Some(keys) = &self.admin.keys {
+            let mut names: HashSet<&str> = HashSet::new();
+            let mut secrets: HashSet<&str> = HashSet::new();
+            for k in keys {
+                if k.name.is_empty() {
+                    return Err("admin.keys[].name must not be empty".into());
+                }
+                if k.key.is_empty() {
+                    return Err(format!("admin key {:?} has an empty key", k.name).into());
+                }
+                // Sessions are matched back to keys by name; duplicates would
+                // make rotation and audit attribution ambiguous.
+                if !names.insert(&k.name) {
+                    return Err(format!("admin.keys has a duplicate name {:?}", k.name).into());
+                }
+                // A shared secret would resolve to whichever entry lists it
+                // last, making the granted role depend on file order.
+                if !secrets.insert(&k.key) {
+                    return Err(
+                        format!("admin keys {:?} and another share the same key", k.name).into(),
+                    );
+                }
+            }
+        }
+        // One year keeps expiry arithmetic far from overflow; one minute keeps
+        // a typo'd TTL from instantly expiring every session.
+        if !(60_000..=31_536_000_000).contains(&self.admin.session_ttl_ms) {
+            return Err(
+                "admin.session_ttl_ms must be between 60000 (1 minute) and 31536000000 (365 days)"
                     .into(),
             );
         }
@@ -681,23 +748,96 @@ mod tests {
     }
 
     #[test]
-    fn admin_requires_a_loopback_listen_addr() {
+    fn admin_on_non_loopback_requires_keys() {
         let mut cfg = Config::default();
         cfg.admin.enabled = true;
         cfg.admin.listen_addr = SocketAddr::from(([0, 0, 0, 0], 9465));
         assert!(
             cfg.validate().is_err(),
-            "a non-loopback admin bind must be rejected while the UI has no auth"
+            "a non-loopback admin bind without keys must be rejected"
         );
 
-        cfg.admin.listen_addr = SocketAddr::from(([127, 0, 0, 1], 9465));
+        cfg.admin.keys = Some(vec![AdminKey {
+            name: "ops".into(),
+            key: "secret".into(),
+            role: Role::Admin,
+        }]);
         assert!(cfg.validate().is_ok());
+
+        let mut loopback = Config::default();
+        loopback.admin.enabled = true;
+        assert!(loopback.validate().is_ok(), "loopback admin needs no keys");
 
         let mut disabled = Config::default();
         disabled.admin.listen_addr = SocketAddr::from(([0, 0, 0, 0], 9465));
         assert!(
             disabled.validate().is_ok(),
             "the bind address is irrelevant while the admin UI is disabled"
+        );
+    }
+
+    #[test]
+    fn admin_keys_must_be_well_formed() {
+        let key = |name: &str, key: &str| AdminKey {
+            name: name.into(),
+            key: key.into(),
+            role: Role::Viewer,
+        };
+
+        let mut cfg = Config::default();
+        cfg.admin.keys = Some(vec![key("ops", "a"), key("ops", "b")]);
+        assert!(cfg.validate().is_err(), "duplicate names are rejected");
+
+        cfg.admin.keys = Some(vec![key("", "a")]);
+        assert!(cfg.validate().is_err(), "empty names are rejected");
+
+        cfg.admin.keys = Some(vec![key("ops", "")]);
+        assert!(cfg.validate().is_err(), "empty keys are rejected");
+
+        cfg.admin.keys = Some(vec![key("ops", "same"), key("dev", "same")]);
+        assert!(
+            cfg.validate().is_err(),
+            "a shared secret across entries is rejected"
+        );
+
+        cfg.admin.keys = Some(vec![key("ops", "a"), key("dev", "b")]);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn session_ttl_is_bounded() {
+        let mut cfg = Config::default();
+        cfg.admin.session_ttl_ms = 0;
+        assert!(cfg.validate().is_err(), "zero TTL is rejected");
+
+        cfg.admin.session_ttl_ms = u64::MAX;
+        assert!(cfg.validate().is_err(), "absurd TTL is rejected");
+
+        cfg.admin.session_ttl_ms = 60_000;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn admin_key_roles_parse_and_default_to_admin() {
+        let cfg = Config::from_toml_str(
+            "[admin]\nkeys = [\
+             { name = \"a\", key = \"ka\" }, \
+             { name = \"v\", key = \"kv\", role = \"viewer\" }, \
+             { name = \"o\", key = \"ko\", role = \"operator\" }]\n",
+        )
+        .expect("roles parse");
+        let keys = cfg.admin.keys.as_deref().unwrap();
+        assert_eq!(keys[0].role, Role::Admin, "role defaults to admin");
+        assert_eq!(keys[1].role, Role::Viewer);
+        assert_eq!(keys[2].role, Role::Operator);
+        assert!(Role::Viewer < Role::Operator && Role::Operator < Role::Admin);
+
+        assert!(
+            Config::from_toml_str(
+                "[admin]\nkeys = [{ name = \"a\", key = \"k\", role = \"root\" }]\n"
+            )
+            .is_err(),
+            "unknown roles are rejected"
         );
     }
 
