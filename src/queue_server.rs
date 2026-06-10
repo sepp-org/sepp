@@ -9,7 +9,7 @@ use crate::pb::sepp::v1::{
 };
 use crate::pb::{millis_to_duration, millis_to_timestamp, timestamp_to_millis};
 use crate::queues::{QueueRegistry, SharedRegistry};
-use crate::storage::{Storage, now_ms};
+use crate::storage::{AtomicEnqueueOutcome, EnqueueResult, Storage, now_ms};
 use crate::telemetry;
 use std::collections::BTreeSet;
 use std::{time::Duration, time::Instant as StdInstant};
@@ -95,22 +95,63 @@ impl QueueServer {
     async fn commit_validated(
         &self,
         mut valid: Vec<EnqueueRequest>,
-    ) -> Result<Vec<pb::EnqueueResponse>, Status> {
+    ) -> Result<Vec<EnqueueResult>, Status> {
         for job in &mut valid {
             if job.trace_context.is_none() {
                 job.trace_context = telemetry::current_trace_context();
             }
         }
 
-        let responses = self.storage.enqueue(valid).await?;
-        let job_ids: Vec<&str> = responses.iter().map(|r| r.job_id.as_str()).collect();
-        let deduplicated = responses.iter().filter(|r| r.deduplicated).count();
+        let results = self.storage.enqueue(valid).await?;
+        let job_ids: Vec<&str> = results
+            .iter()
+            .filter_map(|r| r.as_ref().ok().map(|r| r.job_id.as_str()))
+            .collect();
+        let deduplicated = results
+            .iter()
+            .filter(|r| matches!(r, Ok(r) if r.deduplicated))
+            .count();
 
         let span = tracing::Span::current();
         span.record("job_ids", tracing::field::debug(&job_ids));
         span.record("deduplicated", deduplicated as u64);
 
-        Ok(responses)
+        Ok(results)
+    }
+
+    async fn commit_validated_atomic(
+        &self,
+        mut valid: Vec<EnqueueRequest>,
+    ) -> Result<AtomicEnqueueOutcome, Status> {
+        for job in &mut valid {
+            if job.trace_context.is_none() {
+                job.trace_context = telemetry::current_trace_context();
+            }
+        }
+
+        let outcome = self.storage.enqueue_atomic(valid).await?;
+
+        if let AtomicEnqueueOutcome::Committed(responses) = &outcome {
+            let job_ids: Vec<&str> = responses.iter().map(|r| r.job_id.as_str()).collect();
+            let deduplicated = responses.iter().filter(|r| r.deduplicated).count();
+            let span = tracing::Span::current();
+            span.record("job_ids", tracing::field::debug(&job_ids));
+            span.record("deduplicated", deduplicated as u64);
+        }
+
+        Ok(outcome)
+    }
+
+    // Rejections discovered at commit time (queue_full) get the same log and
+    // metric treatment as the validation rejections recorded in the handlers.
+    fn record_commit_rejection(&self, rejection: &pb::JobRejection) {
+        let label = rejection_label(rejection);
+        let queue = match rejection.reason.as_ref() {
+            Some(pb::job_rejection::Reason::QueueFull(r)) => r.queue.as_str(),
+            _ => "",
+        };
+        tracing::info!(queue = %queue, reason = label, "enqueue rejected");
+        self.metrics.record_rejected(queue, label);
     }
 }
 
@@ -220,8 +261,7 @@ fn check_enqueue_limits(
     }
 
     if let Some(at) = &job.scheduled_at
-        && timestamp_to_millis(at)
-            > now_ms().saturating_add(limits.max_schedule_horizon_ms as i64)
+        && timestamp_to_millis(at) > now_ms().saturating_add(limits.max_schedule_horizon_ms as i64)
     {
         return Err(pb::JobRejection {
             reason: Some(Reason::ScheduledTooFar(pb::ScheduledTooFar {
@@ -301,6 +341,7 @@ pub(crate) fn rejection_label(rejection: &pb::JobRejection) -> &'static str {
         Reason::IdempotencyKeyTooLong(_) => "idempotency_key_too_long",
         Reason::ScheduledTooFar(_) => "scheduled_too_far",
         Reason::InvalidRequest(_) => "invalid_request",
+        Reason::QueueFull(_) => "queue_full",
     }
 }
 
@@ -388,25 +429,37 @@ impl QueueService for QueueServer {
                 }
             }
 
-            let accepted = valid.len();
-            span.record("accepted", accepted as u64);
-            span.record("rejected", (slots.len() - accepted) as u64);
             span.record(
                 "scheduled",
                 valid.iter().filter(|j| j.scheduled_at.is_some()).count() as u64,
             );
 
             let mut enqueued = self.commit_validated(valid).await?.into_iter();
-            let results = slots
+            let results: Vec<JobResult> = slots
                 .into_iter()
                 .map(|slot| {
-                    slot.unwrap_or_else(|| JobResult {
-                        outcome: Some(job_result::Outcome::Success(
-                            enqueued.next().expect("one result per valid job"),
-                        )),
+                    slot.unwrap_or_else(|| {
+                        let outcome = match enqueued.next().expect("one result per valid job") {
+                            Ok(resp) => job_result::Outcome::Success(resp),
+                            Err(rejection) => {
+                                self.record_commit_rejection(&rejection);
+                                job_result::Outcome::Rejection(rejection)
+                            }
+                        };
+                        JobResult {
+                            outcome: Some(outcome),
+                        }
                     })
                 })
                 .collect();
+
+            // Counted after commit so queue_full rejections are included.
+            let accepted = results
+                .iter()
+                .filter(|r| matches!(&r.outcome, Some(job_result::Outcome::Success(_))))
+                .count();
+            span.record("accepted", accepted as u64);
+            span.record("rejected", (results.len() - accepted) as u64);
 
             Ok(Response::new(EnqueueBatchResponse { results }))
         }
@@ -506,14 +559,37 @@ impl QueueService for QueueServer {
                 "scheduled",
                 valid.iter().filter(|j| j.scheduled_at.is_some()).count() as u64,
             );
-            span.record("outcome", "committed");
 
-            let responses = self.commit_validated(valid).await?;
-            Ok(Response::new(EnqueueAtomicResponse {
-                outcome: Some(enqueue_atomic_response::Outcome::Success(
-                    pb::EnqueueAtomicSuccess { responses },
-                )),
-            }))
+            match self.commit_validated_atomic(valid).await? {
+                AtomicEnqueueOutcome::Committed(responses) => {
+                    span.record("outcome", "committed");
+                    Ok(Response::new(EnqueueAtomicResponse {
+                        outcome: Some(enqueue_atomic_response::Outcome::Success(
+                            pb::EnqueueAtomicSuccess { responses },
+                        )),
+                    }))
+                }
+                AtomicEnqueueOutcome::Rejected(rejections) => {
+                    span.record("outcome", "rejected");
+                    span.record("accepted", 0_u64);
+                    span.record("rejected", rejections.len() as u64);
+                    let errors = rejections
+                        .into_iter()
+                        .map(|(index, rejection)| {
+                            self.record_commit_rejection(&rejection);
+                            pb::JobValidationError {
+                                index,
+                                rejection: Some(rejection),
+                            }
+                        })
+                        .collect();
+                    Ok(Response::new(EnqueueAtomicResponse {
+                        outcome: Some(enqueue_atomic_response::Outcome::Rejection(
+                            pb::BatchValidationFailure { errors },
+                        )),
+                    }))
+                }
+            }
         }
         .instrument(span.clone())
         .await;

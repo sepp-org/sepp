@@ -108,8 +108,9 @@ impl From<Status> for ApiError {
 }
 
 fn decode_b64(field: &str, s: &str) -> Result<Vec<u8>, ApiError> {
-    B64.decode(s)
-        .map_err(|_| ApiError::bad_request("invalid_argument", format!("{field} is not valid base64")))
+    B64.decode(s).map_err(|_| {
+        ApiError::bad_request("invalid_argument", format!("{field} is not valid base64"))
+    })
 }
 
 async fn resolve_blocking<T: Send + 'static>(
@@ -268,11 +269,7 @@ pub struct DeleteQueueQuery {
 }
 
 // A truncated page counts as non-empty: entries may exist past the examine cap.
-async fn peek_nonempty(
-    state: &AdminState,
-    queue: &str,
-    peek: PeekState,
-) -> Result<bool, ApiError> {
+async fn peek_nonempty(state: &AdminState, queue: &str, peek: PeekState) -> Result<bool, ApiError> {
     let page = state
         .storage
         .peek_keys(peek, queue.to_string(), None, 1)
@@ -311,7 +308,11 @@ pub(super) async fn delete_queue(
         ));
     }
     if !query.purge.unwrap_or(false) {
-        for peek in [PeekState::Ready, PeekState::Scheduled, PeekState::DeadLetter] {
+        for peek in [
+            PeekState::Ready,
+            PeekState::Scheduled,
+            PeekState::DeadLetter,
+        ] {
             if peek_nonempty(&state, &name, peek).await? {
                 return Err(ApiError::new(
                     StatusCode::CONFLICT,
@@ -638,6 +639,10 @@ fn rejection_detail(rejection: &pb::JobRejection) -> String {
         ),
         Reason::ScheduledTooFar(_) => "scheduled_at exceeds the schedule horizon".to_string(),
         Reason::InvalidRequest(r) => r.message.clone(),
+        Reason::QueueFull(r) => format!(
+            "queue {:?} is at capacity (max_queue_depth={})",
+            r.queue, r.limit
+        ),
     }
 }
 
@@ -684,21 +689,28 @@ pub(super) async fn enqueue_job(
     };
     let registry = state.registry.load();
     if let Err(rejection) = classify_enqueue(&req, &registry, strict_queues, &server_limits) {
-        let detail = rejection_detail(&rejection);
-        return Err(ApiError {
-            status: StatusCode::UNPROCESSABLE_ENTITY,
-            code: "rejected",
-            error: format!("job rejected: {detail}"),
-            rejection: Some(json!({
-                "reason": rejection_label(&rejection),
-                "detail": detail,
-            })),
-        });
+        return Err(rejected_error(&rejection));
     }
 
-    let mut responses = state.storage.enqueue(vec![req]).await?;
-    let job_id = responses.pop().map(|r| r.job_id).unwrap_or_default();
-    Ok(Json(json!({ "job_id": job_id })))
+    let mut results = state.storage.enqueue(vec![req]).await?;
+    match results.pop() {
+        Some(Ok(resp)) => Ok(Json(json!({ "job_id": resp.job_id }))),
+        Some(Err(rejection)) => Err(rejected_error(&rejection)),
+        None => Err(ApiError::internal("storage returned no enqueue result")),
+    }
+}
+
+fn rejected_error(rejection: &pb::JobRejection) -> ApiError {
+    let detail = rejection_detail(rejection);
+    ApiError {
+        status: StatusCode::UNPROCESSABLE_ENTITY,
+        code: "rejected",
+        error: format!("job rejected: {detail}"),
+        rejection: Some(json!({
+            "reason": rejection_label(rejection),
+            "detail": detail,
+        })),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -824,9 +836,8 @@ async fn validate_and_write(
     doc: DocumentMut,
 ) -> Result<(bool, Vec<&'static str>, String), ApiError> {
     let candidate_text = doc.to_string();
-    let candidate = Config::from_toml_str(&candidate_text).map_err(|e| {
-        ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "invalid", e.to_string())
-    })?;
+    let candidate = Config::from_toml_str(&candidate_text)
+        .map_err(|e| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "invalid", e.to_string()))?;
     let running = state.config.load_full();
     let requires_restart = config_watch::restart_only_changes(&running, &candidate);
 
@@ -920,4 +931,3 @@ pub(super) async fn put_config(
         "etag": etag,
     })))
 }
-

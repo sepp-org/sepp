@@ -19,7 +19,7 @@ use tonic::Status;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::config::Config;
+use crate::config::{Config, EffectiveLimits};
 use crate::keys::{
     DeadLetterKey, DedupKey, DedupTimerKey, DedupValue, Inflight, JobValue, ReadyKey, TimerKey,
     deadline_of, queue_prefix, read_queue,
@@ -27,7 +27,7 @@ use crate::keys::{
 use crate::metrics::{CycleMetrics, Metrics, QueueDepthSnapshot};
 use crate::pb::sepp::v1::{
     DeadLetterCause, DeadLetterRecord, EnqueueRequest, EnqueueResponse, ExtendRequest, Job,
-    NackRequest, Payload, TraceContext, nack_retry,
+    JobRejection, NackRequest, Payload, QueueFull, TraceContext, job_rejection, nack_retry,
 };
 use crate::pb::{duration_to_millis, millis_to_timestamp, timestamp_to_millis};
 use crate::queues::SharedRegistry;
@@ -357,10 +357,25 @@ const PURGE_CHUNK_MAX: usize = 1000;
 const ADMIN_PUBLISH_INTERVAL: Duration = Duration::from_millis(250);
 const ADMIN_IDLE_EVICT_MS: i64 = 15 * 60 * 1000;
 
+// Per-job outcome of a best-effort enqueue. Err carries a per-job rejection
+// (currently only queue_full); storage failures stay whole-batch `Status`.
+pub type EnqueueResult = Result<EnqueueResponse, JobRejection>;
+
+// Outcome of an atomic enqueue: every job committed, or none were and the
+// offending jobs are reported by position in the submitted batch.
+pub enum AtomicEnqueueOutcome {
+    Committed(Vec<EnqueueResponse>),
+    Rejected(Vec<(u32, JobRejection)>),
+}
+
 enum Command {
     Enqueue {
         jobs: Vec<EnqueueRequest>,
-        resp: oneshot::Sender<Result<Vec<EnqueueResponse>, Status>>,
+        resp: oneshot::Sender<Result<Vec<EnqueueResult>, Status>>,
+    },
+    EnqueueAtomic {
+        jobs: Vec<EnqueueRequest>,
+        resp: oneshot::Sender<Result<AtomicEnqueueOutcome, Status>>,
     },
     Reserve {
         queues: Vec<String>,
@@ -419,8 +434,12 @@ enum Command {
 
 enum Responder {
     Enqueue(
-        oneshot::Sender<Result<Vec<EnqueueResponse>, Status>>,
-        Vec<EnqueueResponse>,
+        oneshot::Sender<Result<Vec<EnqueueResult>, Status>>,
+        Vec<EnqueueResult>,
+    ),
+    EnqueueAtomic(
+        oneshot::Sender<Result<AtomicEnqueueOutcome, Status>>,
+        AtomicEnqueueOutcome,
     ),
     Reserve(oneshot::Sender<Result<Vec<Job>, Status>>, Vec<Job>),
     Ack(oneshot::Sender<Result<AckOutcome, Status>>, AckOutcome),
@@ -452,6 +471,9 @@ impl Responder {
     fn respond(self, outcome: &Result<(), Status>) {
         match self {
             Responder::Enqueue(resp, payload) => {
+                let _ = resp.send(outcome.clone().map(|()| payload));
+            }
+            Responder::EnqueueAtomic(resp, payload) => {
                 let _ = resp.send(outcome.clone().map(|()| payload));
             }
             Responder::Reserve(resp, payload) => {
@@ -799,9 +821,15 @@ fn apply_command(
 ) -> Result<(), Status> {
     match cmd {
         Command::Enqueue { jobs, resp } => match apply_enqueue(store, indexes, tx, cycle, jobs) {
-            Ok(enqueued) => responders.push(Responder::Enqueue(resp, enqueued)),
+            Ok(results) => responders.push(Responder::Enqueue(resp, results)),
             Err(e) => return reject(resp, e),
         },
+        Command::EnqueueAtomic { jobs, resp } => {
+            match apply_enqueue_atomic(store, indexes, tx, cycle, jobs) {
+                Ok(outcome) => responders.push(Responder::EnqueueAtomic(resp, outcome)),
+                Err(e) => return reject(resp, e),
+            }
+        }
         Command::Reserve {
             queues,
             lease_ms,
@@ -876,8 +904,8 @@ fn apply_command(
 }
 
 // Storage failures are always Status::internal; business rejections (NotFound,
-// FailedPrecondition, ResourceExhausted) never are and never mutate the
-// transaction before returning.
+// FailedPrecondition) never are and never mutate the transaction before
+// returning.
 fn reject<T>(resp: oneshot::Sender<Result<T, Status>>, e: Status) -> Result<(), Status> {
     let fatal = (e.code() == tonic::Code::Internal).then(|| e.clone());
     let _ = resp.send(Err(e));
@@ -890,6 +918,9 @@ fn reject<T>(resp: oneshot::Sender<Result<T, Status>>, e: Status) -> Result<(), 
 fn fail_command(cmd: Command, status: &Status) {
     match cmd {
         Command::Enqueue { resp, .. } => {
+            let _ = resp.send(Err(status.clone()));
+        }
+        Command::EnqueueAtomic { resp, .. } => {
             let _ = resp.send(Err(status.clone()));
         }
         Command::Reserve { resp, .. } => {
@@ -989,179 +1020,277 @@ fn commit_and_persist(store: &Store, tx: WriteTransaction<'_>) -> Result<(), Sta
     }
 }
 
+fn queue_full(queue: &str, cap: u64) -> JobRejection {
+    JobRejection {
+        reason: Some(job_rejection::Reason::QueueFull(QueueFull {
+            queue: queue.to_string(),
+            limit: cap,
+        })),
+    }
+}
+
+enum DedupCheck {
+    Hit(EnqueueResponse),
+    Miss { stale_timer: Option<Vec<u8>> },
+}
+
+fn check_dedup(
+    store: &Store,
+    tx: &mut WriteTransaction<'_>,
+    cycle: &mut Cycle,
+    req: &EnqueueRequest,
+    now: i64,
+    limits: &EffectiveLimits,
+) -> Result<DedupCheck, Status> {
+    let mut stale_timer = None;
+
+    if let Some(key) = &req.idempotency_key {
+        let dkey = DedupKey {
+            queue: &req.queue,
+            idempotency_key: key,
+        }
+        .encode();
+
+        if let Some(existing) = tx.get(&store.dedup, &dkey).map_err(stg_err)? {
+            match DedupValue::decode(&existing) {
+                Some(dv) if now - dv.enqueued_at < limits.dedup_window_ms => {
+                    cycle.deduplicated(&req.queue);
+                    return Ok(DedupCheck::Hit(EnqueueResponse {
+                        job_id: dv.job_id.to_owned(),
+                        deduplicated: true,
+                    }));
+                }
+                Some(dv) => {
+                    stale_timer = Some(
+                        DedupTimerKey {
+                            deadline: dv.enqueued_at + limits.dedup_window_ms,
+                            dedup_key: &dkey,
+                        }
+                        .encode(),
+                    );
+                }
+                None => {}
+            }
+        }
+    }
+
+    Ok(DedupCheck::Miss { stale_timer })
+}
+
 fn apply_enqueue(
     store: &Store,
     indexes: &mut Indexes,
     tx: &mut WriteTransaction<'_>,
     cycle: &mut Cycle,
     jobs: Vec<EnqueueRequest>,
-) -> Result<Vec<EnqueueResponse>, Status> {
+) -> Result<Vec<EnqueueResult>, Status> {
     let now = now_ms();
     let registry = store.registry.load();
+    let mut results = Vec::with_capacity(jobs.len());
 
-    {
-        let mut wanted: HashMap<&str, u64> = HashMap::new();
-        for req in &jobs {
-            *wanted.entry(req.queue.as_str()).or_default() += 1;
-        }
+    for req in jobs {
+        let limits = registry.effective(&req.queue);
 
-        for (queue, count) in wanted {
-            if let Some(cap) = registry.effective(queue).max_queue_depth
-                && indexes.live_depth(queue) + count > cap
-            {
-                return Err(Status::resource_exhausted(format!(
-                    "queue {queue:?} is at capacity (max_queue_depth={cap})"
+        match check_dedup(store, tx, cycle, &req, now, &limits)? {
+            DedupCheck::Hit(resp) => results.push(Ok(resp)),
+            DedupCheck::Miss { stale_timer } => {
+                // live_depth is read from the in-memory indexes, which
+                // insert_job bumps immediately, so jobs admitted earlier in
+                // this batch already count against the cap. Dedup hits never
+                // get here and so never count.
+                if let Some(cap) = limits.max_queue_depth
+                    && indexes.live_depth(&req.queue) >= cap
+                {
+                    results.push(Err(queue_full(&req.queue, cap)));
+                    continue;
+                }
+                results.push(Ok(insert_job(
+                    store,
+                    indexes,
+                    tx,
+                    cycle,
+                    req,
+                    now,
+                    &limits,
+                    stale_timer,
                 )));
             }
         }
     }
 
-    let mut results = Vec::with_capacity(jobs.len());
+    Ok(results)
+}
 
+fn apply_enqueue_atomic(
+    store: &Store,
+    indexes: &mut Indexes,
+    tx: &mut WriteTransaction<'_>,
+    cycle: &mut Cycle,
+    jobs: Vec<EnqueueRequest>,
+) -> Result<AtomicEnqueueOutcome, Status> {
+    let now = now_ms();
+    let registry = store.registry.load();
+
+    // Capacity is checked for the whole batch up front so a full queue commits
+    // nothing. Dedup hits are conservatively counted as new jobs here.
+    let mut wanted: HashMap<&str, u64> = HashMap::new();
+    for req in &jobs {
+        *wanted.entry(req.queue.as_str()).or_default() += 1;
+    }
+
+    let mut full: HashMap<&str, u64> = HashMap::new();
+    for (queue, count) in wanted {
+        if let Some(cap) = registry.effective(queue).max_queue_depth
+            && indexes.live_depth(queue) + count > cap
+        {
+            full.insert(queue, cap);
+        }
+    }
+
+    if !full.is_empty() {
+        let errors = jobs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, req)| {
+                full.get(req.queue.as_str())
+                    .map(|cap| (index as u32, queue_full(&req.queue, *cap)))
+            })
+            .collect();
+        return Ok(AtomicEnqueueOutcome::Rejected(errors));
+    }
+
+    let mut responses = Vec::with_capacity(jobs.len());
     for req in jobs {
         let limits = registry.effective(&req.queue);
-        let mut stale_dedup_timer: Option<Vec<u8>> = None;
-
-        if let Some(key) = &req.idempotency_key {
-            let dkey = DedupKey {
-                queue: &req.queue,
-                idempotency_key: key,
+        responses.push(match check_dedup(store, tx, cycle, &req, now, &limits)? {
+            DedupCheck::Hit(resp) => resp,
+            DedupCheck::Miss { stale_timer } => {
+                insert_job(store, indexes, tx, cycle, req, now, &limits, stale_timer)
             }
-            .encode();
-            if let Some(existing) = tx.get(&store.dedup, &dkey).map_err(stg_err)? {
-                match DedupValue::decode(&existing) {
-                    Some(dv) if now - dv.enqueued_at < limits.dedup_window_ms => {
-                        cycle.deduplicated(&req.queue);
-                        results.push(EnqueueResponse {
-                            job_id: dv.job_id.to_owned(),
-                            deduplicated: true,
-                        });
-                        continue;
-                    }
-                    Some(dv) => {
-                        stale_dedup_timer = Some(
-                            DedupTimerKey {
-                                deadline: dv.enqueued_at + limits.dedup_window_ms,
-                                dedup_key: &dkey,
-                            }
-                            .encode(),
-                        );
-                    }
-                    None => {}
-                }
-            }
-        }
-
-        let id = Uuid::new_v4().to_string();
-        let queue = req.queue;
-        let payload = req.payload;
-
-        let scheduled_at_ms = req.scheduled_at.as_ref().map(timestamp_to_millis);
-        let job = Job {
-            id: id.clone(),
-            job_type: req.job_type,
-            payload: None,
-            priority: req.priority.unwrap_or(limits.default_priority),
-            trace_context: req.trace_context,
-            enqueued_at: Some(millis_to_timestamp(now)),
-            attempt: 1,
-            max_attempts: req
-                .max_attempts
-                .unwrap_or(limits.default_max_attempts)
-                .min(limits.max_attempts_ceiling),
-            // Not yet leased; a real lease is stamped at reserve time.
-            lease_expires_at: Some(millis_to_timestamp(0)),
-            custom: req.custom,
-            scheduled_at: req.scheduled_at,
-            queue: String::new(),
-        };
-
-        tx.insert(
-            &store.jobs,
-            id.clone().into_bytes(),
-            JobValue {
-                queue: &queue,
-                job: &job,
-            }
-            .encode(),
-        );
-
-        if let Some(payload) = payload {
-            tx.insert(
-                &store.payloads,
-                id.clone().into_bytes(),
-                payload.encode_to_vec(),
-            );
-        }
-
-        match scheduled_at_ms {
-            Some(at) if at > now => {
-                let tk = TimerKey {
-                    deadline: at,
-                    job_id: &id,
-                }
-                .encode();
-                tx.insert(
-                    &store.scheduled,
-                    tk.clone(),
-                    job.attempt.to_be_bytes().to_vec(),
-                );
-                indexes.scheduled.insert(tk, &queue);
-            }
-            _ => {
-                let rk = ReadyKey {
-                    queue: &queue,
-                    priority: job.priority,
-                    enqueued_at: now,
-                    job_id: &id,
-                }
-                .encode();
-
-                tx.insert(&store.ready, rk.clone(), job.attempt.to_be_bytes().to_vec());
-                indexes.ready.insert(rk, job.attempt);
-                cycle.new_ready.insert(queue.clone());
-            }
-        }
-
-        if let Some(key) = &req.idempotency_key {
-            let dkey = DedupKey {
-                queue: &queue,
-                idempotency_key: key,
-            }
-            .encode();
-            if let Some(old_timer) = stale_dedup_timer {
-                tx.remove(&store.dedup_timers, old_timer.clone());
-                indexes.dedup_timers.remove(&old_timer);
-            }
-
-            let dtk = DedupTimerKey {
-                deadline: now + limits.dedup_window_ms,
-                dedup_key: &dkey,
-            }
-            .encode();
-            tx.insert(&store.dedup_timers, dtk.clone(), Vec::new());
-            indexes.dedup_timers.insert(dtk, &queue);
-            tx.insert(
-                &store.dedup,
-                dkey,
-                DedupValue {
-                    enqueued_at: now,
-                    job_id: &id,
-                }
-                .encode(),
-            );
-        }
-
-        cycle.enqueued(&queue);
-        cycle.dirty = true;
-
-        results.push(EnqueueResponse {
-            job_id: id,
-            deduplicated: false,
         });
     }
 
-    Ok(results)
+    Ok(AtomicEnqueueOutcome::Committed(responses))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_job(
+    store: &Store,
+    indexes: &mut Indexes,
+    tx: &mut WriteTransaction<'_>,
+    cycle: &mut Cycle,
+    req: EnqueueRequest,
+    now: i64,
+    limits: &EffectiveLimits,
+    stale_dedup_timer: Option<Vec<u8>>,
+) -> EnqueueResponse {
+    let id = Uuid::new_v4().to_string();
+    let queue = req.queue;
+    let payload = req.payload;
+
+    let scheduled_at_ms = req.scheduled_at.as_ref().map(timestamp_to_millis);
+    let job = Job {
+        id: id.clone(),
+        job_type: req.job_type,
+        payload: None,
+        priority: req.priority.unwrap_or(limits.default_priority),
+        trace_context: req.trace_context,
+        enqueued_at: Some(millis_to_timestamp(now)),
+        attempt: 1,
+        max_attempts: req
+            .max_attempts
+            .unwrap_or(limits.default_max_attempts)
+            .min(limits.max_attempts_ceiling),
+        // Not yet leased; a real lease is stamped at reserve time.
+        lease_expires_at: Some(millis_to_timestamp(0)),
+        custom: req.custom,
+        scheduled_at: req.scheduled_at,
+        queue: String::new(),
+    };
+
+    tx.insert(
+        &store.jobs,
+        id.clone().into_bytes(),
+        JobValue {
+            queue: &queue,
+            job: &job,
+        }
+        .encode(),
+    );
+
+    if let Some(payload) = payload {
+        tx.insert(
+            &store.payloads,
+            id.clone().into_bytes(),
+            payload.encode_to_vec(),
+        );
+    }
+
+    match scheduled_at_ms {
+        Some(at) if at > now => {
+            let tk = TimerKey {
+                deadline: at,
+                job_id: &id,
+            }
+            .encode();
+            tx.insert(
+                &store.scheduled,
+                tk.clone(),
+                job.attempt.to_be_bytes().to_vec(),
+            );
+            indexes.scheduled.insert(tk, &queue);
+        }
+        _ => {
+            let rk = ReadyKey {
+                queue: &queue,
+                priority: job.priority,
+                enqueued_at: now,
+                job_id: &id,
+            }
+            .encode();
+
+            tx.insert(&store.ready, rk.clone(), job.attempt.to_be_bytes().to_vec());
+            indexes.ready.insert(rk, job.attempt);
+            cycle.new_ready.insert(queue.clone());
+        }
+    }
+
+    if let Some(key) = &req.idempotency_key {
+        let dkey = DedupKey {
+            queue: &queue,
+            idempotency_key: key,
+        }
+        .encode();
+        if let Some(old_timer) = stale_dedup_timer {
+            tx.remove(&store.dedup_timers, old_timer.clone());
+            indexes.dedup_timers.remove(&old_timer);
+        }
+
+        let dtk = DedupTimerKey {
+            deadline: now + limits.dedup_window_ms,
+            dedup_key: &dkey,
+        }
+        .encode();
+        tx.insert(&store.dedup_timers, dtk.clone(), Vec::new());
+        indexes.dedup_timers.insert(dtk, &queue);
+        tx.insert(
+            &store.dedup,
+            dkey,
+            DedupValue {
+                enqueued_at: now,
+                job_id: &id,
+            }
+            .encode(),
+        );
+    }
+
+    cycle.enqueued(&queue);
+    cycle.dirty = true;
+
+    EnqueueResponse {
+        job_id: id,
+        deduplicated: false,
+    }
 }
 
 fn apply_reserve(
@@ -2680,8 +2809,16 @@ impl Storage {
             .map_err(|_| Status::internal("storage unavailable"))
     }
 
-    pub async fn enqueue(&self, jobs: Vec<EnqueueRequest>) -> Result<Vec<EnqueueResponse>, Status> {
+    pub async fn enqueue(&self, jobs: Vec<EnqueueRequest>) -> Result<Vec<EnqueueResult>, Status> {
         self.send(|resp| Command::Enqueue { jobs, resp }).await?
+    }
+
+    pub async fn enqueue_atomic(
+        &self,
+        jobs: Vec<EnqueueRequest>,
+    ) -> Result<AtomicEnqueueOutcome, Status> {
+        self.send(|resp| Command::EnqueueAtomic { jobs, resp })
+            .await?
     }
 
     pub async fn reserve_once(

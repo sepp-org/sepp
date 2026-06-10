@@ -1,14 +1,13 @@
-# This repo vendors the sepp wire contract under `proto/` (queue.proto plus its
-# transitive imports, e.g. buf/validate/validate.proto). It is NOT the source of
-# truth: the contract lives in the sepp `proto` repo and is published to
+# This repo vendors the sepp wire contract under `proto/`. It is NOT the source
+# of truth: the contract lives in the sepp `proto` repo and is published to
 # buf.build/sepp-org/sepp-proto, where lint/breaking checks are enforced.
 #
-# buf is not part of the build — prost/tonic compile the vendored files directly
+# buf is not part of the build — prost/tonic compile the vendored file directly
 # (see build.rs), so the build is offline and picks up local edits to
 # proto/sepp/v1/queue.proto. This file exists only so editor tooling can resolve
-# the vendored imports, and to document how to refresh the snapshot:
+# the vendored module, and to document how to refresh the snapshot:
 #
-#     buf export buf.build/sepp-org/sepp-proto:v1.1.0 -o proto
+#     buf export buf.build/sepp-org/sepp-proto:v1.1.2 -o proto
 version: v2
 modules:
   - path: proto
