@@ -310,8 +310,7 @@ fn dechunk(raw: &[u8]) -> (String, usize) {
     let mut pos = 0;
     while let Some(line_end) = find(&raw[pos..], b"\r\n") {
         let size_text = std::str::from_utf8(&raw[pos..pos + line_end]).unwrap_or("");
-        let Ok(size) =
-            usize::from_str_radix(size_text.split(';').next().unwrap_or("").trim(), 16)
+        let Ok(size) = usize::from_str_radix(size_text.split(';').next().unwrap_or("").trim(), 16)
         else {
             break;
         };
@@ -323,7 +322,9 @@ fn dechunk(raw: &[u8]) -> (String, usize) {
         if raw.len() < data_start + size + 2 {
             break;
         }
-        out.push_str(&String::from_utf8_lossy(&raw[data_start..data_start + size]));
+        out.push_str(&String::from_utf8_lossy(
+            &raw[data_start..data_start + size],
+        ));
         pos = data_start + size + 2;
     }
     (out, pos)
@@ -370,7 +371,8 @@ async fn http(
         let mut stream = TcpStream::connect(("127.0.0.1", port))
             .await
             .expect("connect to admin endpoint");
-        let mut req = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n");
+        let mut req =
+            format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n");
         for (name, value) in headers {
             req.push_str(&format!("{name}: {value}\r\n"));
         }
@@ -384,7 +386,10 @@ async fn http(
         if let Some(body) = body {
             req.push_str(body);
         }
-        stream.write_all(req.as_bytes()).await.expect("write request");
+        stream
+            .write_all(req.as_bytes())
+            .await
+            .expect("write request");
         let mut raw = Vec::new();
         stream.read_to_end(&mut raw).await.expect("read response");
         parse_response(&raw)
@@ -432,7 +437,8 @@ async fn sse_connect(port: u16) -> SseReader {
     let mut stream = TcpStream::connect(("127.0.0.1", port))
         .await
         .expect("connect to admin endpoint");
-    let req = "GET /admin/api/v1/events HTTP/1.1\r\nHost: localhost\r\nAccept: text/event-stream\r\n\r\n";
+    let req =
+        "GET /admin/api/v1/events HTTP/1.1\r\nHost: localhost\r\nAccept: text/event-stream\r\n\r\n";
     stream
         .write_all(req.as_bytes())
         .await
@@ -451,7 +457,10 @@ async fn sse_connect(port: u16) -> SseReader {
         read_some(&mut stream, &mut raw).await;
     };
     let head = String::from_utf8_lossy(&raw[..header_end]).into_owned();
-    assert!(head.starts_with("HTTP/1.1 200"), "SSE request failed: {head}");
+    assert!(
+        head.starts_with("HTTP/1.1 200"),
+        "SSE request failed: {head}"
+    );
 
     let rest = raw.split_off(header_end + 4);
     let mut reader = SseReader {
@@ -621,7 +630,14 @@ async fn peek_lists_ready_jobs_and_pages_with_cursors() {
 
     // The job-detail route resolves a live job by id; unknown ids are 404.
     let some_id = ids.iter().next().unwrap();
-    let resp = http(port, "GET", &format!("/admin/api/v1/jobs/{some_id}"), &[], None).await;
+    let resp = http(
+        port,
+        "GET",
+        &format!("/admin/api/v1/jobs/{some_id}"),
+        &[],
+        None,
+    )
+    .await;
     assert_eq!(resp.status, 200);
     let detail = resp.json();
     assert_eq!(detail["id"], some_id.as_str());
@@ -907,12 +923,18 @@ async fn admin_dead_letters_ready_and_scheduled_jobs() {
     .await;
 
     // Dead-letter one ready job; a junk key counts as missing, not an error.
-    let page = http(port, "GET", &jobs_path("ready"), &[], None).await.json();
+    let page = http(port, "GET", &jobs_path("ready"), &[], None)
+        .await
+        .json();
     let ready = page["jobs"].as_array().unwrap();
     assert_eq!(ready.len(), 2);
     let victim = ready
         .iter()
-        .find(|j| j["payload"]["data_b64"].as_str().is_some_and(|d| !d.is_empty()))
+        .find(|j| {
+            j["payload"]["data_b64"]
+                .as_str()
+                .is_some_and(|d| !d.is_empty())
+        })
         .expect("the payload-carrying job is listed");
     let victim_id = victim["id"].as_str().unwrap().to_string();
     let victim_key = victim["key_b64"].as_str().unwrap().to_string();
@@ -936,8 +958,14 @@ async fn admin_dead_letters_ready_and_scheduled_jobs() {
     assert_eq!(outcome["dead_lettered"], json!(1));
     assert_eq!(outcome["missing"], json!(1));
 
-    let page = http(port, "GET", &jobs_path("ready"), &[], None).await.json();
-    assert_eq!(page["jobs"].as_array().unwrap().len(), 1, "one ready job remains");
+    let page = http(port, "GET", &jobs_path("ready"), &[], None)
+        .await
+        .json();
+    assert_eq!(
+        page["jobs"].as_array().unwrap().len(),
+        1,
+        "one ready job remains"
+    );
 
     let page = http(port, "GET", &jobs_path("dead_letter"), &[], None)
         .await
@@ -994,7 +1022,11 @@ async fn admin_dead_letters_ready_and_scheduled_jobs() {
         Some(&body),
     )
     .await;
-    assert_eq!(resp.status, 200, "scheduled dead-letter failed: {}", resp.body);
+    assert_eq!(
+        resp.status, 200,
+        "scheduled dead-letter failed: {}",
+        resp.body
+    );
     assert_eq!(resp.json()["dead_lettered"], json!(1));
     let page = http(port, "GET", &jobs_path("scheduled"), &[], None)
         .await
@@ -1222,7 +1254,10 @@ async fn config_editor_applies_validates_and_guards() {
     // The harness boots with SEPP_SERVER__LISTEN_ADDR set, so that path is
     // env-pinned in this process.
     let pinned = config["env_pinned"].to_string();
-    assert!(pinned.contains("server.listen_addr"), "env_pinned: {pinned}");
+    assert!(
+        pinned.contains("server.listen_addr"),
+        "env_pinned: {pinned}"
+    );
     let restart_only = config["restart_only"].to_string();
     assert!(restart_only.contains("admin.listen_addr"));
     assert!(
@@ -1364,9 +1399,8 @@ async fn sse_streams_hello_then_stats_frames() {
 
     // A subsequent stats frame must reflect the enqueue: depth and totals
     // both, since they publish in the same snapshot.
-    let reflects_enqueue = |frame: &Value| {
-        frame["queues"]["adm-sse-q"]["totals"]["enqueued"].as_u64() == Some(1)
-    };
+    let reflects_enqueue =
+        |frame: &Value| frame["queues"]["adm-sse-q"]["totals"]["enqueued"].as_u64() == Some(1);
     sse.wait_for(Instant::now() + Duration::from_secs(15), |body| {
         stats_frames(body).iter().any(reflects_enqueue)
     })

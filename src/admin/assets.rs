@@ -14,8 +14,12 @@ pub async fn serve(uri: Uri) -> Response {
         return Redirect::temporary("/admin/").into_response();
     }
 
-    let not_found =
-        || (StatusCode::NOT_FOUND, Json(json!({ "error": "not found", "code": "not_found" })));
+    let not_found = || {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "not found", "code": "not_found" })),
+        )
+    };
 
     if path.starts_with("/admin/api/") {
         return not_found().into_response();

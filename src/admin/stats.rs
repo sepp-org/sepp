@@ -41,13 +41,7 @@ fn queue_names(state: &AdminState, snapshot: &AdminSnapshot) -> BTreeSet<String>
         .chain(snapshot.totals.keys())
         .cloned()
         .collect();
-    names.extend(
-        state
-            .registry
-            .load()
-            .declared_names()
-            .map(str::to_string),
-    );
+    names.extend(state.registry.load().declared_names().map(str::to_string));
     names
 }
 
@@ -196,15 +190,15 @@ pub async fn events(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
     ));
     let rest = BroadcastStream::new(rx).filter_map(|event| match event {
         Ok(Event::Stats(frame)) => Some(Ok(SseEvent::default().event("stats").data(&*frame))),
-        Ok(Event::Config(seq)) => {
-            Some(Ok(SseEvent::default().event("config").data(seq.to_string())))
-        }
+        Ok(Event::Config(seq)) => Some(Ok(SseEvent::default()
+            .event("config")
+            .data(seq.to_string()))),
         // A lagged subscriber just skips to the next full-snapshot frame.
         Err(BroadcastStreamRecvError::Lagged(_)) => None,
     });
 
-    let sse = Sse::new(first.chain(rest))
-        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)));
+    let sse =
+        Sse::new(first.chain(rest)).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)));
 
     (
         [
