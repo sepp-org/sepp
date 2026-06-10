@@ -347,6 +347,23 @@ impl Default for MetricsConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AdminConfig {
+    pub enabled: bool,
+    // Loopback only until the admin UI grows real authentication.
+    pub listen_addr: SocketAddr,
+}
+
+impl Default for AdminConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen_addr: SocketAddr::from(([127, 0, 0, 1], 9465)),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -357,6 +374,7 @@ pub struct Config {
     pub logging: LoggingConfig,
     pub tracing: TracingConfig,
     pub metrics: MetricsConfig,
+    pub admin: AdminConfig,
     pub queues: Vec<QueueConfig>,
 }
 
@@ -374,9 +392,17 @@ impl Config {
             return Err(format!("config file not found: {path}").into());
         }
 
+        Self::extract(Toml::file(path))
+    }
+
+    pub fn from_toml_str(toml: &str) -> Result<Self, Box<dyn Error>> {
+        Self::extract(Toml::string(toml))
+    }
+
+    fn extract(toml: impl figment::Provider) -> Result<Self, Box<dyn Error>> {
         let config: Config = Figment::new()
             .merge(Serialized::defaults(Config::default()))
-            .merge(Toml::file(path))
+            .merge(toml)
             .merge(Env::prefixed("SEPP_").split("__"))
             .extract()?;
         config.validate()?;
@@ -426,6 +452,14 @@ impl Config {
             }
         }
 
+        if self.admin.enabled && !self.admin.listen_addr.ip().is_loopback() {
+            return Err(
+                "the admin UI has no authentication yet; admin.listen_addr must be a loopback \
+                 address (use an SSH tunnel or an authenticating reverse proxy for remote access)"
+                    .into(),
+            );
+        }
+
         let defaults = EffectiveLimits::from_globals(&self.limits, &self.storage);
         defaults.validate(self.limits.max_message_bytes, "limits")?;
         self.validate_queues(&defaults)?;
@@ -437,6 +471,11 @@ impl Config {
         for q in &self.queues {
             if q.name.is_empty() {
                 return Err("queues[].name must not be empty".into());
+            }
+            // "." and ".." are unaddressable over HTTP: browsers collapse them
+            // out of URL paths before the request is sent.
+            if q.name == "." || q.name == ".." {
+                return Err(format!("queues[].name {:?} is not a valid queue name", q.name).into());
             }
             if q.name.len() > self.limits.max_queue_name_bytes as usize {
                 return Err(format!(
@@ -581,6 +620,20 @@ mod tests {
     }
 
     #[test]
+    fn dot_queue_names_are_rejected() {
+        for name in [".", ".."] {
+            let cfg = Config {
+                queues: vec![QueueConfig {
+                    name: name.into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            assert!(cfg.validate().is_err(), "{name:?} must be rejected");
+        }
+    }
+
+    #[test]
     fn queue_name_over_the_byte_limit_is_rejected() {
         let cfg = Config {
             limits: LimitsConfig {
@@ -624,6 +677,36 @@ mod tests {
         assert!(
             cfg.validate().is_err(),
             "garde range(min = 1) rejects a zero batch cap"
+        );
+    }
+
+    #[test]
+    fn admin_requires_a_loopback_listen_addr() {
+        let mut cfg = Config::default();
+        cfg.admin.enabled = true;
+        cfg.admin.listen_addr = SocketAddr::from(([0, 0, 0, 0], 9465));
+        assert!(
+            cfg.validate().is_err(),
+            "a non-loopback admin bind must be rejected while the UI has no auth"
+        );
+
+        cfg.admin.listen_addr = SocketAddr::from(([127, 0, 0, 1], 9465));
+        assert!(cfg.validate().is_ok());
+
+        let mut disabled = Config::default();
+        disabled.admin.listen_addr = SocketAddr::from(([0, 0, 0, 0], 9465));
+        assert!(
+            disabled.validate().is_ok(),
+            "the bind address is irrelevant while the admin UI is disabled"
+        );
+    }
+
+    #[test]
+    fn from_toml_str_validates_like_load() {
+        assert!(Config::from_toml_str("").is_ok());
+        assert!(
+            Config::from_toml_str("[admin]\nenabled = true\nlisten_addr = \"0.0.0.0:9465\"\n")
+                .is_err()
         );
     }
 

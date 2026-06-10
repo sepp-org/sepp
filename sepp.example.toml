@@ -24,6 +24,16 @@ db_path = "./sepp-data"
 # effect regardless of this flag; strict only gates rejection of unknown names.
 strict_queues = false
 
+[admin]
+# Serve the admin web UI on its own HTTP listener, separate from the gRPC
+# server and the metrics endpoints.
+enabled = false
+
+# host:port the admin UI binds to. The admin UI has no authentication yet, so
+# only loopback addresses are accepted; use an SSH tunnel or an authenticating
+# reverse proxy for remote access.
+listen_addr = "127.0.0.1:9465"
+
 [auth]
 # Primitive API key authentication. If omitted, every caller is allowed.
 # If set to a non-empty list, only those keys are accepted.

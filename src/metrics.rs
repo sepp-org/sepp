@@ -167,6 +167,7 @@ pub struct QueueDepthSnapshot {
     pub ready: HashMap<String, u64>,
     pub scheduled: HashMap<String, u64>,
     pub inflight: HashMap<String, u64>,
+    pub dead_letter: HashMap<String, u64>,
 }
 
 #[derive(Default)]
@@ -182,6 +183,10 @@ pub struct CycleMetrics {
     pub sweep_dedup_expirations_by_queue: HashMap<String, u64>,
     pub dead_letters_expired: u64,
     pub dead_letters_drained: u64,
+    // Queues fully emptied by an admin purge this cycle. Not a metric: the
+    // committer uses it to drop the queue's admin totals immediately instead
+    // of waiting out the 15-minute idle eviction.
+    pub purged_queues: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -390,7 +395,18 @@ impl Metrics {
                 })
                 .build()
         };
-        vec![ready, scheduled, inflight]
+        let dead_lettered = {
+            let depths = self.queue_depths.clone();
+            meter
+                .u64_observable_gauge("sepp.queue.dead_lettered")
+                .with_callback(move |observer| {
+                    for (queue, depth) in &depths.load().dead_letter {
+                        observer.observe(*depth, &[KeyValue::new("queue", queue.clone())]);
+                    }
+                })
+                .build()
+        };
+        vec![ready, scheduled, inflight, dead_lettered]
     }
 }
 

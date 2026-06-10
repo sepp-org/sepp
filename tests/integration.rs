@@ -93,6 +93,17 @@ async fn wait_for_port(book: &PortBook, key: &str, timeout: Duration) -> Option<
     }
 }
 
+/// An empty config file in the temp dir, shared by every test server that
+/// does not bring its own config. The server treats an empty file as
+/// all-defaults; concurrent re-writes of identical content are harmless.
+fn isolated_config_path() -> std::path::PathBuf {
+    let path = std::env::temp_dir().join("sepp-integration-defaults.toml");
+    if !path.exists() {
+        let _ = std::fs::write(&path, "");
+    }
+    path
+}
+
 /// Spawns the server binary with `extra_env`, binding `127.0.0.1:0` so the OS
 /// hands out a free, unique port. Returns the child and a [`PortBook`] the
 /// caller queries (via [`wait_for_port`]) for the actual bound port(s).
@@ -109,6 +120,11 @@ fn spawn_server_process(
     command
         .env("SEPP_SERVER__LISTEN_ADDR", "127.0.0.1:0")
         .env("SEPP_SERVER__DB_PATH", db_path)
+        // Isolate from any sepp.toml in the developer's working directory:
+        // a local file enabling the admin UI's fixed port or strict_queues
+        // would break concurrently spawned test servers. Tests that need a
+        // config override SEPP_CONFIG through `extra_env`.
+        .env("SEPP_CONFIG", isolated_config_path())
         // Force info so the startup "listening" lines are always emitted,
         // whatever level a test's config might otherwise set.
         .env("RUST_LOG", "sepp=info")
@@ -1506,15 +1522,18 @@ max_queue_depth = 2
     enqueue(&client, enqueue_req("smoke-depth")).await;
     enqueue(&client, enqueue_req("smoke-depth")).await;
 
-    // A third would exceed it: rejected as a whole-batch RESOURCE_EXHAUSTED.
-    let status = client
-        .clone()
-        .enqueue_batch(EnqueueBatchRequest {
-            jobs: vec![enqueue_req("smoke-depth")],
-        })
-        .await
-        .expect_err("enqueue beyond the cap is rejected");
-    assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+    // A third is rejected per-job with queue_full; the RPC itself succeeds.
+    let result = enqueue_one(&client, enqueue_req("smoke-depth")).await;
+    match result.outcome {
+        Some(job_result::Outcome::Rejection(r)) => match r.reason {
+            Some(job_rejection::Reason::QueueFull(qf)) => {
+                assert_eq!(qf.queue, "smoke-depth");
+                assert_eq!(qf.limit, 2);
+            }
+            other => panic!("expected QueueFull rejection, got {other:?}"),
+        },
+        other => panic!("enqueue beyond the cap was not rejected: {other:?}"),
+    }
 
     // A different queue has its own independent budget.
     enqueue(&client, enqueue_req("smoke-depth-other")).await;
@@ -1528,6 +1547,138 @@ max_queue_depth = 2
 }
 
 #[tokio::test]
+async fn full_queue_rejects_only_its_own_jobs_in_a_batch() {
+    let cfg = r#"
+[limits]
+max_queue_depth = 2
+"#;
+    let (_guard, client) = start_server_with_config("depth-batch", cfg).await;
+
+    // Four jobs in one batch: two fit, the third exceeds the cap mid-batch,
+    // and the job aimed at another queue is untouched.
+    let results = client
+        .clone()
+        .enqueue_batch(EnqueueBatchRequest {
+            jobs: vec![
+                enqueue_req("smoke-depth-a"),
+                enqueue_req("smoke-depth-a"),
+                enqueue_req("smoke-depth-a"),
+                enqueue_req("smoke-depth-b"),
+            ],
+        })
+        .await
+        .expect("enqueue_batch RPC")
+        .into_inner()
+        .results;
+
+    assert!(matches!(
+        results[0].outcome,
+        Some(job_result::Outcome::Success(_))
+    ));
+    assert!(matches!(
+        results[1].outcome,
+        Some(job_result::Outcome::Success(_))
+    ));
+    assert!(matches!(
+        &results[2].outcome,
+        Some(job_result::Outcome::Rejection(r))
+            if matches!(r.reason, Some(job_rejection::Reason::QueueFull(_)))
+    ));
+    assert!(matches!(
+        results[3].outcome,
+        Some(job_result::Outcome::Success(_))
+    ));
+}
+
+#[tokio::test]
+async fn dedup_hits_bypass_a_full_queue() {
+    let cfg = r#"
+[limits]
+max_queue_depth = 1
+"#;
+    let (_guard, client) = start_server_with_config("depth-dedup", cfg).await;
+
+    let first = enqueue(
+        &client,
+        EnqueueRequest {
+            idempotency_key: Some("dd-1".into()),
+            ..enqueue_req("smoke-depth-dedup")
+        },
+    )
+    .await;
+
+    // The queue is now full, but a duplicate adds nothing and still answers.
+    let dup = enqueue(
+        &client,
+        EnqueueRequest {
+            idempotency_key: Some("dd-1".into()),
+            ..enqueue_req("smoke-depth-dedup")
+        },
+    )
+    .await;
+    assert!(dup.deduplicated);
+    assert_eq!(dup.job_id, first.job_id);
+}
+
+#[tokio::test]
+async fn atomic_enqueue_to_a_full_queue_commits_nothing() {
+    let cfg = r#"
+[limits]
+max_queue_depth = 2
+"#;
+    let (_guard, client) = start_server_with_config("depth-atomic", cfg).await;
+
+    // Three jobs against a cap of 2: the batch cannot fit as a whole, so every
+    // job aimed at the full queue is reported and nothing commits, including
+    // the job aimed at the unrelated queue.
+    let response = client
+        .clone()
+        .enqueue_atomic(EnqueueBatchRequest {
+            jobs: vec![
+                enqueue_req("atomic-full"),
+                enqueue_req("atomic-full"),
+                enqueue_req("atomic-full"),
+                enqueue_req("atomic-full-other"),
+            ],
+        })
+        .await
+        .expect("enqueue_atomic RPC")
+        .into_inner();
+
+    let failure = match response.outcome {
+        Some(enqueue_atomic_response::Outcome::Rejection(f)) => f,
+        other => panic!("expected Rejection outcome, got {other:?}"),
+    };
+    assert_eq!(
+        failure.errors.iter().map(|e| e.index).collect::<Vec<_>>(),
+        vec![0, 1, 2],
+        "every job aimed at the full queue is reported"
+    );
+    for e in &failure.errors {
+        match &e.rejection.as_ref().expect("rejection is set").reason {
+            Some(job_rejection::Reason::QueueFull(qf)) => {
+                assert_eq!(qf.queue, "atomic-full");
+                assert_eq!(qf.limit, 2);
+            }
+            other => panic!("expected QueueFull, got {other:?}"),
+        }
+    }
+
+    assert!(
+        reserve(&client, "atomic-full", LEASE, NO_WAIT)
+            .await
+            .is_none(),
+        "the full queue received nothing"
+    );
+    assert!(
+        reserve(&client, "atomic-full-other", LEASE, NO_WAIT)
+            .await
+            .is_none(),
+        "atomic rejection rolls back the whole batch"
+    );
+}
+
+#[tokio::test]
 async fn max_queue_depth_zero_rejects_every_enqueue() {
     // Omitting the key means unlimited; an explicit 0 rejects everything.
     let cfg = r#"
@@ -1536,14 +1687,12 @@ max_queue_depth = 0
 "#;
     let (_guard, client) = start_server_with_config("depth-zero", cfg).await;
 
-    let status = client
-        .clone()
-        .enqueue_batch(EnqueueBatchRequest {
-            jobs: vec![enqueue_req("smoke-depth-zero")],
-        })
-        .await
-        .expect_err("a 0 cap rejects every enqueue");
-    assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+    let result = enqueue_one(&client, enqueue_req("smoke-depth-zero")).await;
+    assert!(matches!(
+        &result.outcome,
+        Some(job_result::Outcome::Rejection(r))
+            if matches!(r.reason, Some(job_rejection::Reason::QueueFull(_)))
+    ));
 }
 
 #[tokio::test]
@@ -2002,7 +2151,7 @@ async fn completing_an_unknown_job_is_not_found() {
 async fn structurally_invalid_enqueue_is_rejected() {
     let (_guard, client) = start_server("invalid").await;
 
-    // priority must be 0..=9 (a proto buf.validate rule). An out-of-range value
+    // priority must be 0..=9 (documented in the proto). An out-of-range value
     // is surfaced as an InvalidRequest rejection carrying the violation message.
     let rejected = enqueue_one(
         &client,

@@ -54,6 +54,6 @@ cargo build
 cargo test
 ```
 
-The `(buf.validate)` annotations in [`proto/sepp/v1/queue.proto`](proto/sepp/v1/queue.proto)
-remain the published validation contract for clients; the server enforces the
-equivalent rules in [`src/validate.rs`](src/validate.rs).
+Request validation rules are documented as comments in
+[`proto/sepp/v1/queue.proto`](proto/sepp/v1/queue.proto) and enforced by the
+server in [`src/validate.rs`](src/validate.rs).

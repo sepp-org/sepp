@@ -1,0 +1,41 @@
+@import "tailwindcss";
+
+@theme {
+  --color-accent: #ec6a2e;
+  --color-accent-bright: #f5854d;
+  --color-ink-950: #181512;
+  --color-ink-900: #1f1b17;
+  --color-ink-800: #2a241e;
+  --color-ink-700: #38302a;
+  --color-ink-600: #51463c;
+  --color-ink-500: #6e6053;
+  --color-ink-400: #8f7f70;
+  --color-ink-300: #ab9c8c;
+  --color-ink-200: #cdc2b3;
+  --color-ink-100: #e9e2d7;
+}
+
+@layer base {
+  html {
+    color-scheme: dark;
+  }
+
+  body {
+    background-color: var(--color-ink-950);
+    color: var(--color-ink-100);
+  }
+}
+
+/* JSON token colors for jsonHighlight.ts output (CodeTextarea, JsonView). */
+.tok-key {
+  color: #f0976b;
+}
+.tok-str {
+  color: #a9c79b;
+}
+.tok-num {
+  color: #8fb8e0;
+}
+.tok-lit {
+  color: #d9b66f;
+}

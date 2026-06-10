@@ -1,0 +1,239 @@
+<script setup lang="ts">
+import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query'
+import { computed, ref } from 'vue'
+import { api } from '../../api/client'
+import type { JobState, JobSummary } from '../../api/types'
+import ConfirmDialog from '../../components/ConfirmDialog.vue'
+import CopyButton from '../../components/CopyButton.vue'
+import PayloadView from '../../components/PayloadView.vue'
+import { useStatsStream } from '../../composables/useStatsStream'
+
+const props = defineProps<{ queue: string; state: JobState; job: JobSummary }>()
+
+const emit = defineEmits<{ gone: [notice: string] }>()
+
+const { data: detail, error } = useQuery({
+  queryKey: computed(() =>
+    props.state === 'dead_letter'
+      ? ['dead-letter', props.queue, props.job.key_b64]
+      : ['job', props.job.id],
+  ),
+  queryFn: () =>
+    props.state === 'dead_letter'
+      ? api.deadLetter(props.queue, props.job.key_b64)
+      : api.job(props.job.id),
+  retry: false,
+})
+
+const queryClient = useQueryClient()
+const { server } = useStatsStream()
+// In-flight jobs are excluded: a worker holds their lease.
+const canDeadLetter = computed(() => props.state === 'ready' || props.state === 'scheduled')
+const canRequeue = computed(() => props.state === 'dead_letter')
+const retentionOff = computed(() => server.value?.dead_letter_retention_ms === 0)
+const confirm = ref<'dead_letter' | 'requeue' | null>(null)
+const actionError = ref('')
+
+function finish(notice: string) {
+  confirm.value = null
+  void queryClient.invalidateQueries({ queryKey: ['jobs', props.queue] })
+  emit('gone', notice)
+}
+
+function fail(e: unknown, fallback: string) {
+  confirm.value = null
+  actionError.value = e instanceof Error ? e.message : fallback
+}
+
+const { mutate: deadLetter, isPending: deadLettering } = useMutation({
+  mutationFn: () =>
+    api.deadLetterJobs(props.queue, props.state as 'ready' | 'scheduled', [props.job.key_b64]),
+  onSuccess: (res) => {
+    finish(
+      res.dead_lettered === 1
+        ? retentionOff.value
+          ? 'Job dropped (dead-letter retention is disabled)'
+          : 'Job dead-lettered'
+        : 'Job was already gone',
+    )
+  },
+  onError: (e) => fail(e, 'dead-lettering failed'),
+})
+
+const { mutate: requeue, isPending: requeueing } = useMutation({
+  mutationFn: () => api.requeueDeadLetters(props.queue, [props.job.key_b64]),
+  onSuccess: (res) => {
+    finish(res.requeued === 1 ? 'Job requeued to ready' : 'Job was already gone')
+  },
+  onError: (e) => fail(e, 'requeue failed'),
+})
+
+const actionBusy = computed(() => deadLettering.value || requeueing.value)
+
+const full = computed<JobSummary>(() => detail.value ?? props.job)
+const payloadB64 = computed(() => detail.value?.payload.data_b64 ?? props.job.payload.data_b64)
+const customEntries = computed(() => Object.entries(full.value.custom ?? {}))
+
+const stateLabels: Record<JobState, string> = {
+  ready: 'ready',
+  scheduled: 'scheduled',
+  inflight: 'in-flight',
+  dead_letter: 'dead letter',
+}
+
+const times = computed(() => {
+  const f = full.value
+  const rows: { label: string; ms: number }[] = [{ label: 'Enqueued', ms: f.enqueued_at_ms }]
+  if (f.scheduled_at_ms !== undefined) rows.push({ label: 'Scheduled', ms: f.scheduled_at_ms })
+  if (f.lease_expires_at_ms !== undefined)
+    rows.push({ label: 'Lease expires', ms: f.lease_expires_at_ms })
+  if (f.failed_at_ms !== undefined) rows.push({ label: 'Failed', ms: f.failed_at_ms })
+  return rows
+})
+
+const downloadName = computed(() => {
+  const enc = full.value.payload.encoding.toLowerCase()
+  const ext = enc.includes('json')
+    ? 'json'
+    : enc.includes('text') || enc.includes('utf') || enc.includes('plain')
+      ? 'txt'
+      : 'bin'
+  return `${full.value.id}.${ext}`
+})
+
+function absTime(ms: number): string {
+  return new Date(ms).toLocaleString()
+}
+
+function relTime(ms: number): string {
+  const diff = ms - Date.now()
+  const abs = Math.abs(diff)
+  const units: [number, string][] = [
+    [86_400_000, 'd'],
+    [3_600_000, 'h'],
+    [60_000, 'm'],
+    [1_000, 's'],
+  ]
+  for (const [size, label] of units) {
+    if (abs >= size) {
+      const n = Math.round(abs / size)
+      return diff < 0 ? `${n}${label} ago` : `in ${n}${label}`
+    }
+  }
+  return 'now'
+}
+</script>
+
+<template>
+  <div class="flex flex-col gap-4">
+    <div class="flex items-center gap-2">
+      <span class="font-mono text-sm">{{ full.id }}</span>
+      <CopyButton :text="full.id" />
+      <span class="rounded-full bg-ink-800 px-2 py-0.5 text-xs text-ink-300">
+        {{ stateLabels[state] }}
+      </span>
+      <button
+        v-if="canDeadLetter"
+        class="ml-auto rounded border border-red-500/40 px-2.5 py-1 text-sm text-red-400 hover:bg-red-500/10 disabled:opacity-50"
+        :disabled="actionBusy"
+        @click="confirm = 'dead_letter'"
+      >
+        Dead-letter
+      </button>
+      <button
+        v-else-if="canRequeue"
+        class="ml-auto rounded border border-emerald-500/40 px-2.5 py-1 text-sm text-emerald-400 hover:bg-emerald-500/10 disabled:opacity-50"
+        :disabled="actionBusy"
+        @click="confirm = 'requeue'"
+      >
+        Requeue
+      </button>
+    </div>
+
+    <p v-if="actionError" class="text-sm text-red-400">{{ actionError }}</p>
+    <p v-if="error" class="text-sm text-amber-400">{{ error.message }}</p>
+
+    <dl class="grid grid-cols-2 gap-x-6 gap-y-3 text-sm sm:grid-cols-3">
+      <div>
+        <dt class="text-xs text-ink-400">Type</dt>
+        <dd>{{ full.job_type }}</dd>
+      </div>
+      <div>
+        <dt class="text-xs text-ink-400">Priority</dt>
+        <dd>{{ full.priority }}</dd>
+      </div>
+      <div>
+        <dt class="text-xs text-ink-400">Attempt</dt>
+        <dd>{{ full.attempt }}/{{ full.max_attempts }}</dd>
+      </div>
+      <div v-for="t in times" :key="t.label">
+        <dt class="text-xs text-ink-400">{{ t.label }}</dt>
+        <dd>{{ absTime(t.ms) }} <span class="text-ink-400">({{ relTime(t.ms) }})</span></dd>
+      </div>
+      <div v-if="full.cause">
+        <dt class="text-xs text-ink-400">Cause</dt>
+        <dd>{{ full.cause }}</dd>
+      </div>
+    </dl>
+
+    <div v-if="full.last_reason">
+      <h4 class="mb-1 text-xs font-medium text-ink-400">Last failure reason</h4>
+      <p class="rounded border border-ink-800 bg-ink-950 px-3 py-2 text-sm">
+        {{ full.last_reason }}
+      </p>
+    </div>
+
+    <div v-if="customEntries.length > 0">
+      <h4 class="mb-1 text-xs font-medium text-ink-400">Custom</h4>
+      <table class="w-full text-left text-sm">
+        <tbody>
+          <tr v-for="[k, v] in customEntries" :key="k" class="border-b border-ink-800/60">
+            <td class="w-48 py-1.5 pr-3 font-mono text-xs text-ink-300">{{ k }}</td>
+            <td class="py-1.5 font-mono text-xs">{{ v }}</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div>
+      <h4 class="mb-1 text-xs font-medium text-ink-400">Payload</h4>
+      <PayloadView
+        :encoding="full.payload.encoding"
+        :size-bytes="full.payload.size_bytes"
+        :data-b64="payloadB64"
+        :download-name="downloadName"
+      />
+    </div>
+
+    <ConfirmDialog
+      v-if="confirm === 'dead_letter'"
+      title="Dead-letter job"
+      confirm-label="Dead-letter"
+      danger
+      :busy="actionBusy"
+      @confirm="deadLetter()"
+      @cancel="confirm = null"
+    >
+      <p>
+        Move this {{ state }} job to the dead-letter queue? Workers will never see it.
+      </p>
+      <p v-if="retentionOff" class="mt-1 text-amber-400">
+        Dead-letter retention is disabled
+        (<span class="font-mono">dead_letter_retention_ms = 0</span>), so the job is dropped
+        permanently instead of kept for replay.
+      </p>
+    </ConfirmDialog>
+    <ConfirmDialog
+      v-else-if="confirm === 'requeue'"
+      title="Requeue dead letter"
+      confirm-label="Requeue"
+      :busy="actionBusy"
+      @confirm="requeue()"
+      @cancel="confirm = null"
+    >
+      <p>
+        Requeue this dead-lettered job back to ready with the attempt counter reset?
+      </p>
+    </ConfirmDialog>
+  </div>
+</template>
