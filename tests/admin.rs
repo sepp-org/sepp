@@ -1654,6 +1654,132 @@ async fn delete_queue_guards_then_purges_and_removes_declaration() {
     }
 }
 
+#[tokio::test]
+async fn delete_sees_an_empty_queue_behind_a_buried_scheduled_index() {
+    let cfg = format!("{ADMIN_CFG}\n[[queues]]\nname = \"adm-cap-q\"\n");
+    let (_guard, client, port) = start_admin_server("peekcap", &cfg, &[]).await;
+
+    // Bury the globally time-ordered scheduled index under more entries than a
+    // key-scan emptiness probe examines (PEEK_EXAMINE_CAP = 10_000), all for a
+    // different queue. A peek-based check would truncate and falsely report
+    // the empty target queue as non-empty; the exact depth counters must not.
+    let scheduled_at = ts_ms(epoch_ms_in(Duration::from_secs(3600)));
+    for _ in 0..41 {
+        let jobs: Vec<EnqueueRequest> = (0..250)
+            .map(|_| EnqueueRequest {
+                scheduled_at: Some(scheduled_at.clone()),
+                ..enqueue_req("adm-cap-filler")
+            })
+            .collect();
+        let results = client
+            .clone()
+            .enqueue_batch(EnqueueBatchRequest { jobs })
+            .await
+            .expect("filler batch enqueues")
+            .into_inner()
+            .results;
+        assert!(
+            results
+                .iter()
+                .all(|r| matches!(r.outcome, Some(job_result::Outcome::Success(_)))),
+            "every filler job is accepted"
+        );
+    }
+
+    let config = http(port, "GET", "/admin/api/v1/config", &[], None)
+        .await
+        .json();
+    let etag = config["etag"].as_str().unwrap().to_string();
+    let resp = http(
+        port,
+        "DELETE",
+        "/admin/api/v1/queues/adm-cap-q",
+        &[("If-Match", etag.as_str())],
+        None,
+    )
+    .await;
+    assert_eq!(
+        resp.status, 200,
+        "an empty queue deletes without purge=true: {}",
+        resp.body
+    );
+    assert_eq!(resp.json()["purged"], json!(0));
+}
+
+#[tokio::test]
+async fn dedup_window_changes_wait_for_a_restart() {
+    // A 1ms boot window that expires instantly, and a slow sweep so the dedup
+    // record itself outlives the window: what must reject the replay below is
+    // the boot-pinned check window, not the record's removal.
+    let cfg = format!("{ADMIN_CFG}\n[storage]\ndedup_window_ms = 1\nsweep_interval_ms = 60000\n");
+    let (_guard, client, port) = start_admin_server("dedupro", &cfg, &[]).await;
+
+    let keyed = || EnqueueRequest {
+        idempotency_key: Some("replay".to_string()),
+        ..enqueue_req("adm-dedupro-q")
+    };
+    let first = enqueue(&client, keyed()).await;
+    assert!(!first.deduplicated);
+
+    // Hot-raise the window to an hour: the write lands, flagged restart-only.
+    let config = http(port, "GET", "/admin/api/v1/config", &[], None)
+        .await
+        .json();
+    let etag = config["etag"].as_str().unwrap().to_string();
+    let body = json!({
+        "etag": etag,
+        "changes": [{ "path": "storage.dedup_window_ms", "value": 3_600_000 }],
+    })
+    .to_string();
+    let resp = http(port, "PUT", "/admin/api/v1/config", &[], Some(&body)).await;
+    assert_eq!(resp.status, 200, "{}", resp.body);
+    let put = resp.json();
+    assert_eq!(put["requires_restart"], json!(["storage.dedup_window_ms"]));
+
+    // Wait until the reload propagated (the boot-vs-file drift is reported) so
+    // the enqueue below cannot race the watcher.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let config = http(port, "GET", "/admin/api/v1/config", &[], None)
+            .await
+            .json();
+        if config["pending_restart"] == json!(["storage.dedup_window_ms"]) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "pending_restart never reported the dedup window: {config}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // The committer still runs the boot window: the replayed key is a fresh
+    // job, not a dedup hit against the hour-long on-disk window.
+    let second = enqueue(&client, keyed()).await;
+    assert!(
+        !second.deduplicated,
+        "a hot-reloaded dedup window must not take effect before a restart"
+    );
+    assert_ne!(second.job_id, first.job_id);
+
+    // A per-queue override is flagged restart-only the same way.
+    let etag = put["etag"].as_str().unwrap().to_string();
+    let body = json!({ "etag": etag, "overrides": { "dedup_window_ms": 5000 } }).to_string();
+    let resp = http(
+        port,
+        "PUT",
+        "/admin/api/v1/queues/adm-dedupro-q",
+        &[],
+        Some(&body),
+    )
+    .await;
+    assert_eq!(resp.status, 200, "{}", resp.body);
+    assert_eq!(
+        resp.json()["requires_restart"],
+        json!(["queues[].dedup_window_ms"])
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 6. Config editor
 // ---------------------------------------------------------------------------

@@ -8,7 +8,7 @@ use crate::pb::sepp::v1::{
 type Check = Result<(), String>;
 
 pub fn enqueue_request(req: &EnqueueRequest) -> Check {
-    min_len("queue", &req.queue)?;
+    queue_name("queue", &req.queue)?;
     min_len("job_type", &req.job_type)?;
     if let Some(p) = &req.payload {
         payload(p)?;
@@ -37,7 +37,7 @@ pub fn reserve_request(req: &ReserveRequest) -> Check {
         return Err("queues must contain at least 1 item".into());
     }
     for q in &req.queues {
-        min_len("queues item", q)?;
+        queue_name("queues item", q)?;
     }
     if let Some(d) = &req.wait_timeout {
         non_negative("wait_timeout", d)?;
@@ -127,6 +127,32 @@ fn min_len(field: &str, s: &str) -> Check {
         return Err(format!("{field} must not be empty"));
     }
     Ok(())
+}
+
+// Shared queue-name validity, enforced on both the gRPC request path (here) and
+// in config validation, so a name the gRPC plane auto-creates is always one the
+// admin REST API and operators can address. Minimal reject set: empty, "."/"..",
+// any name containing '/' (breaks the admin REST path), or control characters.
+// Length is bounded separately (max_queue_name_bytes -> QueueNameTooLong).
+pub(crate) fn queue_name_error(name: &str) -> Option<&'static str> {
+    if name.is_empty() {
+        Some("must not be empty")
+    } else if name == "." || name == ".." {
+        Some("must not be \".\" or \"..\"")
+    } else if name.contains('/') {
+        Some("must not contain '/'")
+    } else if name.chars().any(char::is_control) {
+        Some("must not contain control characters")
+    } else {
+        None
+    }
+}
+
+fn queue_name(field: &str, name: &str) -> Check {
+    match queue_name_error(name) {
+        Some(why) => Err(format!("{field} {why}")),
+        None => Ok(()),
+    }
 }
 
 fn lte(field: &str, value: u32, max: u32) -> Check {

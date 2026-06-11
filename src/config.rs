@@ -536,13 +536,11 @@ impl Config {
     fn validate_queues(&self, defaults: &EffectiveLimits) -> Result<(), Box<dyn Error>> {
         let mut seen: HashSet<&str> = HashSet::new();
         for q in &self.queues {
-            if q.name.is_empty() {
-                return Err("queues[].name must not be empty".into());
-            }
-            // "." and ".." are unaddressable over HTTP: browsers collapse them
-            // out of URL paths before the request is sent.
-            if q.name == "." || q.name == ".." {
-                return Err(format!("queues[].name {:?} is not a valid queue name", q.name).into());
+            // Same validity rule the gRPC request path enforces (empty, "."/"..",
+            // '/', control chars), so declared and auto-created names agree and
+            // both stay addressable through the admin REST API.
+            if let Some(why) = crate::validate::queue_name_error(&q.name) {
+                return Err(format!("queues[].name {:?} {why}", q.name).into());
             }
             if q.name.len() > self.limits.max_queue_name_bytes as usize {
                 return Err(format!(

@@ -159,6 +159,25 @@ pub fn restart_only_changes(old: &Config, new: &Config) -> Vec<&'static str> {
     if a.dead_letter_retention_ms != b.dead_letter_retention_ms {
         changed.push("storage.dead_letter_retention_ms");
     }
+    // Restart-only: dedup timer deadlines are fixed at a job's insert time, so
+    // changing the window live would desync them from the check window.
+    if a.dedup_window_ms != b.dedup_window_ms {
+        changed.push("storage.dedup_window_ms");
+    }
+    // Per-queue dedup overrides are pinned at boot the same way; flag any
+    // added, removed, or changed override.
+    let dedup_overrides = |cfg: &Config| -> Vec<(String, i64)> {
+        let mut overrides: Vec<_> = cfg
+            .queues
+            .iter()
+            .filter_map(|q| q.dedup_window_ms.map(|w| (q.name.clone(), w)))
+            .collect();
+        overrides.sort_unstable();
+        overrides
+    };
+    if dedup_overrides(old) != dedup_overrides(new) {
+        changed.push("queues[].dedup_window_ms");
+    }
     if a.command_queue_capacity != b.command_queue_capacity {
         changed.push("storage.command_queue_capacity");
     }
@@ -215,7 +234,6 @@ mod tests {
         new.limits.max_payload_bytes -= 1;
         new.limits.default_max_attempts += 1;
         new.limits.max_schedule_horizon_ms += 1;
-        new.storage.dedup_window_ms += 1;
         // strict_queues and the per-call server limits are read live per request.
         new.server.strict_queues = !new.server.strict_queues;
         new.limits.max_reserve_batch += 1;
@@ -233,6 +251,36 @@ mod tests {
     }
 
     #[test]
+    fn per_queue_dedup_overrides_are_restart_only() {
+        let with = |window: Option<i64>| {
+            let mut cfg = Config::default();
+            cfg.queues.push(crate::config::QueueConfig {
+                name: "q".into(),
+                dedup_window_ms: window,
+                ..Default::default()
+            });
+            cfg
+        };
+
+        // Adding, changing, and removing an override each flag a restart.
+        assert_eq!(
+            restart_only_changes(&Config::default(), &with(Some(5_000))),
+            vec!["queues[].dedup_window_ms"]
+        );
+        assert_eq!(
+            restart_only_changes(&with(Some(5_000)), &with(Some(6_000))),
+            vec!["queues[].dedup_window_ms"]
+        );
+        assert_eq!(
+            restart_only_changes(&with(Some(5_000)), &Config::default()),
+            vec!["queues[].dedup_window_ms"]
+        );
+
+        // A declared queue without an override stays fully hot-reloadable.
+        assert!(restart_only_changes(&Config::default(), &with(None)).is_empty());
+    }
+
+    #[test]
     fn strict_queues_is_hot_reloadable() {
         let mut new = Config::default();
         new.server.strict_queues = !new.server.strict_queues;
@@ -245,6 +293,7 @@ mod tests {
         new.server.db_path = "/somewhere/else".into();
         new.limits.max_message_bytes += 1;
         new.storage.sweep_limit += 1;
+        new.storage.dedup_window_ms += 1;
         new.metrics.enabled = !new.metrics.enabled;
         new.admin.enabled = !new.admin.enabled;
         new.admin.listen_addr = "127.0.0.1:9999".parse().unwrap();
@@ -253,6 +302,7 @@ mod tests {
         assert!(changed.contains(&"server.db_path"));
         assert!(changed.contains(&"limits.max_message_bytes"));
         assert!(changed.contains(&"storage.sweep_limit"));
+        assert!(changed.contains(&"storage.dedup_window_ms"));
         assert!(changed.contains(&"metrics"));
         assert!(changed.contains(&"admin.enabled"));
         assert!(changed.contains(&"admin.listen_addr"));

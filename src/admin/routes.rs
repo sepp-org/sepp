@@ -41,6 +41,8 @@ const RESTART_ONLY: &[&str] = &[
     "storage.sweep_interval_ms",
     "storage.sweep_limit",
     "storage.dead_letter_retention_ms",
+    "storage.dedup_window_ms",
+    "queues[].dedup_window_ms",
     "storage.command_queue_capacity",
     "storage.cache_size_bytes",
     "storage.max_journaling_size_bytes",
@@ -285,13 +287,51 @@ pub struct DeleteQueueQuery {
     purge: Option<bool>,
 }
 
-// A truncated page counts as non-empty: entries may exist past the examine cap.
-async fn peek_nonempty(state: &AdminState, queue: &str, peek: PeekState) -> Result<bool, ApiError> {
-    let page = state
-        .storage
-        .peek_keys(peek, queue.to_string(), None, 1)
-        .await?;
-    Ok(!page.keys.is_empty() || page.truncated)
+// Verifies the queue is deletable, then purges it in chunks so normal traffic
+// interleaves between committer cycles. Runs even without purge=true to clear
+// dedup leftovers that carry no depth. The caller holds the close tombstone
+// around this call; each extra chunk refreshes it.
+async fn drain_queue(state: &AdminState, name: &str, purge: bool) -> Result<u64, ApiError> {
+    // Exact live depths from the committer's counters: the stats snapshot can
+    // lag ~250ms, and a key-scan emptiness check truncates past
+    // PEEK_EXAMINE_CAP, falsely flagging an empty queue as non-empty.
+    let depths = state.storage.queue_depths(name.to_string()).await?;
+    if depths.inflight > 0 {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "inflight",
+            "queue has in-flight jobs",
+        ));
+    }
+    if !purge && (depths.ready > 0 || depths.scheduled > 0 || depths.dead_letter > 0) {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "not_empty",
+            "queue holds jobs; pass purge=true to delete them",
+        ));
+    }
+
+    let mut purged = 0u64;
+    loop {
+        let outcome = state
+            .storage
+            .purge_queue_chunk(name.to_string(), PURGE_CHUNK)
+            .await
+            .map_err(|status| match status.code() {
+                // E.g. a worker reserved a job mid-delete; briefly in-flight.
+                tonic::Code::FailedPrecondition => ApiError::new(
+                    StatusCode::CONFLICT,
+                    "inflight",
+                    status.message().to_string(),
+                ),
+                _ => status.into(),
+            })?;
+        purged += outcome.purged;
+        if !outcome.remaining {
+            return Ok(purged);
+        }
+        state.storage.close_queue(name.to_string()).await?;
+    }
 }
 
 pub(super) async fn delete_queue(
@@ -316,52 +356,14 @@ pub(super) async fn delete_queue(
     let current = read_config_file(&state)?;
     check_etag(&current, &presented)?;
 
-    // The stats snapshot can lag the committer by 250ms; peeks answer from
-    // the live indexes, so a just-enqueued job cannot be purged silently.
-    if peek_nonempty(&state, &name, PeekState::Inflight).await? {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            "inflight",
-            "queue has in-flight jobs",
-        ));
-    }
-    if !query.purge.unwrap_or(false) {
-        for peek in [
-            PeekState::Ready,
-            PeekState::Scheduled,
-            PeekState::DeadLetter,
-        ] {
-            if peek_nonempty(&state, &name, peek).await? {
-                return Err(ApiError::new(
-                    StatusCode::CONFLICT,
-                    "not_empty",
-                    "queue holds jobs; pass purge=true to delete them",
-                ));
-            }
-        }
-    }
-
-    // Chunked so normal traffic interleaves between committer cycles. Runs
-    // even without purge=true to clear dedup leftovers that carry no depth.
-    let mut purged = 0u64;
-    loop {
-        let outcome = state
-            .storage
-            .purge_queue_chunk(name.clone(), PURGE_CHUNK)
-            .await
-            .map_err(|status| match status.code() {
-                tonic::Code::FailedPrecondition => ApiError::new(
-                    StatusCode::CONFLICT,
-                    "inflight",
-                    status.message().to_string(),
-                ),
-                _ => status.into(),
-            })?;
-        purged += outcome.purged;
-        if !outcome.remaining {
-            break;
-        }
-    }
+    // Tombstone before the emptiness check so a producer can't slip a job into
+    // the check-to-purge window and have it silently purged, and can't refill
+    // the queue faster than the purge drains it. Every exit clears the
+    // tombstone here; the grace deadline only covers a handler that dies.
+    state.storage.close_queue(name.clone()).await?;
+    let drained = drain_queue(&state, &name, query.purge.unwrap_or(false)).await;
+    let _ = state.storage.open_queue(name.clone()).await;
+    let purged = drained?;
 
     let mut etag = config_edit::sha256_hex(current.as_bytes());
     let mut doc = parse_doc(&current)?;
@@ -669,6 +671,12 @@ fn rejection_detail(rejection: &pb::JobRejection) -> String {
             "queue {:?} is at capacity (max_queue_depth={})",
             r.queue, r.limit
         ),
+        Reason::QueueClosing(r) => {
+            format!(
+                "queue {:?} is being deleted and is not accepting new jobs",
+                r.queue
+            )
+        }
     }
 }
 

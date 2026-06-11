@@ -27,10 +27,11 @@ use crate::keys::{
 use crate::metrics::{CycleMetrics, Metrics, QueueDepthSnapshot};
 use crate::pb::sepp::v1::{
     DeadLetterCause, DeadLetterRecord, EnqueueRequest, EnqueueResponse, ExtendRequest, Job,
-    JobRejection, NackRequest, Payload, QueueFull, TraceContext, job_rejection, nack_retry,
+    JobRejection, NackRequest, Payload, QueueClosing, QueueFull, TraceContext, job_rejection,
+    nack_retry,
 };
 use crate::pb::{duration_to_millis, millis_to_timestamp, timestamp_to_millis};
-use crate::queues::SharedRegistry;
+use crate::queues::{QueueRegistry, SharedRegistry};
 use crate::telemetry;
 
 pub fn now_ms() -> i64 {
@@ -60,6 +61,11 @@ struct Store {
     dead_letter: TxKeyspace,
     params: StorageParams,
     registry: SharedRegistry,
+    // Boot snapshot of the registry. dedup_window_ms is read from here instead
+    // of the live (hot-reloadable) registry: dedup timer deadlines are fixed at
+    // insert time, so a hot-reloaded window would desync them from the check
+    // window. Everything else reads the live registry.
+    boot_registry: Arc<QueueRegistry>,
     metrics: Metrics,
 }
 
@@ -181,6 +187,12 @@ struct Indexes {
     leases: TimerIndex,
     dedup_timers: TimerIndex,
     dead_letter: TimerIndex,
+    // Queues an admin delete is draining, mapped to a grace deadline (ms). While
+    // a queue is closing, enqueues to it are rejected (QueueClosing) so the
+    // delete's purge loop is guaranteed to drain rather than livelock against a
+    // concurrent producer. The deadline auto-clears the tombstone if the delete
+    // handler dies; the handler refreshes it each chunk and clears it on finish.
+    closing: HashMap<String, i64>,
 }
 
 impl Indexes {
@@ -188,6 +200,15 @@ impl Indexes {
         self.ready.by_queue.get(queue).copied().unwrap_or(0)
             + self.scheduled.by_queue.get(queue).copied().unwrap_or(0)
             + self.leases.by_queue.get(queue).copied().unwrap_or(0)
+    }
+
+    fn depth_counts(&self, queue: &str) -> QueueDepthCounts {
+        QueueDepthCounts {
+            ready: self.ready.by_queue.get(queue).copied().unwrap_or(0),
+            scheduled: self.scheduled.by_queue.get(queue).copied().unwrap_or(0),
+            inflight: self.leases.by_queue.get(queue).copied().unwrap_or(0),
+            dead_letter: self.dead_letter.by_queue.get(queue).copied().unwrap_or(0),
+        }
     }
 
     fn snapshot(&self) -> QueueDepthSnapshot {
@@ -273,7 +294,12 @@ fn rebuild_indexes(store: &Store) -> Result<Indexes, fjall::Error> {
 
 fn resync(store: &Store, indexes: &mut Indexes) {
     match rebuild_indexes(store) {
-        Ok(fresh) => *indexes = fresh,
+        Ok(mut fresh) => {
+            // `closing` is transient committer state, not derived from the DB;
+            // an in-progress delete must keep rejecting enqueues across a rebuild.
+            fresh.closing = std::mem::take(&mut indexes.closing);
+            *indexes = fresh;
+        }
         Err(e) => error!(error = %e, "could not re-sync the in-memory indexes"),
     }
 }
@@ -333,6 +359,16 @@ pub struct PurgeOutcome {
     pub remaining: bool,
 }
 
+// Exact live per-queue depths from the in-memory by_queue counters, so the
+// admin delete path can check emptiness without a capped key scan.
+#[derive(Debug, Default)]
+pub struct QueueDepthCounts {
+    pub ready: u64,
+    pub scheduled: u64,
+    pub inflight: u64,
+    pub dead_letter: u64,
+}
+
 #[derive(Default, Clone)]
 pub struct QueueTotals {
     pub enqueued: u64,
@@ -356,6 +392,8 @@ const PEEK_EXAMINE_CAP: usize = 10_000;
 const PURGE_CHUNK_MAX: usize = 1000;
 const ADMIN_PUBLISH_INTERVAL: Duration = Duration::from_millis(250);
 const ADMIN_IDLE_EVICT_MS: i64 = 15 * 60 * 1000;
+// How long a close tombstone outlives its last refresh; see Indexes::closing.
+const CLOSE_GRACE_MS: i64 = 30_000;
 
 // Per-job outcome of a best-effort enqueue. Err carries a per-job rejection
 // (currently only queue_full); storage failures stay whole-batch `Status`.
@@ -407,6 +445,18 @@ enum Command {
         cursor: Option<Vec<u8>>,
         limit: usize,
         resp: oneshot::Sender<Result<PeekPage, Status>>,
+    },
+    QueueDepths {
+        queue: String,
+        resp: oneshot::Sender<Result<QueueDepthCounts, Status>>,
+    },
+    CloseQueue {
+        queue: String,
+        resp: oneshot::Sender<Result<(), Status>>,
+    },
+    OpenQueue {
+        queue: String,
+        resp: oneshot::Sender<Result<(), Status>>,
     },
     RequeueDeadLetters {
         queue: String,
@@ -872,6 +922,22 @@ fn apply_command(
         } => {
             let _ = resp.send(Ok(peek_keys(indexes, state, &queue, cursor, limit)));
         }
+        // Read-only against the in-memory by_queue counters; answered inline.
+        Command::QueueDepths { queue, resp } => {
+            let _ = resp.send(Ok(indexes.depth_counts(&queue)));
+        }
+        // In-memory only (no DB write): arm/refresh or clear a queue's close
+        // tombstone. Answered inline; does not mark the cycle dirty.
+        Command::CloseQueue { queue, resp } => {
+            indexes
+                .closing
+                .insert(queue, now_ms().saturating_add(CLOSE_GRACE_MS));
+            let _ = resp.send(Ok(()));
+        }
+        Command::OpenQueue { queue, resp } => {
+            indexes.closing.remove(&queue);
+            let _ = resp.send(Ok(()));
+        }
         Command::RequeueDeadLetters { queue, keys, resp } => {
             match apply_requeue_dead_letters(store, indexes, tx, cycle, &queue, keys) {
                 Ok(outcome) => responders.push(Responder::Requeue(resp, outcome)),
@@ -939,6 +1005,15 @@ fn fail_command(cmd: Command, status: &Status) {
             let _ = resp.send(Err(status.clone()));
         }
         Command::PeekKeys { resp, .. } => {
+            let _ = resp.send(Err(status.clone()));
+        }
+        Command::QueueDepths { resp, .. } => {
+            let _ = resp.send(Err(status.clone()));
+        }
+        Command::CloseQueue { resp, .. } => {
+            let _ = resp.send(Err(status.clone()));
+        }
+        Command::OpenQueue { resp, .. } => {
             let _ = resp.send(Err(status.clone()));
         }
         Command::RequeueDeadLetters { resp, .. } => {
@@ -1029,6 +1104,14 @@ fn queue_full(queue: &str, cap: u64) -> JobRejection {
     }
 }
 
+fn queue_closing(queue: &str) -> JobRejection {
+    JobRejection {
+        reason: Some(job_rejection::Reason::QueueClosing(QueueClosing {
+            queue: queue.to_string(),
+        })),
+    }
+}
+
 enum DedupCheck {
     Hit(EnqueueResponse),
     Miss { stale_timer: Option<Vec<u8>> },
@@ -1089,7 +1172,20 @@ fn apply_enqueue(
     let mut results = Vec::with_capacity(jobs.len());
 
     for req in jobs {
-        let limits = registry.effective(&req.queue);
+        // Checked before dedup so a hit can't hand back a job_id that is about
+        // to be purged.
+        if indexes
+            .closing
+            .get(&req.queue)
+            .is_some_and(|&deadline| deadline > now)
+        {
+            results.push(Err(queue_closing(&req.queue)));
+            continue;
+        }
+
+        let mut limits = registry.effective(&req.queue);
+        // Restart-only; see Store::boot_registry.
+        limits.dedup_window_ms = store.boot_registry.dedup_window_ms(&req.queue);
 
         match check_dedup(store, tx, cycle, &req, now, &limits)? {
             DedupCheck::Hit(resp) => results.push(Ok(resp)),
@@ -1131,6 +1227,18 @@ fn apply_enqueue_atomic(
     let now = now_ms();
     let registry = store.registry.load();
 
+    // Atomic = all-or-nothing: if any job targets a queue being deleted, reject
+    // the whole batch (mirrors the per-job QueueClosing in best-effort enqueue).
+    let closing: Vec<(u32, JobRejection)> = jobs
+        .iter()
+        .enumerate()
+        .filter(|(_, req)| indexes.closing.get(&req.queue).is_some_and(|&d| d > now))
+        .map(|(index, req)| (index as u32, queue_closing(&req.queue)))
+        .collect();
+    if !closing.is_empty() {
+        return Ok(AtomicEnqueueOutcome::Rejected(closing));
+    }
+
     // Capacity is checked for the whole batch up front so a full queue commits
     // nothing. Dedup hits are conservatively counted as new jobs here.
     let mut wanted: HashMap<&str, u64> = HashMap::new();
@@ -1161,7 +1269,9 @@ fn apply_enqueue_atomic(
 
     let mut responses = Vec::with_capacity(jobs.len());
     for req in jobs {
-        let limits = registry.effective(&req.queue);
+        let mut limits = registry.effective(&req.queue);
+        // Restart-only; see Store::boot_registry.
+        limits.dedup_window_ms = store.boot_registry.dedup_window_ms(&req.queue);
         responses.push(match check_dedup(store, tx, cycle, &req, now, &limits)? {
             DedupCheck::Hit(resp) => resp,
             DedupCheck::Miss { stale_timer } => {
@@ -2130,12 +2240,15 @@ fn apply_extend(
         job_id: &req.job_id,
     }
     .encode();
+    // Floor at 1ms for the same reason as Reserve: a sub-ms lease truncates to
+    // 0 and would expire the moment it is granted (max_lease is validated >= 1).
     let lease_ms = req
         .lease_duration
         .as_ref()
         .map(duration_to_millis)
         .unwrap_or(0)
-        .min(max_lease);
+        .min(max_lease)
+        .max(1);
     let lease_expires_at = now_ms().saturating_add(i64::try_from(lease_ms).unwrap_or(i64::MAX));
     inflight.lease_expires_at = lease_expires_at;
 
@@ -2172,6 +2285,9 @@ fn apply_sweep(
 ) -> Result<usize, Status> {
     let now = now_ms();
     let mut processed = 0usize;
+
+    // Drop close tombstones whose delete handler died without clearing them.
+    indexes.closing.retain(|_, deadline| *deadline > now);
 
     // Each phase gets its own budget so a backlog of one timer kind cannot
     // starve another — most importantly, scheduled promotions must not crowd
@@ -2400,6 +2516,11 @@ fn apply_sweep(
     Ok(processed)
 }
 
+// Past this many distinct queue names, `get` prunes notifiers that no Reserve
+// is parked on; otherwise every queue name ever reserved leaks an Arc<Notify>
+// for the process lifetime.
+const NOTIFIER_PRUNE_THRESHOLD: usize = 4096;
+
 #[derive(Clone, Default)]
 struct QueueNotifiers {
     map: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
@@ -2407,11 +2528,16 @@ struct QueueNotifiers {
 
 impl QueueNotifiers {
     fn get(&self, queue: &str) -> Arc<Notify> {
+        let mut map = self.map.lock().unwrap();
+        // An entry is safe to drop only when no JobWaiter holds it, i.e.
+        // strong_count == 1 (just the map); every access takes this one mutex,
+        // so the count read can't race a concurrent clone. Pruning before the
+        // insert keeps the O(n) retain amortized.
+        if map.len() >= NOTIFIER_PRUNE_THRESHOLD {
+            map.retain(|_, n| Arc::strong_count(n) > 1);
+        }
         Arc::clone(
-            self.map
-                .lock()
-                .unwrap()
-                .entry(queue.to_owned())
+            map.entry(queue.to_owned())
                 .or_insert_with(|| Arc::new(Notify::new())),
         )
     }
@@ -2722,6 +2848,7 @@ impl Storage {
             })?,
             db,
             params,
+            boot_registry: registry.load_full(),
             registry,
             metrics,
         };
@@ -2877,6 +3004,22 @@ impl Storage {
             resp,
         })
         .await?
+    }
+
+    pub async fn queue_depths(&self, queue: String) -> Result<QueueDepthCounts, Status> {
+        self.send(|resp| Command::QueueDepths { queue, resp })
+            .await?
+    }
+
+    // Tombstone a queue (refreshable) so enqueues to it are rejected with
+    // QueueClosing while an admin delete drains it; open_queue clears it.
+    pub async fn close_queue(&self, queue: String) -> Result<(), Status> {
+        self.send(|resp| Command::CloseQueue { queue, resp })
+            .await?
+    }
+
+    pub async fn open_queue(&self, queue: String) -> Result<(), Status> {
+        self.send(|resp| Command::OpenQueue { queue, resp }).await?
     }
 
     pub async fn requeue_dead_letters(
@@ -3311,6 +3454,7 @@ mod tests {
                 admin_enabled: true,
             },
             registry: crate::queues::QueueRegistry::from_config(&Config::default()).into_shared(),
+            boot_registry: Arc::new(QueueRegistry::from_config(&Config::default())),
             metrics: Metrics::new(false),
         }
     }
@@ -3333,5 +3477,141 @@ mod tests {
             .expect("an idle queue purges");
         assert_eq!(outcome.purged, 0);
         assert!(!outcome.remaining);
+    }
+
+    fn test_req(queue: &str) -> EnqueueRequest {
+        EnqueueRequest {
+            queue: queue.to_string(),
+            job_type: "t".to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn enqueue_rejects_jobs_for_a_closing_queue() {
+        let store = open_test_store();
+        let mut indexes = Indexes::default();
+        indexes.closing.insert("q".into(), now_ms() + 60_000);
+
+        let mut tx = store.db.write_tx();
+        let mut cycle = Cycle::new(false);
+        let results = apply_enqueue(
+            &store,
+            &mut indexes,
+            &mut tx,
+            &mut cycle,
+            vec![test_req("q"), test_req("other")],
+        )
+        .expect("enqueue applies");
+
+        match &results[0] {
+            Err(JobRejection {
+                reason: Some(job_rejection::Reason::QueueClosing(r)),
+            }) => assert_eq!(r.queue, "q"),
+            other => panic!("expected a QueueClosing rejection, got {other:?}"),
+        }
+        assert!(results[1].is_ok(), "other queues are unaffected");
+
+        // An expired tombstone (its delete handler died) no longer rejects.
+        indexes.closing.insert("q".into(), now_ms() - 1);
+        let results = apply_enqueue(
+            &store,
+            &mut indexes,
+            &mut tx,
+            &mut cycle,
+            vec![test_req("q")],
+        )
+        .expect("enqueue applies");
+        assert!(results[0].is_ok());
+    }
+
+    #[test]
+    fn atomic_enqueue_rejects_the_whole_batch_for_a_closing_queue() {
+        let store = open_test_store();
+        let mut indexes = Indexes::default();
+        indexes.closing.insert("q".into(), now_ms() + 60_000);
+
+        let mut tx = store.db.write_tx();
+        let mut cycle = Cycle::new(false);
+        let outcome = apply_enqueue_atomic(
+            &store,
+            &mut indexes,
+            &mut tx,
+            &mut cycle,
+            vec![test_req("other"), test_req("q")],
+        )
+        .expect("atomic enqueue applies");
+
+        match outcome {
+            AtomicEnqueueOutcome::Rejected(rejections) => {
+                assert_eq!(rejections.len(), 1);
+                assert_eq!(rejections[0].0, 1, "the offending index is reported");
+                assert!(matches!(
+                    rejections[0].1.reason,
+                    Some(job_rejection::Reason::QueueClosing(_))
+                ));
+            }
+            AtomicEnqueueOutcome::Committed(_) => panic!("the batch must not commit"),
+        }
+        assert_eq!(
+            indexes.live_depth("other"),
+            0,
+            "nothing from the rejected batch is inserted"
+        );
+    }
+
+    #[test]
+    fn sweep_drops_only_expired_close_tombstones() {
+        let store = open_test_store();
+        let mut indexes = Indexes::default();
+        indexes.closing.insert("abandoned".into(), now_ms() - 1);
+        indexes.closing.insert("active".into(), now_ms() + 60_000);
+
+        let mut tx = store.db.write_tx();
+        let mut cycle = Cycle::new(false);
+        apply_sweep(&store, &mut indexes, &mut tx, &mut cycle).expect("sweep applies");
+
+        assert!(!indexes.closing.contains_key("abandoned"));
+        assert!(indexes.closing.contains_key("active"));
+    }
+
+    #[test]
+    fn dedup_check_window_is_pinned_at_boot() {
+        let mut store = open_test_store();
+        let mut boot_cfg = Config::default();
+        boot_cfg.storage.dedup_window_ms = 1;
+        store.boot_registry = Arc::new(QueueRegistry::from_config(&boot_cfg));
+        // An hour-long hot-reloaded window must not stretch the boot window.
+        let mut live_cfg = Config::default();
+        live_cfg.storage.dedup_window_ms = 3_600_000;
+        store
+            .registry
+            .store(Arc::new(QueueRegistry::from_config(&live_cfg)));
+
+        let mut indexes = Indexes::default();
+        let mut tx = store.db.write_tx();
+        let mut cycle = Cycle::new(false);
+        let req = EnqueueRequest {
+            idempotency_key: Some("k".to_string()),
+            ..test_req("q")
+        };
+        let first = apply_enqueue(&store, &mut indexes, &mut tx, &mut cycle, vec![req.clone()])
+            .expect("enqueue applies")
+            .remove(0)
+            .expect("the first enqueue is accepted");
+
+        // Outlive the 1ms boot window. The dedup record itself is still there
+        // (no sweep has run), so a check against the live window would hit.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let second = apply_enqueue(&store, &mut indexes, &mut tx, &mut cycle, vec![req])
+            .expect("enqueue applies")
+            .remove(0)
+            .expect("the second enqueue is accepted");
+
+        assert!(
+            !second.deduplicated,
+            "the boot window, not the live one, bounds the dedup check"
+        );
+        assert_ne!(second.job_id, first.job_id);
     }
 }

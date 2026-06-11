@@ -2195,6 +2195,103 @@ async fn structurally_invalid_enqueue_is_rejected() {
 }
 
 #[tokio::test]
+async fn invalid_queue_names_are_rejected_on_the_grpc_plane() {
+    let (_guard, client) = start_server("qname").await;
+
+    // Same validity rule config validation enforces: "."/"..", '/', and
+    // control characters are unaddressable through the admin REST API, so the
+    // gRPC plane must not auto-create such queues.
+    for bad in [".", "..", "a/b", "ctl\u{1}"] {
+        let rejected = enqueue_one(&client, enqueue_req(bad)).await;
+        assert!(
+            matches!(
+                &rejected.outcome,
+                Some(job_result::Outcome::Rejection(r))
+                    if matches!(r.reason, Some(job_rejection::Reason::InvalidRequest(_)))
+            ),
+            "queue name {bad:?} must be rejected: {:?}",
+            rejected.outcome
+        );
+
+        let err = client
+            .clone()
+            .reserve(ReserveRequest {
+                queues: vec![bad.to_string()],
+                wait_timeout: None,
+                lease_duration: Some(dur(LEASE)),
+                worker_id: None,
+                max_jobs: None,
+            })
+            .await
+            .expect_err("reserve refuses the name outright");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument, "{bad:?}");
+    }
+
+    // A name that merely contains dots stays valid.
+    enqueue(&client, enqueue_req("smoke.qname.ok")).await;
+}
+
+#[tokio::test]
+async fn a_sub_millisecond_lease_is_floored_not_granted_expired() {
+    let (_guard, client) = start_server("subms").await;
+    let enqueued = enqueue(&client, enqueue_req("smoke-subms")).await;
+
+    // 100µs is strictly positive (passes validation) but truncates to 0ms
+    // internally; the server must floor it to 1ms rather than hand out a
+    // lease that is expired on arrival.
+    let job = client
+        .clone()
+        .reserve(ReserveRequest {
+            queues: vec!["smoke-subms".to_string()],
+            wait_timeout: Some(dur(WAIT)),
+            lease_duration: Some(prost_types::Duration {
+                seconds: 0,
+                nanos: 100_000,
+            }),
+            worker_id: None,
+            max_jobs: None,
+        })
+        .await
+        .expect("a sub-ms lease duration is accepted")
+        .into_inner()
+        .jobs
+        .into_iter()
+        .next()
+        .expect("the job is granted");
+    assert_eq!(job.id, enqueued.job_id);
+    assert_eq!(job.attempt, 1);
+
+    // The 1ms lease lapses and the sweep redelivers the job rather than
+    // losing it.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let again = reserve(&client, "smoke-subms", LEASE, WAIT)
+        .await
+        .expect("the lapsed job is redelivered");
+    assert_eq!(again.id, enqueued.job_id);
+    assert_eq!(again.attempt, 2);
+
+    // Extend floors the same way: a sub-ms extension is accepted and reports
+    // an expiry instead of failing or handing back an expired lease.
+    let expires = client
+        .clone()
+        .extend(ExtendRequest {
+            job_id: again.id.clone(),
+            attempt: again.attempt,
+            lease_duration: Some(prost_types::Duration {
+                seconds: 0,
+                nanos: 100_000,
+            }),
+            worker_id: None,
+        })
+        .await
+        .expect("a sub-ms extend is accepted")
+        .into_inner()
+        .lease_expires_at
+        .expect("extend reports a lease expiry");
+    assert!(ts_to_ms(&expires) > 0);
+}
+
+#[tokio::test]
 async fn a_blocked_reserve_wakes_on_enqueue() {
     let (_guard, client) = start_server("wake").await;
 

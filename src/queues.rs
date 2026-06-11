@@ -35,6 +35,15 @@ impl QueueRegistry {
         }
     }
 
+    // Cheaper than `effective()` for the enqueue hot path: reads one field
+    // without cloning the allow-list vecs.
+    pub fn dedup_window_ms(&self, queue: &str) -> i64 {
+        self.declared
+            .get(queue)
+            .and_then(|q| q.dedup_window_ms)
+            .unwrap_or(self.defaults.dedup_window_ms)
+    }
+
     pub fn is_declared(&self, queue: &str) -> bool {
         self.declared.contains_key(queue)
     }
@@ -89,6 +98,27 @@ mod tests {
             "fields without an override fall back to the global"
         );
         assert!(reg.is_declared("emails"));
+    }
+
+    #[test]
+    fn dedup_window_ms_matches_effective() {
+        let mut cfg = cfg_with(vec![QueueConfig {
+            name: "emails".into(),
+            dedup_window_ms: Some(5_000),
+            ..Default::default()
+        }]);
+        cfg.storage.dedup_window_ms = 1_000;
+        let reg = QueueRegistry::from_config(&cfg);
+        assert_eq!(reg.dedup_window_ms("emails"), 5_000);
+        assert_eq!(
+            reg.dedup_window_ms("emails"),
+            reg.effective("emails").dedup_window_ms
+        );
+        assert_eq!(reg.dedup_window_ms("other"), 1_000);
+        assert_eq!(
+            reg.dedup_window_ms("other"),
+            reg.effective("other").dedup_window_ms
+        );
     }
 
     #[test]

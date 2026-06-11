@@ -13,8 +13,8 @@ const { canAdmin } = useSession()
 type ListKey = 'allowed_encodings' | 'allowed_job_types'
 type NumberKey = Exclude<keyof QueueOverridesPatch, ListKey>
 type FieldDef =
-  | { key: NumberKey; label: string; kind: 'number' }
-  | { key: ListKey; label: string; kind: 'list' }
+  | { key: NumberKey; label: string; kind: 'number'; restartOnly?: boolean }
+  | { key: ListKey; label: string; kind: 'list'; restartOnly?: boolean }
 
 const fields: FieldDef[] = [
   { key: 'max_lease_duration_ms', label: 'Max lease duration (ms)', kind: 'number' },
@@ -28,7 +28,7 @@ const fields: FieldDef[] = [
   { key: 'max_custom_entries', label: 'Max custom entries', kind: 'number' },
   { key: 'max_custom_total_bytes', label: 'Max custom total bytes', kind: 'number' },
   { key: 'max_custom_key_bytes', label: 'Max custom key bytes', kind: 'number' },
-  { key: 'dedup_window_ms', label: 'Dedup window (ms)', kind: 'number' },
+  { key: 'dedup_window_ms', label: 'Dedup window (ms)', kind: 'number', restartOnly: true },
   { key: 'max_queue_depth', label: 'Max queue depth', kind: 'number' },
 ]
 
@@ -164,7 +164,15 @@ function reset() {
     <template v-else>
       <div class="grid grid-cols-2 gap-4">
         <div v-for="f in fields" :key="f.key" class="flex flex-col gap-1">
-          <label class="text-xs text-ink-400" :for="`qset-${f.key}`">{{ f.label }}</label>
+          <label class="text-xs text-ink-400" :for="`qset-${f.key}`">
+            {{ f.label }}
+            <span
+              v-if="f.restartOnly"
+              class="ml-1 rounded bg-amber-500/15 px-1 text-[10px] uppercase tracking-wide text-amber-400"
+              title="Changing this takes effect only after a server restart"
+              >restart only</span
+            >
+          </label>
           <TagInput
             v-if="f.kind === 'list'"
             :id="`qset-${f.key}`"

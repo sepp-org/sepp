@@ -342,6 +342,7 @@ pub(crate) fn rejection_label(rejection: &pb::JobRejection) -> &'static str {
         Reason::ScheduledTooFar(_) => "scheduled_too_far",
         Reason::InvalidRequest(_) => "invalid_request",
         Reason::QueueFull(_) => "queue_full",
+        Reason::QueueClosing(_) => "queue_closing",
     }
 }
 
@@ -672,12 +673,16 @@ impl QueueService for QueueServer {
                 .unwrap_or(u64::MAX);
             // Inbound Duration -> internal i64/u64 ms. lease_duration is
             // required (validated); wait_timeout is optional (unset => 0).
+            // Floor at 1ms: a positive sub-ms lease passes validation but
+            // truncates to 0, an already-expired lease. max_lease is validated
+            // >= 1, so the floor never exceeds the ceiling.
             let lease = req
                 .lease_duration
                 .as_ref()
                 .map(crate::pb::duration_to_millis)
                 .unwrap_or(0)
-                .min(max_lease);
+                .min(max_lease)
+                .max(1);
 
             let max_jobs = req
                 .max_jobs
