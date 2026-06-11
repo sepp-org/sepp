@@ -352,9 +352,17 @@ impl Default for MetricsConfig {
 pub struct AdminConfig {
     pub enabled: bool,
     pub listen_addr: SocketAddr,
+    pub tls_cert_path: Option<String>,
+    pub tls_key_path: Option<String>,
     // None = auth disabled; only allowed on a loopback listen_addr.
     pub keys: Option<Vec<AdminKey>>,
     pub session_ttl_ms: u64,
+}
+
+impl AdminConfig {
+    pub fn tls_enabled(&self) -> bool {
+        self.tls_cert_path.is_some() && self.tls_key_path.is_some()
+    }
 }
 
 impl Default for AdminConfig {
@@ -362,6 +370,8 @@ impl Default for AdminConfig {
         Self {
             enabled: true,
             listen_addr: SocketAddr::from(([127, 0, 0, 1], 9465)),
+            tls_cert_path: None,
+            tls_key_path: None,
             keys: None,
             session_ttl_ms: 12 * 60 * 60 * 1000,
         }
@@ -484,13 +494,29 @@ impl Config {
             }
         }
 
+        match (&self.admin.tls_cert_path, &self.admin.tls_key_path) {
+            (Some(_), None) => {
+                return Err(
+                    "admin.tls_cert_path is set but admin.tls_key_path is not; set both or neither"
+                        .into(),
+                );
+            }
+            (None, Some(_)) => {
+                return Err(
+                    "admin.tls_key_path is set but admin.tls_cert_path is not; set both or neither"
+                        .into(),
+                );
+            }
+            _ => {}
+        }
+
         if self.admin.enabled
             && !self.admin.listen_addr.ip().is_loopback()
             && self.admin.keys.is_none()
         {
             return Err(
-                "admin UI on a non-loopback address requires [admin] keys (note: the admin \
-                 listener itself is plain HTTP; terminate TLS in front of it for remote access)"
+                "admin UI on a non-loopback address requires [admin] keys (set \
+                 admin.tls_cert_path/tls_key_path for HTTPS, or terminate TLS in front of it)"
                     .into(),
             );
         }
@@ -609,6 +635,30 @@ mod tests {
         both.server.tls_cert_path = Some("cert.pem".into());
         both.server.tls_key_path = Some("key.pem".into());
         assert!(both.validate().is_ok(), "both set is the valid case");
+    }
+
+    #[test]
+    fn admin_tls_requires_both_cert_and_key() {
+        let mut cert_only = Config::default();
+        cert_only.admin.tls_cert_path = Some("cert.pem".into());
+        assert!(
+            cert_only.validate().is_err(),
+            "a cert without a key must be rejected"
+        );
+
+        let mut key_only = Config::default();
+        key_only.admin.tls_key_path = Some("key.pem".into());
+        assert!(
+            key_only.validate().is_err(),
+            "a key without a cert must be rejected"
+        );
+
+        let mut both = Config::default();
+        both.admin.tls_cert_path = Some("cert.pem".into());
+        both.admin.tls_key_path = Some("key.pem".into());
+        assert!(both.validate().is_ok(), "both set is the valid case");
+        assert!(both.admin.tls_enabled());
+        assert!(!Config::default().admin.tls_enabled());
     }
 
     #[test]

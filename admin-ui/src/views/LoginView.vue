@@ -18,6 +18,7 @@ const busy = ref(false)
 // The autofocus attribute only applies at document load, not when the SPA
 // inserts this view after a redirect.
 const nameInput = useTemplateRef('nameInput')
+const keyInput = useTemplateRef('keyInput')
 onMounted(() => nameInput.value?.focus())
 
 // Internal paths only; anything else falls back to the dashboard.
@@ -71,12 +72,14 @@ async function submit() {
           autocomplete="username"
           spellcheck="false"
           class="mt-1.5 w-full rounded border border-ink-700 bg-ink-950 py-2 px-3 font-mono text-sm text-ink-100 outline-none focus:border-accent"
+          @keydown.enter.prevent="keyInput?.focus()"
         />
 
         <label for="admin-key" class="mt-4 block text-xs text-ink-400">Key</label>
         <div class="relative mt-1.5">
           <input
             id="admin-key"
+            ref="keyInput"
             v-model="key"
             :type="reveal ? 'text' : 'password'"
             autocomplete="current-password"

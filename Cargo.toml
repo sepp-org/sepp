@@ -31,6 +31,14 @@ hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 axum = "0.8"
+# tls-rustls-no-provider + an explicit ring provider below: pulling axum-server's
+# default TLS feature would add aws-lc-rs next to tonic's ring and leave rustls
+# with no unambiguous process-level provider (runtime panic).
+axum-server = { version = "0.8", default-features = false, features = ["tls-rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+# 1.10 is the first release with the PemObject loaders; std enables the
+# from_pem_file variants.
+rustls-pki-types = { version = "1.14", features = ["std"] }
 serde_json = "1"
 toml_edit = "0.22"
 tokio-stream = { version = "0.1", features = ["sync"] }

@@ -53,6 +53,8 @@ const RESTART_ONLY: &[&str] = &[
     "metrics",
     "admin.enabled",
     "admin.listen_addr",
+    "admin.tls_cert_path",
+    "admin.tls_key_path",
 ];
 
 pub(crate) struct ApiError {

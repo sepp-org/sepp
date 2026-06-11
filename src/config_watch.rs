@@ -205,13 +205,19 @@ pub fn restart_only_changes(old: &Config, new: &Config) -> Vec<&'static str> {
         changed.push("metrics");
     }
 
-    // The admin listener is bound once at startup.
+    // The admin listener is bound once at startup, TLS identity included.
     let (a, b) = (&old.admin, &new.admin);
     if a.enabled != b.enabled {
         changed.push("admin.enabled");
     }
     if a.listen_addr != b.listen_addr {
         changed.push("admin.listen_addr");
+    }
+    if a.tls_cert_path != b.tls_cert_path {
+        changed.push("admin.tls_cert_path");
+    }
+    if a.tls_key_path != b.tls_key_path {
+        changed.push("admin.tls_key_path");
     }
 
     changed
@@ -297,6 +303,8 @@ mod tests {
         new.metrics.enabled = !new.metrics.enabled;
         new.admin.enabled = !new.admin.enabled;
         new.admin.listen_addr = "127.0.0.1:9999".parse().unwrap();
+        new.admin.tls_cert_path = Some("admin.crt".into());
+        new.admin.tls_key_path = Some("admin.key".into());
 
         let changed = restart_only_changes(&Config::default(), &new);
         assert!(changed.contains(&"server.db_path"));
@@ -306,6 +314,8 @@ mod tests {
         assert!(changed.contains(&"metrics"));
         assert!(changed.contains(&"admin.enabled"));
         assert!(changed.contains(&"admin.listen_addr"));
+        assert!(changed.contains(&"admin.tls_cert_path"));
+        assert!(changed.contains(&"admin.tls_key_path"));
     }
 
     #[test]

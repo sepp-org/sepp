@@ -50,6 +50,7 @@ impl Drop for ServerGuard {
 const PORT_MARKERS: &[(&str, &str)] = &[
     ("grpc", "queue server listening"),
     ("prometheus", "prometheus metrics endpoint listening"),
+    ("admin", "admin UI listening"),
 ];
 
 /// How long to wait for a freshly spawned server to report its bound port.
@@ -2031,6 +2032,135 @@ async fn tls_secures_the_connection() {
         matches!(plain, Err(_) | Ok(Err(_))),
         "plaintext RPC unexpectedly succeeded against a TLS-only server"
     );
+}
+
+/// Blocking HTTPS roundtrip against `127.0.0.1:port` trusting only `ca_pem`,
+/// returning the raw response text. Uses rustls's sync API so the test does not
+/// need an HTTP client dependency.
+fn https_roundtrip(
+    port: u16,
+    ca_pem: &str,
+    request: &[u8],
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    use std::io::{Read, Write};
+
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, ServerName};
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(CertificateDer::from_pem_slice(ca_pem.as_bytes())?)?;
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+
+    let mut conn =
+        rustls::ClientConnection::new(Arc::new(config), ServerName::try_from("localhost")?)?;
+    let mut sock = std::net::TcpStream::connect(("127.0.0.1", port))?;
+    sock.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let mut tls = rustls::Stream::new(&mut conn, &mut sock);
+    tls.write_all(request)?;
+    let mut response = Vec::new();
+    // A missing close_notify after the response only matters for truncation
+    // attacks, not for this assertion; keep whatever bytes arrived.
+    let _ = tls.read_to_end(&mut response);
+    Ok(String::from_utf8_lossy(&response).into_owned())
+}
+
+#[tokio::test]
+async fn admin_ui_serves_https_when_tls_configured() {
+    let rcgen::CertifiedKey { cert, signing_key } =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("generate self-signed cert for localhost");
+    let cert_pem = cert.pem();
+    let key_pem = signing_key.serialize_pem();
+
+    let unique = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let cert_path = std::env::temp_dir().join(format!("sepp-it-admin-tls-{unique}.crt"));
+    let key_path = std::env::temp_dir().join(format!("sepp-it-admin-tls-{unique}.key"));
+    std::fs::write(&cert_path, &cert_pem).expect("write cert");
+    std::fs::write(&key_path, &key_pem).expect("write key");
+    // Admin keys are a list of tables, which figment's env provider cannot
+    // express, so this test brings its own config file.
+    let config_path = std::env::temp_dir().join(format!("sepp-it-admin-tls-{unique}.toml"));
+    std::fs::write(
+        &config_path,
+        "[[admin.keys]]\nname = \"ops\"\nkey = \"integration-secret\"\n",
+    )
+    .expect("write config");
+
+    let db_path = temp_db("admin-tls");
+    let (child, book) = spawn_server_process(
+        &db_path,
+        &[
+            ("SEPP_CONFIG", config_path.to_str().expect("utf-8 path")),
+            (
+                "SEPP_ADMIN__TLS_CERT_PATH",
+                cert_path.to_str().expect("utf-8 path"),
+            ),
+            (
+                "SEPP_ADMIN__TLS_KEY_PATH",
+                key_path.to_str().expect("utf-8 path"),
+            ),
+        ],
+    );
+    let _guard = ServerGuard {
+        child,
+        db_path: Some(db_path),
+    };
+    let port = wait_for_port(&book, "admin", STARTUP_TIMEOUT)
+        .await
+        .expect("admin UI reported a listening port");
+
+    let body = r#"{"name":"ops","key":"integration-secret"}"#;
+    let request = format!(
+        "POST /admin/api/v1/session HTTP/1.1\r\nhost: localhost\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let ca = cert_pem.clone();
+    let response =
+        tokio::task::spawn_blocking(move || https_roundtrip(port, &ca, request.as_bytes()))
+            .await
+            .expect("https roundtrip task")
+            .expect("login over admin HTTPS");
+    let _ = std::fs::remove_file(&cert_path);
+    let _ = std::fs::remove_file(&key_path);
+    let _ = std::fs::remove_file(&config_path);
+
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "login over HTTPS should succeed, got: {response}"
+    );
+    assert!(
+        response.contains("sepp_admin=") && response.contains("; Secure"),
+        "session cookie under TLS must carry the Secure attribute, got: {response}"
+    );
+
+    // A plaintext request against the TLS listener must not get an HTTP
+    // response; the handshake failure surfaces as an alert or a dropped
+    // connection.
+    let plain = tokio::task::spawn_blocking(move || {
+        use std::io::{Read, Write};
+        let mut sock = std::net::TcpStream::connect(("127.0.0.1", port))?;
+        sock.set_read_timeout(Some(Duration::from_secs(3)))?;
+        sock.write_all(b"GET /admin/api/v1/server-info HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n")?;
+        let mut response = Vec::new();
+        let _ = sock.read_to_end(&mut response);
+        Ok::<_, std::io::Error>(String::from_utf8_lossy(&response).into_owned())
+    })
+    .await
+    .expect("plaintext probe task");
+    if let Ok(plain) = plain {
+        assert!(
+            !plain.starts_with("HTTP/1.1"),
+            "plaintext request unexpectedly got an HTTP response from a TLS-only admin listener: {plain}"
+        );
+    }
 }
 
 /// A syntactically valid UUID that no enqueue ever assigns, for exercising the

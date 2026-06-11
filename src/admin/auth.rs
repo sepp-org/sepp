@@ -94,6 +94,18 @@ fn cookie_token(headers: &HeaderMap) -> Option<String> {
     })
 }
 
+// Secure tracks this listener's own TLS; behind a TLS-terminating proxy the
+// hop to us is plain HTTP and the flag must stay off.
+fn session_cookie(token: &str, secure: bool) -> String {
+    let secure = if secure { "; Secure" } else { "" };
+    format!("{COOKIE_NAME}={token}; HttpOnly; SameSite=Strict; Path=/{secure}")
+}
+
+fn clear_cookie(secure: bool) -> String {
+    let secure = if secure { "; Secure" } else { "" };
+    format!("{COOKIE_NAME}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{secure}")
+}
+
 fn bearer_key(headers: &HeaderMap) -> Option<String> {
     headers
         .get(header::AUTHORIZATION)?
@@ -238,7 +250,7 @@ pub async fn login(
     (
         [(
             header::SET_COOKIE,
-            format!("{COOKIE_NAME}={token}; HttpOnly; SameSite=Strict; Path=/"),
+            session_cookie(&token, state.boot.admin.tls_enabled()),
         )],
         Json(json!({
             "name": matched.name,
@@ -258,7 +270,7 @@ pub async fn logout(State(state): State<Arc<AdminState>>, headers: HeaderMap) ->
         StatusCode::NO_CONTENT,
         [(
             header::SET_COOKIE,
-            format!("{COOKIE_NAME}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"),
+            clear_cookie(state.boot.admin.tls_enabled()),
         )],
     )
         .into_response()
@@ -349,5 +361,16 @@ mod tests {
         missing.insert(header::COOKIE, "other=1".parse().unwrap());
         assert_eq!(cookie_token(&missing), None);
         assert_eq!(cookie_token(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn cookies_carry_secure_only_under_tls() {
+        assert!(session_cookie("tok", true).ends_with("; Secure"));
+        assert!(!session_cookie("tok", false).contains("Secure"));
+        assert!(clear_cookie(true).ends_with("; Secure"));
+        assert!(!clear_cookie(false).contains("Secure"));
+
+        // The clear cookie must still expire the session cookie it replaces.
+        assert!(clear_cookie(true).contains("Max-Age=0"));
     }
 }

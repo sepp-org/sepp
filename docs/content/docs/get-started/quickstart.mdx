@@ -1,6 +1,6 @@
 ---
 title: "Quickstart"
-description: "Run the server, enqueue a job, and watch a worker process it — your first durable job in a few minutes."
+description: "Run the server, enqueue a job and watch a worker process it."
 ---
 
 ## Start the server
@@ -23,7 +23,7 @@ docker run --rm \
 
 This starts sepp with the default configuration, listening on `localhost:50051` and persisting data to a `sepp-data` directory in the current working directory. 
 You can generate a config file to edit with `sepp config example > sepp.toml`. Sepp will pick it up automatically
-as long as it is named `sepp.toml` and in the same directory as the binary, or you can specify a custom path with the `SEPP_CONFIG` environment variable.
+as long as it is named `sepp.toml` and in the same directory as the binary or you can specify a custom path with the `SEPP_CONFIG` environment variable.
 
 ## Talk to the server
 
@@ -152,4 +152,4 @@ await worker.run();
 
 ## Watch it in the admin UI
 
-The server you just started also serves a built-in web UI on [http://localhost:9465](http://localhost:9465). Open it to watch queue depths and rates update live as your producer and worker run, inspect the jobs you just enqueued, or enqueue more from the browser. Running in Docker takes a small config override first; see the [admin UI guide](/docs/get-started/admin-ui) for that and everything else it can do.
+The server you just started also serves a built-in web UI on [http://localhost:9465](http://localhost:9465). Open it to watch queue depths and rates update live as your producer and worker run, inspect the jobs you just enqueued or enqueue more from the browser. Running in Docker takes a small config override first; see the [admin UI guide](/docs/get-started/admin-ui) for that and everything else it can do.

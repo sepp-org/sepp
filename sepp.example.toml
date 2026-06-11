@@ -30,9 +30,16 @@ strict_queues = false
 enabled = true
 
 # host:port the admin UI binds to. Binding a non-loopback address requires
-# `keys` below. The listener itself is plain HTTP: for remote access put a
-# TLS-terminating reverse proxy (or an SSH tunnel) in front of it.
+# `keys` below. For remote access set the TLS paths below, or keep the
+# listener plain HTTP behind a TLS-terminating reverse proxy or SSH tunnel.
 listen_addr = "127.0.0.1:9465"
+
+# TLS for the admin UI listener. Set both or neither. Independent of the gRPC
+# server's TLS; point both at the same files to share a certificate. Note
+# browsers only trust certificates issued by a CA they know, so a self-signed
+# gRPC certificate will draw a warning here.
+#tls_cert_path = "/etc/sepp/tls/admin.crt"
+#tls_key_path = "/etc/sepp/tls/admin.key"
 
 # Named keys for the admin UI and API. Omitted = auth disabled (loopback
 # only). Each key gets a role:

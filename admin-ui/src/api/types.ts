@@ -338,6 +338,8 @@ export interface MetricsConfigView {
 export interface AdminConfigView {
   enabled: boolean
   listen_addr: string
+  tls_cert_path: string | null
+  tls_key_path: string | null
   // Redacted: names and roles only.
   keys: { name: string; role: Role }[] | null
   session_ttl_ms: number

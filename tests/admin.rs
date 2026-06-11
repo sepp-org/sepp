@@ -1667,7 +1667,7 @@ async fn delete_sees_an_empty_queue_behind_a_buried_scheduled_index() {
     for _ in 0..41 {
         let jobs: Vec<EnqueueRequest> = (0..250)
             .map(|_| EnqueueRequest {
-                scheduled_at: Some(scheduled_at.clone()),
+                scheduled_at: Some(scheduled_at),
                 ..enqueue_req("adm-cap-filler")
             })
             .collect();

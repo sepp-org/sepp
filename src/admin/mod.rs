@@ -15,9 +15,10 @@ use std::sync::{Arc, RwLock};
 use arc_swap::ArcSwap;
 use axum::Router;
 use axum::routing::{get, post};
+use axum_server::tls_rustls::RustlsConfig;
 use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::config::{Config, SharedConfig};
 use crate::queues::SharedRegistry;
@@ -93,30 +94,107 @@ pub async fn spawn(
     addr: SocketAddr,
     shutdown: watch::Receiver<bool>,
 ) -> Result<(SocketAddr, JoinHandle<()>), Box<dyn Error>> {
+    let tls = state
+        .boot
+        .admin
+        .tls_enabled()
+        .then(|| tls_config(&state.boot.admin))
+        .transpose()?;
+
     let state = Arc::new(state);
     stats::prime(&state);
 
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .map_err(|e| format!("binding admin UI {addr}: {e}"))?;
+    let listener =
+        std::net::TcpListener::bind(addr).map_err(|e| format!("binding admin UI {addr}: {e}"))?;
+    listener.set_nonblocking(true)?;
     let local_addr = listener.local_addr()?;
-    info!(addr = %local_addr, "admin UI listening");
+    let scheme = if tls.is_some() { "https" } else { "http" };
+    let tls_label = if tls.is_some() { "enabled" } else { "disabled" };
+    if local_addr.ip().is_unspecified() {
+        // An unspecified bind serves every interface but is not a browsable
+        // host itself; loopback is always among them.
+        info!(
+            addr = %local_addr,
+            tls = tls_label,
+            "admin UI listening at {scheme}://localhost:{}",
+            local_addr.port(),
+        );
+    } else {
+        info!(
+            tls = tls_label,
+            "admin UI listening at {scheme}://{local_addr}",
+        );
+    }
+    if state.boot.admin.keys.is_some() && tls.is_none() && !local_addr.ip().is_loopback() {
+        warn!("admin keys are enabled without TLS; keys and session cookies are sent in plaintext");
+    }
 
     tokio::spawn(stats::run_hub(state.clone(), shutdown.clone()));
     tokio::spawn(stats::watch_reloads(state.clone(), shutdown.clone()));
 
     let app = router(state);
-    let mut shutdown = shutdown;
-    let handle = tokio::spawn(async move {
-        let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
+    let handle = axum_server::Handle::new();
+    {
+        let handle = handle.clone();
+        let mut shutdown = shutdown;
+        tokio::spawn(async move {
             let _ = shutdown.changed().await;
+            // SSE streams end once the stats hub observes the same shutdown
+            // signal; the timeout only backstops stuck connections.
+            handle.graceful_shutdown(Some(std::time::Duration::from_secs(10)));
         });
+    }
+
+    let serve: std::pin::Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>> = match tls {
+        Some(tls) => Box::pin(
+            axum_server::from_tcp_rustls(listener, tls)
+                .map_err(|e| format!("admin UI listener: {e}"))?
+                .handle(handle)
+                .serve(app.into_make_service()),
+        ),
+        None => Box::pin(
+            axum_server::from_tcp(listener)
+                .map_err(|e| format!("admin UI listener: {e}"))?
+                .handle(handle)
+                .serve(app.into_make_service()),
+        ),
+    };
+    let task = tokio::spawn(async move {
         if let Err(e) = serve.await {
             error!(error = %e, "admin UI server stopped with error");
         }
     });
 
-    Ok((local_addr, handle))
+    Ok((local_addr, task))
+}
+
+fn tls_config(admin: &crate::config::AdminConfig) -> Result<RustlsConfig, Box<dyn Error>> {
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+    let cert_path = admin.tls_cert_path.as_deref().expect("tls_cert_path set");
+    let key_path = admin.tls_key_path.as_deref().expect("tls_key_path set");
+
+    let certs: Vec<CertificateDer> = CertificateDer::pem_file_iter(cert_path)
+        .map_err(|e| format!("reading admin.tls_cert_path ({cert_path}): {e}"))?
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("parsing admin.tls_cert_path ({cert_path}): {e}"))?;
+    let key = PrivateKeyDer::from_pem_file(key_path)
+        .map_err(|e| format!("reading admin.tls_key_path ({key_path}): {e}"))?;
+
+    // An explicit provider rather than rustls's process default: tonic's
+    // tls-ring already puts ring in the graph and the default would panic at
+    // runtime if any future dependency also enabled aws-lc-rs.
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| format!("admin TLS protocol versions: {e}"))?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| format!("admin TLS identity: {e}"))?;
+
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(RustlsConfig::from_config(Arc::new(config)))
 }
 
 fn router(state: Arc<AdminState>) -> Router {

@@ -1,18 +1,15 @@
 ---
 title: "Client SDKs"
-description: "First-party SDKs (Rust, Python, Go), what they share, and how to pick one."
+description: "First-party SDKs (Rust, Python, JavaScript/TypeScript)."
 ---
 
-{/* SCAFFOLD — layout only, no prose written yet. */}
-{/* TODO(content): SDK directory + merged connecting + error-handling. First-party SDKs are Rust (F:/sepp-rs), Python (F:/sepp-py) and TypeScript/Node (F:/sepp-js). Points to the per-task LangTabs in Producers/Workers. ABSORBED connecting: API-key metadata, client TLS, keepalive, calling GetServerInfo (server_time for clock-skew). ABSORBED error-handling overview: gRPC status map vs JobRejection and when to retry — defer the full catalogue to reference/rejections. */}
-
 ## Official SDKs
+All SDKs are open source and easily installable via their respective package managers. They are designed to be idiomatic and easy to use, largely using the same API across languages.
 
-## Connecting
+TODO: add links here
 
-## What every client shares
+Documention regarding each client is mostly inline as doc comments and in the README of each client.
 
-## Errors & retries
+## Roll your own
 
-## Versioning & compatibility
-
+Sepp's gRPC line protocol is simple and well-documented, so you can also implement your own client in any language you want. See the [build your own client](/docs/clients/build-your-own) guide for more.

@@ -10,9 +10,9 @@ Sepp ships with a web admin UI embedded in the binary. It streams a live dashboa
 
 ## Open it
 
-The UI is on by default, on its own HTTP listener separate from the gRPC port. Start the server and open [http://localhost:9465](http://localhost:9465): you land on the dashboard.
+The UI is on by default, on its own HTTP listener separate from the gRPC port. Start the server and open [http://localhost:9465](http://localhost:9465).
 
-The default bind is `127.0.0.1:9465`, so out of the box the UI is reachable only from the machine the server runs on and no login is required. Binding anything else requires named keys with roles, and the server refuses to start without them. The listener itself is plain HTTP, so for remote access put a TLS-terminating reverse proxy or an SSH tunnel in front. See [admin UI authentication](/docs/operations/security#admin-ui-authentication) for keys, roles and sessions.
+The default bind is `127.0.0.1:9465`, so out of the box the UI is reachable only from the machine the server runs on and no login is required. Binding anything else requires named keys with roles and the server refuses to start without them. For remote access serve the listener over HTTPS by setting `tls_cert_path` and `tls_key_path` under `[admin]`, or keep it plain HTTP behind a TLS-terminating reverse proxy or an SSH tunnel. See [admin UI authentication](/docs/operations/security#admin-ui-authentication) for keys, roles and sessions.
 
 To turn the UI off, set in `sepp.toml`:
 
@@ -21,11 +21,11 @@ To turn the UI off, set in `sepp.toml`:
 enabled = false
 ```
 
-`enabled` and `listen_addr` are the two admin fields that need a restart to apply.
+`enabled`, `listen_addr` and the TLS paths are the admin fields that need a restart to apply.
 
 ### In Docker
 
-Inside a container the default loopback bind is unreachable from the host, so publishing the port alone is not enough: the UI has to bind `0.0.0.0`, and a non-loopback bind requires keys. Write a config:
+Inside a container the default loopback bind is unreachable from the host, so publishing the port alone is not enough: the UI has to bind `0.0.0.0` and a non-loopback bind requires keys. Write a config:
 
 ```toml
 [admin]
