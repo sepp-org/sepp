@@ -1,0 +1,60 @@
+---
+title: "Admin UI"
+description: "The built-in web UI: watch queues in real time, inspect and enqueue jobs, manage dead letters and edit configuration from the browser."
+---
+
+Sepp ships with a web admin UI embedded in the binary. It streams a live dashboard of every queue and lets you inspect jobs, enqueue new ones, requeue dead letters and edit the server configuration, all from the browser. There is nothing extra to install or deploy.
+
+{/* TODO(media): hero capture of the dashboard. Prefer a static WebP screenshot in public/admin-ui/, or a short <video autoPlay loop muted playsInline> WebM clip; avoid GIF (huge, 256 colors). Markdown image syntax below resolves size + basePath at build: */}
+{/* ![The admin UI dashboard](/admin-ui/dashboard.webp) */}
+
+## Open it
+
+The UI is on by default, on its own HTTP listener separate from the gRPC port. Start the server and open [http://localhost:9465](http://localhost:9465): you land on the dashboard.
+
+The default bind is `127.0.0.1:9465`, so out of the box the UI is reachable only from the machine the server runs on and no login is required. Binding anything else requires named keys with roles, and the server refuses to start without them. The listener itself is plain HTTP, so for remote access put a TLS-terminating reverse proxy or an SSH tunnel in front. See [admin UI authentication](/docs/operations/security#admin-ui-authentication) for keys, roles and sessions.
+
+To turn the UI off, set in `sepp.toml`:
+
+```toml
+[admin]
+enabled = false
+```
+
+`enabled` and `listen_addr` are the two admin fields that need a restart to apply.
+
+### In Docker
+
+Inside a container the default loopback bind is unreachable from the host, so publishing the port alone is not enough: the UI has to bind `0.0.0.0`, and a non-loopback bind requires keys. Write a config:
+
+```toml
+[admin]
+listen_addr = "0.0.0.0:9465"
+keys = [{ name = "me", key = "generate-a-long-random-secret" }]
+```
+
+mount it over the image's config path and publish the port:
+
+```bash
+docker run --rm \
+  -p 50051:50051 -p 9465:9465 \
+  -v "$(pwd)/sepp.toml:/etc/sepp/sepp.toml" \
+  -v sepp-data:/sepp/sepp-data \
+  ghcr.io/sepp-org/sepp:latest
+```
+
+## What you can do
+
+- **Watch queues live.** The dashboard shows a card per queue with its depths (ready, scheduled, in-flight, dead-lettered), per-second enqueue and ack rates and a sparkline of the last minute, streamed over SSE with no polling to configure.
+- **Inspect jobs.** Open a queue and page through its jobs by state. A job's detail view shows every field, the custom map and the payload decoded by its encoding hint (pretty-printed JSON, text or a hex dump).
+- **Enqueue jobs.** Every queue has an enqueue form covering the full request: payload, priority, scheduling, idempotency key and custom fields. See [enqueue from the admin UI](/docs/producers/admin-ui).
+- **Manage dead letters.** List a queue's dead letters with their cause and last failure reason, then requeue the ones worth another go or delete the rest. Unlike a [drain](/docs/concepts/retries-and-dead-letter#retention-and-replay), looking is not destructive.
+- **Manage queues.** Create a queue, edit its per-queue overrides, and purge or delete it. Deleting refuses while jobs are in flight.
+- **Edit configuration.** The config editor writes `sepp.toml` through the same [hot-reload](/docs/operations/configuration) path you would use by hand, preserving comments. Fields that need a restart are flagged, and fields pinned by `SEPP_` environment variables are locked.
+
+## See also
+
+- [Enqueue from the admin UI](/docs/producers/admin-ui): the enqueue form field by field.
+- [Authentication & TLS](/docs/operations/security): admin keys, roles and the audit log.
+- [Configuration](/docs/operations/configuration): the file the config editor writes.
+- [Quickstart](/docs/get-started/quickstart): enqueue and process your first job.

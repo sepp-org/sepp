@@ -2,6 +2,7 @@
   "title": "Get Started",
   "pages": [
     "install",
-    "quickstart"
+    "quickstart",
+    "admin-ui"
   ]
 }

@@ -5,6 +5,7 @@ description: "How sepp exposes metrics, traces, logs, and health — and a recom
 
 {/* SCAFFOLD — layout only, no prose written yet. */}
 {/* TODO(content): Observability hub + merged logging + health. The four signals and a Prometheus + OTel collector + Grafana setup. ABSORBED logging: [logging] level directive (e.g. info,sepp=debug) + RUST_LOG override; text vs json for aggregators; notable lines (startup/ready, hot reload, restart-only warning, shutdown). ABSORBED health: tonic health service alongside QueueService; probe wiring; relationship to the Prometheus endpoint. Metrics and tracing keep their own pages. OPEN QUESTION: ship a blessed Grafana dashboard / Prometheus rules? */}
+{/* TODO(content): Position the admin UI dashboard under "What sepp exposes": the zero-setup live view (per-queue depths, rates, last 60s over SSE) for looking at the server right now; Prometheus + Grafana for retention, history and alerting. Link /docs/get-started/admin-ui. */}
 
 ## What sepp exposes
 

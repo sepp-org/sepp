@@ -250,6 +250,8 @@ for (const record of records) {
 
 </LangTabs>
 
+Draining is the programmatic path. The [admin UI](/docs/get-started/admin-ui) reads the same store without consuming it: it lists a queue's dead letters with their cause and last reason, and can requeue or delete the ones you select.
+
 ## See also
 
 - [Job lifecycle & delivery](/docs/concepts/job-lifecycle): how lease expiry feeds the attempt counter and where dead-letter sits.

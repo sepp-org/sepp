@@ -5,8 +5,11 @@ description: "Every sepp.toml key with type, default, hot-reloadable flag, and d
 
 {/* SCAFFOLD — layout only, no prose written yet. */}
 {/* TODO(content): Exhaustive key tables (TypeTable-friendly) with type / default / hot-reloadable. Must include max_message_bytes, default_max_attempts, max_attempts_ceiling, default_priority, max_queue_depth tri-state, prometheus_listen_addr, export_interval_ms. Cross-validation rules (max_payload_bytes <= max_message_bytes; default_max_attempts <= max_attempts_ceiling; max_queue_name_bytes <= 65535). [[queues]]-only key: allowed_job_types. Env mapping: SEPP_<SECTION>__<FIELD>, env wins over file. */}
+{/* TODO(content): [admin] keys: enabled (default true, restart-only), listen_addr (default 127.0.0.1:9465, restart-only), keys (list of {name, key, role}; roles viewer/operator/admin, role defaults to admin; omitted = auth off, loopback only; required for non-loopback binds; hot-reloadable), session_ttl_ms (default 43200000). */}
 
 ## [server]
+
+## [admin]
 
 ## [auth]
 

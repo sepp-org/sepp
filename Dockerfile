@@ -25,7 +25,9 @@ WORKDIR /sepp
 COPY --from=builder /app/target/release/sepp /usr/local/bin/sepp
 COPY --from=builder /app/sepp.example.toml /etc/sepp/sepp.toml
 COPY --from=builder --chown=65532:65532 /app/empty-data/ /sepp/sepp-data/
-EXPOSE 50051
+# 50051 gRPC, 9464 Prometheus (off by default), 9465 admin UI (loopback-bound
+# by default; reaching it from outside needs a listen_addr + keys override)
+EXPOSE 50051 9464 9465
 VOLUME ["/sepp/sepp-data"]
 ENV SEPP_CONFIG=/etc/sepp/sepp.toml
 

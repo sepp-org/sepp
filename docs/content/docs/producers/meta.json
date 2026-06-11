@@ -1,6 +1,7 @@
 {
   "title": "Producers",
   "pages": [
-    "index"
+    "index",
+    "admin-ui"
   ]
 }

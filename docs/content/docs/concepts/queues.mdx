@@ -36,7 +36,7 @@ dedup_window_ms = 3600000
 An `allowed_job_types` list restricts which job types a queue accepts, a simple way to enforce separation between queues and catch a producer enqueueing the wrong type. The full set of per-queue overrides (`max_lease_duration_ms`, `default_max_attempts`, `max_attempts_ceiling`, `default_priority`, `max_payload_bytes`, `allowed_encodings`, `max_schedule_horizon_ms`, `max_custom_entries`, `max_custom_total_bytes`, `max_custom_key_bytes`, `dedup_window_ms`, `max_queue_depth`) is listed in the [configuration reference](/docs/reference/configuration).
 
 <Callout type="info" title="Hot reloading">
-Queues declared in the configuration are hot-reloadable, so you can add, remove or change them on the fly without restarting the server. Just edit the config file, save and the server picks up the changes automatically.
+Queues declared in the configuration are hot-reloadable, so you can add, remove or change them on the fly without restarting the server. Just edit the config file, save and the server picks up the changes automatically. The [admin UI](/docs/get-started/admin-ui) edits the same file, so queues created or changed there apply the same way.
 </Callout>
 
 ## Opaque payloads and encoding hints

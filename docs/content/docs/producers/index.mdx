@@ -16,6 +16,8 @@ The producer side of sepp is small: three enqueue calls and one request message,
 - **`enqueueAtomic`** sends many jobs with an all-or-none guarantee: either every job lands or none do.
 - **`getServerInfo`** returns the server's version, feature flags and advertised limits. Clients use it to [validate locally](#validating-against-server-limits) before sending.
 
+There is also a no-code path: the [admin UI](/docs/producers/admin-ui) can enqueue a job from the browser, useful for trying out a queue or firing a one-off job without a producer script.
+
 All three enqueue calls carry the same building block, the `EnqueueRequest`. Two fields are required, the rest are optional knobs you set only when you need them:
 
 | Field | Required | What it carries |

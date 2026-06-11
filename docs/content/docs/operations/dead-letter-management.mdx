@@ -5,6 +5,7 @@ description: "Enable retention and drain dead-lettered jobs for inspection and r
 
 {/* SCAFFOLD — layout only, no prose written yet. */}
 {/* TODO(content): Day-2 DLQ how-to. dead_letter_retention_ms (0 disables). DrainDeadLetters: optional single-queue filter, oldest-first, max clamped to max_reserve_batch. DESTRUCTIVE: no redelivery token — a dropped response permanently removes jobs. Empty list is indistinguishable from retention disabled, so check dead_letter_retention_enabled first. Replay = client copies DeadLetterRecord.job fields into a fresh EnqueueRequest (no server-side replay). */}
+{/* TODO(content): Admin UI path. Per-queue Dead letters tab lists records WITHOUT consuming them (cause + last reason columns), select → requeue or delete. Requeue keeps the job id and resets attempt to 1 (unlike client replay, which is a fresh job with a new id). Ready/scheduled jobs can also be dead-lettered from the UI (cause admin). Needs operator role when auth is on. Link /docs/get-started/admin-ui. */}
 
 ## Enabling retention
 
@@ -13,6 +14,8 @@ description: "Enable retention and drain dead-lettered jobs for inspection and r
 ## Destructive drain semantics
 
 ## Replaying drained jobs
+
+## Requeue and delete from the admin UI
 
 ## Retention expiry
 

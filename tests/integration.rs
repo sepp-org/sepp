@@ -119,11 +119,14 @@ fn spawn_server_process(
     let mut command = Command::new(env!("CARGO_BIN_EXE_sepp"));
     command
         .env("SEPP_SERVER__LISTEN_ADDR", "127.0.0.1:0")
+        // The admin UI is on by default; its fixed default port would clash
+        // across concurrently spawned test servers.
+        .env("SEPP_ADMIN__LISTEN_ADDR", "127.0.0.1:0")
         .env("SEPP_SERVER__DB_PATH", db_path)
         // Isolate from any sepp.toml in the developer's working directory:
-        // a local file enabling the admin UI's fixed port or strict_queues
-        // would break concurrently spawned test servers. Tests that need a
-        // config override SEPP_CONFIG through `extra_env`.
+        // a local file pinning ports or strict_queues would break
+        // concurrently spawned test servers. Tests that need a config
+        // override SEPP_CONFIG through `extra_env`.
         .env("SEPP_CONFIG", isolated_config_path())
         // Force info so the startup "listening" lines are always emitted,
         // whatever level a test's config might otherwise set.

@@ -360,7 +360,7 @@ pub struct AdminConfig {
 impl Default for AdminConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             listen_addr: SocketAddr::from(([127, 0, 0, 1], 9465)),
             keys: None,
             session_ttl_ms: 12 * 60 * 60 * 1000,
@@ -769,6 +769,7 @@ mod tests {
         assert!(loopback.validate().is_ok(), "loopback admin needs no keys");
 
         let mut disabled = Config::default();
+        disabled.admin.enabled = false;
         disabled.admin.listen_addr = SocketAddr::from(([0, 0, 0, 0], 9465));
         assert!(
             disabled.validate().is_ok(),
