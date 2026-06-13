@@ -1,27 +1,116 @@
 ---
 title: "Configuration"
-description: "Configure sepp via sepp.toml, SEPP_ environment overrides, and hot reload."
+description: "Configure sepp via sepp.toml, SEPP_ environment overrides and the admin UI."
 ---
 
-{/* SCAFFOLD — layout only, no prose written yet. */}
-{/* TODO(content): Config hub + merged limits + durability + storage tuning. File + SEPP_<SECTION>__<FIELD> env precedence + hot reload + `sepp config example`. Hot-reloadable: [auth] api_keys, [[queues]], strict_queues, registry-derived limits. Restart-only: listen_addr, db_path, TLS paths, max_message_bytes, all [storage] tuning, [logging]/[tracing]/[metrics]. ABSORBED limits: [limits] + [[queues]] merge; which limit maps to which rejection; max_message_bytes (whole-request, >= max_payload_bytes) vs max_payload_bytes; max_queue_depth tri-state (omit = unlimited, 0 = reject all); default_max_attempts/max_attempts_ceiling/default_priority. ABSORBED durability: the three persist modes + ~4x buffer trade-off, sweep_interval_ms/sweep_limit, command_queue_capacity (restart-only). ABSORBED storage tuning: fjall cache_size_bytes (~20-25% RAM), max_journaling_size_bytes, max_cached_files, worker_threads, dedup_window_ms (all restart-only). Full key tables in Reference. */}
-{/* TODO(content): Admin UI editor: writes sepp.toml through the same hot-reload path, comment-preserving; restart-only fields flagged amber, SEPP_*-pinned fields locked; ETag guard rejects concurrent edits; admin.keys cannot be edited through it. Link /docs/get-started/admin-ui. */}
+Sepp offers various ways of configuring itself to make it as easy to run as possible. This page goes over the different ways to configure sepp and how they interact with each other.
 
 ## The sepp.toml file
 
+This is the source of truth for the server configuration. Every edit you make through the admin UI or by hand is written to this file. The server hot-reloads it on every save, so you can make changes on the fly without incurring downtime. Additionally, you can override any field in the config file with an environment variable prefixed with `SEPP_`. See [Environment variable overrides](#environment-variable-overrides) for details.
+
+Please note that some fields are restart-only and require a full server restart to apply. These fields are clearly marked in the admin UI.
+
 ## Config sections overview
+
+A `sepp.toml` is split into a handful of tables. Each maps to a part of this documentation; the [configuration reference](/docs/reference/configuration) has the exhaustive key tables with every type and default.
+
+| Section | What it configures |
+| --- | --- |
+| `[server]` | Bind address, data directory, gRPC TLS, and strict-queue mode. |
+| `[auth]` | gRPC API keys. See [Authentication & TLS](/docs/operations/security). |
+| `[limits]` | Global request and per-job limits. |
+| `[storage]` | Durability, the background sweeper and fjall tuning. |
+| `[logging]` / `[tracing]` / `[metrics]` | The three observability stacks. See [Observability](/docs/observability). |
+| `[admin]` | The admin UI listener, its TLS and its keys. |
+| `[[queues]]` | Per-queue declarations and limit overrides. See [Queues](/docs/concepts/queues). |
 
 ## Environment variable overrides
 
+Every scalar field can be set from the environment instead of the file. Prefix `SEPP_`, uppercase the names and join the section and field with a double underscore:
+
+```bash
+SEPP_SERVER__LISTEN_ADDR=0.0.0.0:6000
+SEPP_STORAGE__PERSIST_MODE=buffer
+SEPP_METRICS__PROMETHEUS_LISTEN_ADDR=127.0.0.1:9464
+```
+
+Environment variables take precedence over the file, which takes precedence over the built-in defaults. This is the usual way to inject secrets and per-environment addresses without committing them to `sepp.toml`. Structured values like `[[queues]]` and `[admin] keys` are lists of tables, so keep those in the file.
+
+A field pinned by an env var cannot be changed by editing the file: the env value always wins and the admin UI shows such fields as locked.
+
 ## Hot reloading
+
+The server watches the config file and reloads it shortly after each save (events are debounced over 500 ms). A reload re-reads the file with environment overrides reapplied, then validates the result:
+
+- If the new config is invalid, the server logs an error and keeps running the previous configuration. A broken edit never takes the server down.
+- If it is valid, hot-reloadable changes apply atomically: the API-key set and the queue registry (which carries the effective per-queue limits) switch over without dropping connections.
+
+Some fields are read once at startup and only change on a restart. When a reload sees one of these change, it logs a warning naming the fields and leaves the running values in place.
+
+**Restart-only fields**
+
+- `[server]`: `listen_addr`, `db_path`, `tls_cert_path`, `tls_key_path`
+- `[limits]`: `max_message_bytes` (the gRPC decode ceiling)
+- `[storage]`: every field, including `persist_mode`, the sweeper and all fjall tuning
+- `[logging]`, `[tracing]`, `[metrics]`: each entire section
+- `[admin]`: `enabled`, `listen_addr`, `tls_cert_path`, `tls_key_path`
+- `[[queues]]`: `dedup_window_ms` overrides (dedup deadlines are pinned when a job is inserted)
+
+Everything else reloads live, including `auth.api_keys`, `server.strict_queues`, `admin.keys`, the rest of `[limits]` and adding, removing or retuning a `[[queues]]` entry.
 
 ## Editing from the admin UI
 
+The admin UI writes the same `sepp.toml` through the same hot-reload path, so edits made in the browser and by hand are equivalent. The editor preserves your comments and formatting, flags restart-only fields and locks any field an `SEPP_` variable already pins. Concurrent edits are guarded by an ETag, so a stale tab cannot clobber a newer save. The `[admin] keys` themselves cannot be edited through the UI; change those in the file. See the [admin UI guide](/docs/get-started/admin-ui) for the full editor.
+
 ## Limits & quotas
+
+`[limits]` sets the global ceilings every request is checked against. A `[[queues]]` entry can override most of them for one queue; the effective limit is the queue's value if set, otherwise the global. Exceeding a limit produces a deterministic rejection rather than an error. See the [rejection catalogue](/docs/reference/rejections) for which limit maps to which reason.
+
+The few that matter most in production:
+
+- **`max_message_bytes`** caps the whole gRPC request and is the hard decode ceiling (default 16 MiB, restart-only). **`max_payload_bytes`** caps a single job's payload (default 1 MiB, hot-reloadable, overridable per queue) and must not exceed `max_message_bytes`.
+- **`max_queue_depth`** bounds how many jobs a queue may hold. Omit it for unlimited (the default), set a number to cap or set `0` to reject every enqueue. A cap is the main backstop against an unbounded producer filling the disk.
+- **`default_max_attempts`** (default 3) is the retry budget before a job is dead-lettered and may not exceed **`max_attempts_ceiling`** (default 100). **`default_priority`** runs from `0` to `9`.
+
+Invalid combinations (a payload cap above the message cap, default attempts above the ceiling, a duplicate or malformed queue name) are rejected when the config loads. On reload the same check runs and a failure leaves the previous config in place.
 
 ## Durability & persist modes
 
+`storage.persist_mode` sets the durability of each write: whether, and how, the write-ahead log is fsynced to disk after every commit. It is restart-only.
+
+| Mode | Behaviour | Choose when |
+| --- | --- | --- |
+| `sync_all` (default) | fsync data and metadata on every commit | You want the strongest durability. |
+| `sync_data` | flush data with `fdatasync`, skip the extra metadata sync | You want to shave commit latency while still persisting each write to disk. |
+| `buffer` | no fsync; let the OS flush on its own schedule | You want maximum throughput and can tolerate losing recently acked writes. |
+
+<Callout type="warn" title="Buffer mode is not crash-safe">
+In `buffer` mode an acknowledged enqueue lives only in the OS page cache, not on disk. An OS crash or power loss can lose any writes the kernel has not yet flushed. The server logs a warning at startup whenever this mode is active.
+</Callout>
+
+Two more knobs shape write behaviour, both restart-only:
+
+- **The sweeper** runs the periodic maintenance pass that promotes due scheduled jobs and reclaims expired leases. `sweep_limit` (default 10000) caps how many jobs it touches per cycle. There is also `sweep_internval_ms` (default 1000) that caps the maximum time between two sweep cycles but this is only included as a safety feature against clock jumps. Under normal operation the sweeper cycle is scheduled to run exactly when the next job is due.
+- **`command_queue_capacity`** (default 4096) bounds how many writes can be queued to the single committer thread. If it fills under a burst, new writes get a transient, retryable rejection rather than growing memory without limit.
+
 ## Storage tuning
+
+The `[storage]` block also exposes the underlying fjall engine's knobs. All are optional, fall back to fjall's own defaults and are restart-only. Leave them unset unless you are sizing for a specific workload; see [Resource sizing](/docs/operations/deployment#resource-sizing) for guidance.
+
+- **`cache_size_bytes`** sizes the block cache. For read-heavy workloads, roughly 20 to 25% of available RAM is a reasonable starting point.
+- **`max_journaling_size_bytes`** caps the journal (WAL) size (minimum 64 MiB).
+- **`max_cached_files`** caps the open file-descriptor cache (minimum 10). Raise it for databases with many segments but keep it under your process FD limit.
+- **`worker_threads`** sets the flush and compaction thread count (default is the smaller of the CPU count and 4).
+
+The [configuration reference](/docs/reference/configuration) lists the exact defaults.
 
 ## Generating an example config
 
+`sepp config example` prints a fully commented configuration to stdout. Redirect it to a file to start from a complete template:
+
+```bash
+sepp config example > sepp.toml
+```
+
+The printed config mirrors the built-in defaults, so an empty `sepp.toml` and the generated one behave identically; the generated file just documents every key inline. The server loads `./sepp.toml` automatically or pass `--config <path>` (or set `SEPP_CONFIG`) to point elsewhere.

@@ -3,19 +3,60 @@ title: "Dead-letter management"
 description: "Enable retention and drain dead-lettered jobs for inspection and replay."
 ---
 
-{/* SCAFFOLD — layout only, no prose written yet. */}
-{/* TODO(content): Day-2 DLQ how-to. dead_letter_retention_ms (0 disables). DrainDeadLetters: optional single-queue filter, oldest-first, max clamped to max_reserve_batch. DESTRUCTIVE: no redelivery token — a dropped response permanently removes jobs. Empty list is indistinguishable from retention disabled, so check dead_letter_retention_enabled first. Replay = client copies DeadLetterRecord.job fields into a fresh EnqueueRequest (no server-side replay). */}
-{/* TODO(content): Admin UI path. Per-queue Dead letters tab lists records WITHOUT consuming them (cause + last reason columns), select → requeue or delete. Requeue keeps the job id and resets attempt to 1 (unlike client replay, which is a fresh job with a new id). Ready/scheduled jobs can also be dead-lettered from the UI (cause admin). Needs operator role when auth is on. Link /docs/get-started/admin-ui. */}
+When a job exhausts its retries or is rejected, sepp dead-letters it: the job leaves the normal flow and is set aside instead of being retried again. What causes that is covered in [Retries & dead-letter](/docs/concepts/retries-and-dead-letter); this page is the day-2 side, keeping those records around and then inspecting, replaying or clearing them.
 
 ## Enabling retention
 
-## Inspecting with DrainDeadLetters
+Dead-letter retention is **off by default**. With `storage.dead_letter_retention_ms = 0` a job that dies is deleted on the spot: nothing is kept to inspect or replay, so `DrainDeadLetters` always comes back empty. Set a positive duration to keep records for that long:
+
+```toml
+[storage]
+# Keep dead-letter records for 7 days.
+dead_letter_retention_ms = 604800000
+```
+
+This is restart-only. With it enabled, `GetServerInfo` reports `dead_letter_retention_enabled = true`, dead jobs are retained as `DeadLetterRecord`s and everything below becomes available.
+
+<Callout type="warn" title="Decide this before you need it">
+Retention is not retroactive. Jobs that died while it was `0` are already gone. If dead-letter inspection matters to you, enable it from day one.
+</Callout>
+
+## Managing dead letters in the admin UI
+
+The admin UI is the main way to work with dead letters. Each queue has a **Dead letters** tab that lists its retained records without consuming them, so looking costs nothing and is safe to do as often as you like. Each row shows the cause (`attempts_exhausted`, `rejected`, `lease_expired` or `admin`) and the last failure reason. Opening a record shows the full job: its payload, custom fields and the attempt it died on.
+
+From there you can select records and:
+
+- **Requeue** them. The job goes back onto its queue as ready, keeping its original job id and resetting its attempt counter to 1. It is the same job getting another run, not a copy.
+- **Delete** them. The record is removed and the job is gone for good.
+
+You can also dead-letter a live `ready` or `scheduled` job straight from its queue view (it is recorded with the `admin` cause), which is handy for pulling a known-bad job out of circulation for inspection.
+
+These actions need the **operator** role when admin auth is on; a viewer can see the Dead letters tab but cannot requeue, delete or dead-letter. See the [admin UI guide](/docs/get-started/admin-ui) and [admin roles](/docs/operations/security#admin-roles).
+
+## Draining with DrainDeadLetters
+
+For bulk or scripted handling, the `DrainDeadLetters` RPC pulls records out programmatically. It returns up to `max` records oldest-first, optionally restricted to a single queue:
+
+- `queue` (optional) limits the drain to one queue; unset drains across all queues.
+- `max` (optional, default 1) caps the batch. The server clamps it to `max_reserve_batch` (advertised in `GetServerInfo`), so a larger value is not an error.
+
+Each returned `DeadLetterRecord` carries the job snapshot (with its queue and payload inline), the `cause`, the `failed_at` timestamp, the `final_attempt` number and, when a worker nacked it, the `last_reason`.
+
+An empty response is indistinguishable from retention being disabled, so check `dead_letter_retention_enabled` from `GetServerInfo` before treating "no records" as "queue is clean".
 
 ## Destructive drain semantics
 
+`DrainDeadLetters` is destructive: the records it returns are removed from the server in the same call. Unlike `Reserve` there is no lease or ack and no redelivery token, so if the response is lost in transit (a dropped connection, a client crash) those records are gone with no way to get them back.
+
+Treat a drain as a one-shot export: persist what you receive before acting on it and do not drain more than you can handle in one response. When you only want to look, use the admin UI's Dead letters tab instead, which lists without removing.
+
 ## Replaying drained jobs
 
-## Requeue and delete from the admin UI
+There is no server-side replay of a drained record. To re-run one, copy the fields from its `DeadLetterRecord.job` into a fresh `EnqueueRequest` and enqueue it. That produces a brand-new job with a new id and a fresh attempt count; this is the difference from an admin-UI requeue, which keeps the original id and resets the attempt.
+
+Because the record's job is a snapshot from failure time, copy only the fields you mean to re-send (payload, priority, custom map and so on) rather than treating it as a live job.
 
 ## Retention expiry
 
+Retention is a TTL, not permanent storage. A record is kept for `dead_letter_retention_ms` from the moment the job died, after which the server's background sweep reclaims it. Drain or requeue anything you care about within that window. Letting records expire is the normal way the dead-letter set stays bounded; there is no separate purge to run.

@@ -1,25 +1,149 @@
 ---
 title: "Deployment"
-description: "Run the single binary in production: Docker, systemd, the data directory, and graceful shutdown."
+description: "Run the single binary in production: Docker, systemd, the data directory and graceful shutdown."
 ---
 
-{/* SCAFFOLD — layout only, no prose written yet. */}
-{/* TODO(content): Deployment how-to + merged Kubernetes + upgrading. ghcr.io/sepp-org/sepp image; persist db_path (default ./sepp-data) on a volume. SHUTDOWN: on SIGTERM/Ctrl-C tonic stops accepting connections and lets in-flight RPCs finish, then exits; leased jobs are NOT re-queued — they redeliver after lease expiry (no zero-loss drain). BACKUP: cold copy only (stop the server) — hot-copying the live fjall/LSM dir is unsafe. ABSORBED Kubernetes: PVC for db_path, SEPP_* env / ConfigMap, gRPC health probes, terminationGracePeriodSeconds, Prometheus scrape of prometheus_listen_addr. ABSORBED upgrading: 0.x wire + on-disk compat caveats, stop/replace, post-upgrade verification (GetServerInfo), rollback. */}
-{/* TODO(content): Admin UI listener: separate HTTP port, on by default at 127.0.0.1:9465 (enabled/listen_addr restart-only). Docker/K8s: bind 0.0.0.0 + publish the port; non-loopback requires [admin] keys. Plain HTTP — TLS-terminating proxy or SSH tunnel in front. Link /docs/get-started/admin-ui. */}
+sepp runs as a single process with no external dependencies. Getting the binary or image is covered in [Install](/docs/get-started/install); this page is about running it as a long-lived production service: where its state lives, how to supervise it, how it shuts down and how to upgrade and back it up.
 
 ## The single binary
 
+sepp is one self-contained binary with no database or broker to run alongside it. It runs in the foreground, logs to stdout and reads its configuration from `./sepp.toml`, `--config <path>` or `SEPP_CONFIG` (see [Configuration](/docs/operations/configuration)).
+
+A default server uses three ports:
+
+| Port | Purpose | Default bind |
+| --- | --- | --- |
+| `50051` | gRPC job API | `0.0.0.0` |
+| `9465` | Admin UI | `127.0.0.1` (loopback) |
+| `9464` | Prometheus metrics | `0.0.0.0`, but the endpoint is off until enabled |
+
+Everything sepp persists lives under one directory, `server.db_path` (default `./sepp-data`). That directory is the entire server state: jobs, leases, dead letters and dedup history. Keeping it on durable storage is the single most important deployment decision.
+
 ## Docker image and data volume
+
+The multi-architecture image is published to the GitHub Container Registry at `ghcr.io/sepp-org/sepp`. [Install](/docs/get-started/install#run-with-docker) covers the tags and a first `docker run`; the production essentials are:
+
+- **Pin a version tag** (`ghcr.io/sepp-org/sepp:1.2.3`) rather than `latest` or `master`, so each redeploy is deliberate.
+- **Persist the data volume.** Mount a named volume or host directory at `/sepp/sepp-data`, the image's `db_path`. Without it every job is lost when the container is removed. The directory is owned by uid `65532` (the image runs as non-root), so a bind mount must be writable by that user.
+- **The admin UI is loopback-bound inside the container**, so publishing its port is not enough. To reach it, bind `0.0.0.0` and set `[admin] keys`; see [admin UI in Docker](/docs/get-started/admin-ui#in-docker).
 
 ## systemd unit
 
+To run the binary directly on a host, supervise it with systemd. Run it as its own user, keep the data directory on a persistent path and give it time to drain on stop.
+
+```ini title="/etc/systemd/system/sepp.service"
+[Unit]
+Description=sepp job queue
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/sepp --config /etc/sepp/sepp.toml
+User=sepp
+Group=sepp
+Restart=on-failure
+# systemd sends SIGTERM on stop; allow in-flight RPCs to finish before SIGKILL.
+# Set this above your slowest job (see graceful shutdown below).
+TimeoutStopSec=120
+# Raise if you increase storage.max_cached_files.
+LimitNOFILE=65536
+# Creates and owns /var/lib/sepp; point db_path there.
+StateDirectory=sepp
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Set `server.db_path = "/var/lib/sepp"` (or a path under it) in the config so the state lands in the directory systemd manages.
+
 ## Kubernetes
+
+sepp is a single-node server with no clustering, so run it as a **single-replica StatefulSet** with a PersistentVolumeClaim for `db_path`. Do not scale past one replica: a second pod would open its own separate data directory, not share the first one.
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: sepp
+spec:
+  replicas: 1
+  serviceName: sepp
+  selector:
+    matchLabels: { app: sepp }
+  template:
+    metadata:
+      labels: { app: sepp }
+    spec:
+      terminationGracePeriodSeconds: 120   # above your slowest job
+      containers:
+        - name: sepp
+          image: ghcr.io/sepp-org/sepp:1.2.3
+          ports:
+            - { containerPort: 50051, name: grpc }
+            - { containerPort: 9464, name: metrics }
+          readinessProbe:
+            grpc: { port: 50051, service: sepp.v1.QueueService }
+          livenessProbe:
+            grpc: { port: 50051, service: sepp.v1.QueueService }
+          volumeMounts:
+            - { name: data, mountPath: /sepp/sepp-data }
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources: { requests: { storage: 10Gi } }
+```
+
+- **Config** goes in a ConfigMap mounted over `/etc/sepp/sepp.toml` or as `SEPP_` environment variables. Keep secrets (`auth.api_keys`, `admin.keys`) in a Secret, not the ConfigMap.
+- **Health probes** use the built-in gRPC health service; set the probe's `service` to `sepp.v1.QueueService`.
+- **Metrics**: enable `metrics.prometheus_enabled` and scrape port `9464` with a ServiceMonitor or a `prometheus.io/scrape` annotation.
+- **The admin UI** needs the same `0.0.0.0` bind plus keys as in Docker before a Service can reach it.
 
 ## Graceful shutdown & lease-expiry redelivery
 
+On `SIGTERM` or `Ctrl-C` the server stops accepting new connections, lets in-flight RPCs finish, wakes any long-polling reserves so they return promptly, then exits. The admin listener stops alongside it.
+
+What it does **not** do is hand back jobs that are already leased. A job a worker has reserved stays leased across the restart; it becomes ready again only when its lease expires (`max_lease_duration`, or the per-reserve `lease_duration`), at which point the new process redelivers it. There is no instant zero-loss drain, so:
+
+- Give the process a stop timeout longer than your slowest job (`TimeoutStopSec`, `terminationGracePeriodSeconds`) so in-flight RPCs finish cleanly instead of being killed.
+- Size lease durations with restarts in mind: a long lease means a longer wait before an interrupted job is retried.
+
+Delivery is at-least-once regardless: a crash or a kill mid-RPC can cause a job to be delivered again, so handlers must be idempotent. See [delivery guarantees](/docs/concepts/job-lifecycle#delivery-guarantees).
+
 ## Resource sizing
+
+sepp is modest by default and most workloads need no tuning. The levers, all under `[storage]` and restart-only, are documented in [Storage tuning](/docs/operations/configuration#storage-tuning):
+
+- **Memory** is dominated by the block cache (`cache_size_bytes`, roughly 20 to 25% of RAM for read-heavy use) plus whatever is in flight. Cap queue depth and payload size to keep that bound in check (see [Limits & quotas](/docs/operations/configuration#limits--quotas)).
+- **Disk** holds every persisted job plus LSM overhead, so size the volume for your peak backlog times the payload size, with headroom for compaction.
+- **File descriptors**: `max_cached_files` caps the open-file cache; keep it under the process `ulimit -n` (`LimitNOFILE` in systemd).
+- **CPU**: `worker_threads` sets fjall's flush and compaction threads (default is the smaller of the core count and 4).
 
 ## Upgrading & rollback
 
+sepp ships as one binary, so an upgrade is a stop-and-replace:
+
+<Steps>
+<Step>
+### Back up the data directory
+Take a cold copy or volume snapshot first (see below). The on-disk format can change between releases, so a backup is your only way back if you need to roll the binary back.
+</Step>
+<Step>
+### Stop, replace, start
+Stop the old process for a clean drain, swap the binary or image tag, then start the new one. Expect a brief unavailability window during the swap; clients should retry transient failures.
+</Step>
+<Step>
+### Verify
+Call `GetServerInfo` and check `server_version` and `supported_protocol_versions` to confirm the new build is up and speaks a protocol your clients use.
+</Step>
+</Steps>
+
+During 0.x, read the release notes for each version, since behaviour can change between minor releases. The wire protocol is versioned through `supported_protocol_versions`, so a client and server from nearby releases interoperate. Rolling the on-disk format backward is not guaranteed, which is why the pre-upgrade backup matters.
+
 ## Backing up the data directory
 
+sepp keeps all state under `db_path` in an LSM-tree (fjall). There is no online backup command. A plain `cp`, `rsync` or `tar` of a running server's `db_path` is unsafe: the copy is not point-in-time, so a concurrent flush or compaction can leave it referencing segment files the copy missed; the server then refuses to open it. Two safe options:
+
+- **Cold copy** — stop the server, then copy `db_path`. Once the process has exited the directory is at rest and internally consistent.
+- **Atomic volume snapshot** — an LVM, ZFS, btrfs or cloud-disk snapshot of the whole directory is crash-consistent and can be taken on a running server; sepp recovers it the same way it recovers from a restart.
+
+Restore by pointing `db_path` at the copy or the restored volume, then starting the server.

@@ -1,18 +1,82 @@
 ---
 title: "Running sepp"
-description: "What an operator needs to take the single binary from first run to production."
+description: "How to run sepp in a production capacity."
 ---
 
-{/* SCAFFOLD — layout only, no prose written yet. */}
-{/* TODO(content): Operator hub with a production-checklist orientation. Routes to config, security, durability, deploy, day-2 pages. Mention the admin UI as the operator's window into a running server (/docs/get-started/admin-ui). */}
+Although sepp is designed first and foremost to be simple to run, and easy to set up, there are a few things to consider when running it in production. This guide is intended to help you get started with running sepp in a production environment and to provide some best practices for doing so.
 
 ## The operator surface
 
-## Day-0 vs day-2 concerns
+The main way an operator interacts with sepp is through the configuration file, which is hot-reloaded on each save. This means that you can make configuration changes on the fly without incurring downtime. The [admin UI](/docs/get-started/admin-ui) is a convenient way to edit the configuration but you can also edit the file directly if you prefer. Make sure to first specify the login information for the admin UI in the configuration unless the server is listening on a local loopback address in which case no login is required.
 
-## Configuration at a glance
+```toml
+[admin]
+enabled = true
+
+# If listen_addr = 127.0.0.1:9465 for example, then no keys are required and admin access is granted by default.
+listen_addr = "192.168.1.100:9465"
+keys = [
+ { name = "admin", key = "generate-a-long-random-secret", role = "admin" },
+ { name = "engineer", key = "another-long-random-secret", role = "operator" },
+ { name = "auditor", key = "a-third-long-random-secret", role = "viewer" },
+]
+```
+
+The most common operation is to add, remove or change queues, especially when running in strict mode. Via the admin UI you can also inspect jobs in real-time, queue jobs manually, inspect dead-lettered jobs and more. See the [configuration reference](/docs/reference/configuration) for details on all the options available to you.
 
 ## Production checklist
 
+Work through these before taking real traffic.
+
+**Security & access**
+
+- Set `[auth] api_keys` so only known clients connect. [API keys](/docs/operations/security#api-key-authentication)
+- Serve gRPC over TLS. [Enabling TLS](/docs/operations/security#enabling-tls)
+- Give the admin UI keys and roles or disable it entirely. [Admin authentication](/docs/operations/security#admin-ui-authentication)
+- Front the admin port with HTTPS, either the built-in TLS or a terminating proxy.
+- Bind `metrics.prometheus_listen_addr` to a private interface; it defaults to `0.0.0.0:9464`.
+
+**Data & durability**
+
+- Persist the data directory (`db_path`) on a volume that survives restarts. [Deployment](/docs/operations/deployment#docker-image-and-data-volume)
+- Confirm the persist mode matches your loss tolerance; it is `SyncAll` by default. [Durability](/docs/operations/configuration#durability--persist-modes)
+- Have a backup plan: stop-and-copy or an atomic volume snapshot. Never copy a live `db_path`. [Backups](/docs/operations/deployment#backing-up-the-data-directory)
+
+**Limits & resource bounds**
+
+- Cap `limits.max_message_bytes` and per-queue `max_queue_depth` to bound memory; queue depth is unlimited by default. [Limits & quotas](/docs/operations/configuration#limits--quotas)
+
+**Operations**
+
+- Wire the gRPC health service into your liveness and readiness probes. [Health checks](/docs/observability#health-checks)
+- Set up tracing and metrics collection. [Observability](/docs/observability)
+- Enable dead-letter retention, then decide a triage process; retention is off by default. [Dead-letter management](/docs/operations/dead-letter-management#enabling-retention)
+
 ## Where to next
 
+<Cards>
+  <Card
+    href="/docs/operations/deployment"
+    title="Deployment"
+    description="Docker, systemd, graceful shutdown and backups."
+    icon={<IconTerminal size={18} />}
+  />
+  <Card
+    href="/docs/operations/security"
+    title="Authentication & TLS"
+    description="API keys, TLS and admin roles."
+    icon={<IconLayers size={18} />}
+  />
+  <Card
+    href="/docs/operations/configuration"
+    title="Configuration"
+    description="Limits, durability and storage tuning."
+    icon={<IconBolt size={18} />}
+  />
+  <Card
+    href="/docs/observability"
+    title="Observability"
+    description="Metrics, traces, logs and health."
+    icon={<IconBook size={18} />}
+  />
+</Cards>

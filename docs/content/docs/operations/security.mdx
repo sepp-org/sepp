@@ -3,23 +3,132 @@ title: "Authentication & TLS"
 description: "Enable API-key authentication and serve gRPC over TLS."
 ---
 
-{/* SCAFFOLD — layout only, no prose written yet. */}
-{/* TODO(content): Security how-to. [auth] api_keys tri-state (omitted = allow all; non-empty list = only those; empty [] = deny all). TLS needs both tls_cert_path and tls_key_path or neither. Always use keys over TLS. Key rotation IS hot-reloadable (verified: interceptor.set_keys on reload). */}
-{/* TODO(content): Admin UI auth. [admin] keys = named keys with roles (viewer < operator < admin, role defaults to admin); omitted = auth off, loopback binds only. Login with name + key sets an HttpOnly SameSite=Strict session cookie (session_ttl_ms, default 12h); Bearer <key> works for curl. Key rotation hot-reloads and signs sessions out. GET /config redacts auth.api_keys to a count and admin.keys to names+roles; admin.keys cannot be edited via the admin API. Non-loopback bind requires keys; serve HTTPS via admin.tls_cert_path/tls_key_path (restart-only, independent of the gRPC certs, may point at the same files; session cookie gains Secure) or terminate TLS in a fronting proxy. Mutations are audit-logged under the sepp::audit tracing target with actor + role; failed logins audit as session.login_failed. */}
+Sepp has two independent authentication planes: API keys gate the gRPC job API and a separate set of keys gates the admin UI. You can enable either without the other.
 
 ## API key authentication
 
+The gRPC API (enqueue, reserve, ack and everything else clients call) is gated by `[auth] api_keys`, a list of bearer secrets. It is off by default: a fresh server accepts any client that can reach the port.
+
+```toml
+[auth]
+api_keys = ["a-long-random-secret", "a-second-for-rotation"]
+```
+
+Each first-party client takes the key as a connect option and sends it as an `authorization: Bearer <key>` header on every request:
+
+<LangTabs items={['Rust', 'Python', 'TypeScript']} groupId="client">
+
+```rust
+use sepp_rs::client::SeppClient;
+
+let client = SeppClient::builder("https://sepp.example.com:50051")
+    .api_key("a-long-random-secret")
+    .tls() // requires the `tls` feature
+    .connect()
+    .await?;
+```
+
+```python
+from sepp import SeppClient
+
+client = await SeppClient.connect(
+    "sepp.example.com:50051",
+    api_key="a-long-random-secret",
+    tls=True,
+)
+```
+
+```typescript
+import { SeppClient } from "sepp";
+
+const client = await SeppClient.connect("https://sepp.example.com:50051", {
+  apiKey: "a-long-random-secret",
+});
+```
+
+</LangTabs>
+
+A request with no key or an unrecognized one is rejected with `UNAUTHENTICATED`. The keys are opaque, so generate long random values and treat them like passwords. They are unrelated to the admin UI keys covered [below](#admin-ui-authentication).
+
+<Callout type="warn" title="An open gRPC port accepts any client">
+With `api_keys` unset, anyone who can reach the port can enqueue, reserve and delete jobs. Set keys before exposing sepp beyond a trusted network and pair them with TLS so the key is not sent in the clear.
+</Callout>
+
 ## Key allow-list semantics
+
+`api_keys` is a tri-state:
+
+| `api_keys` | Effect |
+| --- | --- |
+| omitted | Authentication off; every request is allowed. |
+| a non-empty list | Only the listed keys are accepted. |
+| `[]` (empty list) | Every request is rejected. |
+
+The empty list is a deliberate "deny all" you can use to seal the gRPC plane. Every listed key is equivalent; list more than one so you can rotate without a gap (see [Rotating keys](#rotating-keys-with-hot-reload)).
 
 ## Enabling TLS
 
+Serve the gRPC API over TLS by pointing `server.tls_cert_path` and `server.tls_key_path` at a PEM certificate and private key. Set both or neither; one without the other is rejected at load. Both are restart-only.
+
+```toml
+[server]
+tls_cert_path = "/etc/sepp/tls/server.crt"
+tls_key_path  = "/etc/sepp/tls/server.key"
+```
+
+Clients then connect over TLS and must trust the certificate's CA, so a self-signed certificate means distributing it to every client. This is the gRPC listener's TLS only; the admin UI has its own, independent settings.
+
 ## Keys over plaintext warning
+
+API keys are bearer tokens: the `Bearer` header is sent on every request and grants access to whoever holds it. Without TLS that secret crosses the network in cleartext, where anyone on the path can read and replay it. Always enable TLS alongside keys on any network you do not fully trust, or terminate TLS in a proxy in front of sepp.
 
 ## Rotating keys with hot reload
 
+`auth.api_keys` is hot-reloadable. Editing the list takes effect on the next request, with no restart and no dropped connections. To rotate without a gap:
+
+1. Add the new key to the list alongside the old one and save.
+2. Move clients over to the new key.
+3. Remove the old key and save.
+
+Removing a key takes effect immediately, so anything still presenting it starts getting `UNAUTHENTICATED`.
+
 ## Admin UI authentication
+
+The admin UI authenticates against its own `[admin] keys`, a list of named keys that each carry a role. These are separate from the gRPC `api_keys`.
+
+```toml
+[admin]
+listen_addr = "0.0.0.0:9465"
+keys = [
+  { name = "ops", key = "a-long-random-secret", role = "admin" },
+  { name = "ci",  key = "another-secret",       role = "operator" },
+]
+```
+
+- **Omitting `keys` turns admin auth off**, which is only allowed when the listener is bound to a loopback address. A non-loopback bind with no keys is rejected at startup. The bound address is fixed at boot, so deleting the keys from a live, non-loopback server fails closed (requests return "restart required") rather than silently opening the UI to the network.
+- **Browser login** takes a name and key, which must match the same entry. On success the server sets an `HttpOnly`, `SameSite=Strict` session cookie that lasts `session_ttl_ms` (default 12 hours).
+- **Scripts** can skip the login and send the key directly as an `Authorization: Bearer <key>` header on each request.
+- **Failed logins** are delayed briefly and recorded in the [audit log](#audit-log).
+
+Serve the UI over HTTPS with `admin.tls_cert_path` and `admin.tls_key_path` (restart-only, independent of the gRPC certificates and free to point at the same files), or terminate TLS in a fronting proxy or SSH tunnel. The session cookie is marked `Secure` only when this listener terminates TLS itself; behind a proxy the final hop is plain HTTP, so the flag stays off. See [Deployment](/docs/operations/deployment) for the proxy setup.
+
+Secrets are never exposed through the UI: the config endpoint reports `auth.api_keys` as a count and `admin.keys` as names and roles only. `admin.keys` also cannot be edited through the admin API; change them in `sepp.toml` on the server.
 
 ## Admin roles
 
+Roles are strictly ordered: **viewer < operator < admin**. A key's `role` defaults to `admin` when omitted.
+
+| Role | Allowed actions |
+| --- | --- |
+| `viewer` | Read-only: dashboards, queue and job inspection, the redacted config and the live SSE stream. |
+| `operator` | Everything a viewer can do, plus job-level mutations: enqueue, dead-letter, requeue and delete dead letters. |
+| `admin` | Everything an operator can do, plus config-level changes: create, update and delete queues, and edit the config. |
+
+A request whose role is too low gets `403 Forbidden`; an unauthenticated one gets `401 Unauthorized`. Roles are read live from the config on every request, so changing a key's role applies immediately to existing sessions, with no re-login. Rotating a key's secret signs out any session that was established with the old value.
+
 ## Audit log
+
+Every successful admin mutation and every login attempt is written to the `sepp::audit` tracing target, one line each, carrying the actor (the key's name), its role and the action. The action labels are values like `job.enqueue`, `queue.put`, `queue.delete`, `config.put`, `session.login` and `session.login_failed`. When admin auth is off on a loopback bind, the actor is `local`.
+
+Only mutations and logins are audited, not reads. Key secrets never appear in the log. Because it is a dedicated tracing target, you can route `sepp::audit` to its own sink independent of the rest of the logs; see [Observability](/docs/observability).
 
