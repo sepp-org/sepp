@@ -1,20 +1,110 @@
 ---
 title: "Metrics"
-description: "Export OTel metrics or scrape Prometheus, and read the job, queue-depth, and request metrics sepp emits."
+description: "How sepp exposes metrics over OTLP and Prometheus."
 ---
 
-{/* SCAFFOLD — layout only, no prose written yet. */}
-{/* TODO(content): Metrics how-to + catalogue. [metrics] OTLP push (otlp_endpoint, export_interval_ms) and a SEPARATE Prometheus listener (prometheus_listen_addr default 0.0.0.0:9464, distinct from the gRPC port). Catalogue (verified in src/metrics.rs): counters sepp.requests, sepp.jobs.enqueued/reserved/acked/nacked/dead_lettered/deduplicated/rejected, sepp.reserve.empty, sepp.sweep.promotions/lease_redeliveries/dedup_expirations, sepp.dead_letters.expired/drained; histograms sepp.request.duration, sepp.commit.duration; gauges sepp.queue.ready/scheduled/inflight (labeled per queue) and sepp.command_queue.depth. */}
+Sepp publishes metrics through two independent channels: OTLP push to a collector and a Prometheus scrape endpoint. You can enable either, both or neither.
+
+The `[metrics]` section requires a restart to apply. All fields, with their defaults:
+
+```toml
+[metrics]
+enabled = false
+otlp_endpoint = "http://localhost:4317"
+export_interval_ms = 5000
+prometheus_enabled = false
+prometheus_listen_addr = "0.0.0.0:9464"
+```
 
 ## Enabling OTLP metrics
 
+Set `enabled = true` and sepp will push metrics to the OpenTelemetry collector at `otlp_endpoint` every `export_interval_ms` milliseconds. Both the counter and histogram instruments and the observable gauges are exported. The collector sees the same catalogue described below regardless of whether it arrives via OTLP or Prometheus.
+
+The `otlp_endpoint` defaults match the collector's standard gRPC receiver, so if you run the collector locally on the default port no further wiring is needed. Point it elsewhere to talk to a sidecar or a hosted backend that accepts OTLP.
+
 ## Prometheus scrape endpoint
 
-## Job and request metrics
+Set `prometheus_enabled = true`. Sepp opens a plain HTTP/1.1 listener on `prometheus_listen_addr` and serves `GET /metrics` in the standard Prometheus exposition format.
 
-## Queue-depth gauges
+The endpoint carries no authentication. Bind it to a private interface (e.g. `127.0.0.1:9464`) when the host is reachable from multiple networks and configure Prometheus to scrape it:
 
-## Command-queue and commit metrics
+```yaml
+scrape_configs:
+  - job_name: sepp
+    static_configs:
+      - targets: ["localhost:9464"]
+```
+
+OTLP and Prometheus are independent. Enabling both is fine — the Prometheus reader and the OTLP periodic reader coexist inside the same meter provider and both see every instrument.
+
+## Metric catalogue
+
+Every metric is prefixed `sepp.` and tagged with labels where shown. Counters are cumulative since the process started; histograms record milliseconds; gauges are point-in-time snapshots polled by the exporter.
+
+### Job lifecycle counters
+
+These track jobs as they move through the queue. All are labeled with `queue`.
+
+| Metric | Type | Labels | Description |
+| --- | --- | --- | --- |
+| `sepp.jobs.enqueued` | Counter | `queue` | Jobs accepted for enqueue (excludes duplicates, includes scheduled) |
+| `sepp.jobs.reserved` | Counter | `queue` | Jobs handed to a worker |
+| `sepp.jobs.acked` | Counter | `queue` | Jobs acknowledged as complete |
+| `sepp.jobs.nacked` | Counter | `queue` | Jobs nacked (retried or dead-lettered) |
+| `sepp.jobs.dead_lettered` | Counter | `queue`, `cause` | Jobs moved to the dead-letter store. `cause` is one of: `attempts_exhausted`, `rejected` (worker forced it), `lease_expired`, `admin` |
+| `sepp.jobs.deduplicated` | Counter | `queue` | Enqueues that matched an active idempotency key |
+| `sepp.jobs.rejected` | Counter | `queue`, `reason` | Enqueues rejected at validation before reaching the committer. `reason` is one of: `unknown_queue`, `payload_too_large`, `encoding_not_allowed`, `job_type_not_allowed`, `custom_entries_too_many`, `custom_map_too_large`, `custom_key_too_long`, `queue_name_too_long`, `job_type_name_too_long`, `idempotency_key_too_long`, `scheduled_too_far`, `invalid_request`, `queue_full`, `queue_closing` |
+
+### Reserve and sweep counters
+
+| Metric | Type | Labels | Description |
+| --- | --- | --- | --- |
+| `sepp.reserve.empty` | Counter | `queue` | A reserve call returned no jobs for this queue |
+| `sepp.sweep.promotions` | Counter | `queue` | Scheduled jobs whose time arrived and were moved to ready |
+| `sepp.sweep.lease_redeliveries` | Counter | `queue` | Leases that expired and the job was put back in ready |
+| `sepp.sweep.dedup_expirations` | Counter | `queue` | Idempotency keys that aged out of their dedup window |
+| `sepp.dead_letters.expired` | Counter | — | Dead-letter records pruned by retention expiry |
+| `sepp.dead_letters.drained` | Counter | — | Dead-letter records wiped by an admin drain |
+
+### Request metrics
+
+| Metric | Type | Labels | Description |
+| --- | --- | --- | --- |
+| `sepp.requests` | Counter | `method`, `outcome` | gRPC calls. `method` is the RPC name (`enqueue_batch`, `reserve`, etc.). `outcome` is `ok` or `error` |
+| `sepp.request.duration` | Histogram | `method` | RPC wall-clock time in milliseconds |
+
+### Queue-depth gauges
+
+Each gauge emits a data point per queue with a `queue` label.
+
+| Metric | Type | Description |
+| --- | --- | --- |
+| `sepp.queue.ready` | Gauge | Jobs available for immediate reservation |
+| `sepp.queue.scheduled` | Gauge | Jobs waiting for their `scheduled_at` time |
+| `sepp.queue.inflight` | Gauge | Jobs currently leased to a worker |
+| `sepp.queue.dead_lettered` | Gauge | Jobs in the dead-letter store |
+
+### Commit and command-queue metrics
+
+| Metric | Type | Labels | Description |
+| --- | --- | --- | --- |
+| `sepp.commit.duration` | Histogram | — | Time spent inside one committer cycle (apply + fsync) in milliseconds |
+| `sepp.command_queue.depth` | Gauge | — | Number of pending commands waiting for the committer thread. Spikes under burst load; sustained elevation means write throughput is saturated |
+
+## How cycle metrics flush
+
+Job counts aren't incremented one-by-one on the hot path. The committer accumulates per-cycle deltas — how many enqueues, reserves, acks, etc. happened in one commit — and flushes them to the OTel instruments in a batch after the cycle finishes. This means counters update at the cadence of the committer (typically tens of milliseconds), not every individual operation and a single cycle's worth of data is atomic from the collector's perspective.
+
+Queue-depth gauges are refreshed the same way: the committer snapshots the in-memory indexes after each cycle and stores the snapshot behind an `ArcSwap`. The gauge callbacks read the latest snapshot at export time, so the gauges always reflect the state as of the last completed commit.
 
 ## Building a dashboard
 
+The counters and gauges above give you enough to build the essential panels:
+
+- **Job throughput** — rate of `sepp.jobs.enqueued` and `sepp.jobs.acked` stacked, broken down by `queue`. A gap between enqueue and ack rate is your backlog growing.
+- **Queue health** — `sepp.queue.ready` as a timeseries per queue, overlaid with `sepp.queue.inflight`. Inflight climbing while ready stays flat means jobs are taking too long to process.
+- **Error signals** — `sepp.jobs.rejected` by `reason` (a spike in `queue_full` means you hit a depth cap) and `sepp.jobs.dead_lettered` by `cause` (a spike in `lease_expired` suggests workers are too slow or crashing).
+- **Latency** — `sepp.request.duration` p50/p95/p99 per `method` and `sepp.commit.duration` p95 to spot storage contention.
+- **Backpressure** — `sepp.command_queue.depth`. A healthy server hovers near zero. Sustained elevation means the committer can't keep up with write load.
+
+The admin UI dashboard gives you the live state without any setup. Prometheus and Grafana give you history, retention and alert rules. See the [observability overview](/docs/observability) for wiring them together.

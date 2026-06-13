@@ -1,20 +1,208 @@
 ---
 title: "Distributed tracing"
-description: "Export OTLP traces and follow a job across producer, server, and worker."
+description: "Export OTLP traces and follow a job across producer, server and worker."
 ---
 
-{/* SCAFFOLD — layout only, no prose written yet. */}
-{/* TODO(content): Tracing how-to (server) + merged client-side propagation. [tracing] enabled/otlp_endpoint/sample_ratio/service_name. Head sampling vs inherited caller context (always honored). ABSORBED client-side propagation (was clients/tracing-propagation): the enqueue RPC's traceparent gRPC metadata is extracted server-side (set_parent_from_metadata) so the call nests in the caller's trace; EnqueueRequest.trace_context (traceparent/tracestate) is stored on the job and the worker's processing span is LINKED to it (link_from_proto — a span link, not a parent, because it runs later); clients auto-inject from the active OTel span (current_trace_context). View in Jaeger/collector. */}
+Sepp propagates W3C trace context end-to-end: from the producer that enqueues a job, through the server that stores and delivers it, to the worker that processes it. The server exports OpenTelemetry spans over OTLP and the client SDKs inject trace context into every call automatically when an OTel tracer is active.
+
+The `[tracing]` section requires a restart to apply. All fields, with their defaults:
+
+```toml
+[tracing]
+enabled = false
+otlp_endpoint = "http://localhost:4317"
+service_name = "sepp"
+sample_ratio = 1.0
+```
 
 ## Enabling tracing
 
-## OTLP exporter and sampling
+Set `enabled = true`. Sepp spins up an OTLP gRPC span exporter pointed at `otlp_endpoint`, registers the W3C `TraceContextPropagator` globally for context extraction and injection and layers an `opentelemetry-tracing` subscriber over the normal logging subscriber. Both layers run together — logs go to stderr as before, spans go to the collector.
 
-## End-to-end trace propagation
+The span exporter batches asynchronously, so tracing overhead on the request path is a small allocation for the span's structured fields plus the eventual gRPC push.
+
+## Sampling
+
+Sepp uses a `ParentBased(TraceIdRatioBased)` sampler. This means:
+
+- **Inherited decisions are always honored.** If the caller's trace is already being sampled, the server span is sampled too regardless of `sample_ratio`.
+- **Head sampling** applies only when the server roots a new trace (no incoming trace context). The `sample_ratio` controls what fraction of those are kept. At `1.0` (the default) every head trace is exported.
+
+In practice, if your producers and workers are also instrumented, the sampling decision made at the producer cascades through the entire chain.
+
+## How trace context flows
+
+The context travels two paths in parallel:
+
+### gRPC metadata (immediate parent)
+
+Every RPC carries `traceparent` and `tracestate` as gRPC metadata headers. When the server receives a call it extracts them and sets the incoming context as the parent of the RPC span. This gives you the standard nested view: the producer's enqueue span contains the server's `sepp.enqueue` span.
+
+### Protobuf `TraceContext` on the job (deferred link)
+
+The enqueue request also carries a `TraceContext` in the protobuf body. The server stamps it onto the stored job and when the job is later reserved for delivery the server creates a `sepp.deliver` span with a **span link** back to the producer's context. It is not a parent, because the delivery happens later and the original RPC is long closed. The worker then links its own processing span to the delivery span.
+
+This diagram shows the full chain:
+
+<Mermaid chart={`
+sequenceDiagram
+  participant P as Producer App
+  participant S as sepp server
+  participant W as Worker App
+
+  P->>S: Enqueue RPC<br/>metadata: traceparent<br/>body: trace_context
+  S->>S: sepp.enqueue span<br/>(parented via metadata)
+  S->>S: stores trace_context on job
+
+  Note over P,W: ... later (reserve) ...
+
+  W->>S: Reserve RPC
+  S->>S: sepp.deliver span<br/>(link ← stored trace_context)
+  S->>W: Job + trace_context
+  W->>W: sepp.process span<br/>(link ← delivery trace_context)
+`} />
+
+- **Producer → Server:** `traceparent` in gRPC metadata → parent relation. `trace_context` on the job → stored for later linking.
+- **Server internally:** `link_from_proto` attaches the job's stored trace as a link on delivery, promotion, nack and dead-letter spans. Each of those spans then captures its own context via `current_trace_context` and stamps it back on the job, so the next internal operation links to the *most recent* server span, not just the original enqueue.
+- **Server → Worker:** The job returned from a `Reserve` carries a `trace_context`. The worker creates a CONSUMER span with a span link to that context.
 
 ## Client trace propagation
 
-## Service name and resource attributes
+All three client SDKs handle propagation automatically when an OpenTelemetry tracer is active. There is no separate configuration.
+
+### Rust
+
+The `opentelemetry` Cargo feature is on by default. Every RPC call injects `traceparent`/`tracestate` into gRPC metadata and enqueue calls additionally stamp the trace context onto each job in the protobuf body.
+
+```rust
+use opentelemetry_sdk::trace::SdkTracerProvider;
+use opentelemetry_otlp::SpanExporter;
+use tracing_opentelemetry::OpenTelemetryLayer;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::Registry;
+
+// Set up the OTel pipeline (just once at startup)
+let exporter = SpanExporter::builder().with_tonic().build()?;
+let provider = SdkTracerProvider::builder()
+    .with_batch_exporter(exporter)
+    .build();
+let tracer = provider.tracer("my-producer");
+
+let subscriber = Registry::default()
+    .with(OpenTelemetryLayer::new(tracer));
+tracing::subscriber::set_global_default(subscriber)?;
+
+// Enqueue — the active span's context is injected automatically
+#[tracing::instrument(skip(client, payload), fields(otel.kind = "producer"))]
+async fn publish(
+    client: &Client,
+    payload: Payload,
+) -> Result<EnqueueAck, sepp_client::EnqueueError> {
+    let request = EnqueueRequest::new("emails", "welcome")?.with_payload(payload);
+    client.enqueue(request).await
+}
+```
+
+On the worker side, the `sepp-rs` worker creates a `sepp-rs.process` span for every job with a span link back to the server's delivery context:
+
+```rust
+use sepp_client::worker::Worker;
+use tracing::instrument;
+
+let worker = Worker::new(client.clone(), ["emails"], Duration::from_secs(30))?
+    .handle("welcome", |payload, ctx| async move {
+        handle_welcome(payload, ctx).await
+    })?;
+
+#[instrument(skip(payload), fields(job_id = %ctx.id))]
+async fn handle_welcome(
+    payload: Payload,
+    ctx: JobContext,
+) -> Result<(), sepp_client::Error> {
+    // The surrounding sepp-rs.process span is already active —
+    // it links back to the producer's trace.
+    send_email(&payload).await?;
+    Ok(())
+}
+```
+
+### Python
+
+Install the optional OTel dependencies: `pip install sepp[otel]`.
+
+```python
+from opentelemetry import trace
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+# Set up the OTel pipeline
+provider = TracerProvider()
+provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
+trace.set_tracer_provider(provider)
+tracer = trace.get_tracer("my-producer")
+
+client = sepp.Client("http://localhost:50051")
+
+# Enqueue — trace context is injected into both gRPC metadata and the job body
+with tracer.start_as_current_span("my-producer.publish"):
+    ack = client.enqueue(EnqueueRequest("emails", "welcome", payload=payload))
+```
+
+The worker creates a `sepp.process` CONSUMER span linked to the delivery context:
+
+```python
+worker = Worker(client, ["emails"], lease_duration=timedelta(seconds=30))
+
+@worker.handler("welcome")
+async def send_welcome(payload, ctx: JobContext) -> None:
+    with tracer.start_as_current_span("handle_welcome"):
+        await send_email(payload)
+```
+
+### TypeScript
+
+Add `@opentelemetry/api` as a dependency (the SDK loads it lazily — no import means no error). The client calls `loadOtel()` on connect to make the OTel API available.
+
+```typescript
+import { trace, context, SpanKind } from "@opentelemetry/api";
+import { Client, EnqueueRequest, Payload, Worker } from "@sepp/sh";
+
+const client = new Client("http://localhost:50051");
+
+// Enqueue inside a span
+const tracer = trace.getTracer("my-producer");
+const span = tracer.startSpan("my-producer.publish", { kind: SpanKind.PRODUCER });
+await context.with(trace.setSpan(context.active(), span), async () => {
+  const ack = await client.enqueue(
+    new EnqueueRequest({ queue: "emails", jobType: "welcome", payload: Payload.text("hello") }),
+  );
+});
+span.end();
+```
+
+The worker creates a `sepp.process` CONSUMER span with a link back to the delivery context:
+
+```typescript
+const worker = new Worker(client, { queues: ["emails"], leaseDuration: 30_000 })
+  .handle("welcome", async (payload, ctx) => {
+    // ctx.traceContext is available for manual span creation if needed,
+    // but the worker already creates a sepp.process CONSUMER span.
+    console.log(`handling job ${ctx.id}`);
+  });
+```
+
+All three SDKs follow the same pattern: capture the current trace context, inject it into gRPC metadata and the job body on enqueue, then create a CONSUMER span with a span link when processing. No manual propagation code needed.
 
 ## Viewing traces
 
+Point the collector at Jaeger or Tempo and you will see a trace that spans the producer, server and worker:
+
+- **`my-producer.publish`** (PRODUCER) → **`sepp.enqueue`** (SERVER) — parent/child through gRPC metadata
+- **`sepp.deliver`** (SERVER) — linked to `my-producer.publish` via the job's stored trace context
+- **`sepp.process`** (CONSUMER, from the worker SDK) — linked to `sepp.deliver`
+- **`handle_welcome`** — your own span, nested under `sepp.process`
+
+The server also creates internal spans that link to the job's trace: `sepp.promote` when a scheduled job fires, `sepp.dead_letter` when a lease expires with no retries left, `sepp.redeliver` when a lease expires but retries remain and `sepp.ack`/`sepp.nack`/`sepp.extend` for the worker's lifecycle calls. These show up in the same trace view, connected by span links.
+
+Run the OpenTelemetry Collector with the OTLP receiver on `0.0.0.0:4317` and a Jaeger exporter, then browse `http://localhost:16686`. The [observability overview](/docs/observability#recommended-stack) has the wiring diagram.

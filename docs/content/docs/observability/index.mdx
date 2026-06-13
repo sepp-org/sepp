@@ -1,19 +1,152 @@
 ---
 title: "Observability overview"
-description: "How sepp exposes metrics, traces, logs, and health — and a recommended stack."
+description: "How sepp exposes metrics, traces and logs."
 ---
 
-{/* SCAFFOLD — layout only, no prose written yet. */}
-{/* TODO(content): Observability hub + merged logging + health. The four signals and a Prometheus + OTel collector + Grafana setup. ABSORBED logging: [logging] level directive (e.g. info,sepp=debug) + RUST_LOG override; text vs json for aggregators; notable lines (startup/ready, hot reload, restart-only warning, shutdown). ABSORBED health: tonic health service alongside QueueService; probe wiring; relationship to the Prometheus endpoint. Metrics and tracing keep their own pages. OPEN QUESTION: ship a blessed Grafana dashboard / Prometheus rules? */}
-{/* TODO(content): Position the admin UI dashboard under "What sepp exposes": the zero-setup live view (per-queue depths, rates, last 60s over SSE) for looking at the server right now; Prometheus + Grafana for retention, history and alerting. Link /docs/get-started/admin-ui. */}
+Sepp is developed with observability in mind, including distributed tracing between the clients and server out of the box. It exposes metrics, traces and logs via OpenTelemetry. Prometheus metrics are also available via a separate endpoint. The admin UI provides a live view of the server state, including queue depths and rates, and can be used to inspect jobs in real-time.
 
 ## What sepp exposes
 
+Sepp gives you four signals:
+
+| Signal | Transport | Zero setup? | Purpose |
+| --- | --- | --- | --- |
+| **Admin UI dashboard** | SSE over HTTP | Yes — on by default at `127.0.0.1:9465` | Live queue depths, per-second rates and a 60-second sparkline |
+| **Metrics** | OTLP push **and/or** Prometheus scrape | Off by default; enable `metrics.enabled` or `metrics.prometheus_enabled` | Per-queue counters and gauges, request latency histograms, commit duration |
+| **Tracing** | OTLP (gRPC) | Off by default; enable `tracing.enabled` | End-to-end spans from producer through server to worker, with W3C trace context propagation across hops |
+| **Logs** | `stderr` | Yes, duh | Standard application state monitoring. Supports both text and JSON. |
+
+The admin UI dashboard is the zero-setup way to look at the server *right now*. It streams queue depths and per-second rates over [SSE](/docs/get-started/admin-ui#what-you-can-do) once a second.
+
+For retention, history and alerting you will something more heavyweight like Prometheus and Grafana. Sepp can push metrics and traces to an OpenTelemetry Collector, which can then export to your backend of choice. The Prometheus scrape endpoint is also available if you prefer that model for metrics.
+
 ## Recommended stack
+
+A production setup might look something like this:
+
+<Mermaid chart={`
+flowchart LR
+  subgraph sepp["sepp"]
+    direction LR
+    OTLP("OTLP exporter")
+    PM("GET /metrics")
+    LOG("stderr")
+    AD("admin UI")
+  end
+
+  subgraph Collector["OpenTelemetry Collector"]
+    direction TB
+    OTLPR("OTLP receiver")
+    PR["Prometheus<br/>exporter"]
+    JE["Jaeger / Tempo<br/>exporter"]
+  end
+
+  Prom("Prometheus")
+  Graf("Grafana")
+  Jaeger("Jaeger / Tempo")
+  Aggregator("Log aggregator")
+  Browser("Browser")
+
+  OTLP -- "gRPC, traces + metrics" --> OTLPR
+  OTLPR --> JE --> Jaeger
+  OTLPR --> PR --> Prom
+  Prom --> Graf
+  PM -- "scrape" --> Prom
+  LOG --> Aggregator
+  AD -- "dashboard" --> Browser
+`} />
+
+- **Collector** — run an [OpenTelemetry Collector](https://opentelemetry.io/docs/collector/) as a sidecar or daemon. Give it an OTLP receiver on `0.0.0.0:4317` and exporters for your backend. Both `tracing.otlp_endpoint` and `metrics.otlp_endpoint` default to `http://localhost:4317`, matching the collector's gRPC receiver out of the box.
+- **Prometheus** — scrape `metrics.prometheus_listen_addr` (default `0.0.0.0:9464`) at `GET /metrics`. The endpoint serves the standard Prometheus exposition format and requires no authentication. Bind it to a private interface when the host is multi-homed.
+- **Grafana** — point it at Prometheus and visualize the counters and gauges sepp publishes. The [metrics catalogue](/docs/observability/metrics#job-and-request-metrics) lists every metric with its labels.
+- **Log aggregation** — switch `logging.format` to `"json"` and ship stderr to Loki, Elasticsearch or your aggregator of choice.
 
 ## Logging
 
+Logging is configured under `[logging]` and requires a restart to change. Two knobs:
+
+```toml
+[logging]
+level = "info,lsm_tree=warn,fjall=warn"
+format = "text"
+```
+
+### Level directives
+
+The `level` field accepts an [`EnvFilter`](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html) directive string. A bare level like `"warn"` applies everywhere. A directive like `"info,sepp=debug"` sets the default to `info` but traces the `sepp` target at `debug`. The default filters out the LSM storage engine's internal chatter while keeping sepp's own output at `info`.
+
+`RUST_LOG` takes precedence when set in the environment, so prefer the config file for stability and an env var for one-off debugging:
+
+```bash
+RUST_LOG=debug ./sepp
+```
+
+### Formats
+
+| Format | Output | Use when |
+| --- | --- | --- |
+| `text` (default) | Human-readable, single-line | You are developing or running ad-hoc |
+| `json` | JSON-structured lines with `timestamp`, `level`, `target`, `fields` and `message` | A log aggregator will index the output |
+
+### Audit logs
+
+As it currently stands, the actions performed via the admin UI are logged to the same output as the rest of the server. The `target` field is set to `sepp::audit` for these events, so you can filter them out or route them to a separate sink in your aggregator.
+
 ## Health checks
+
+Sepp registers the gRPC [health checking protocol](https://github.com/grpc/grpc/blob/master/doc/health-checking.md) on the same port as the QueueService. The service name is the fully qualified gRPC symbol. A client calls `grpc.health.v1.Health/Check`:
+
+```bash
+grpcurl -plaintext localhost:50051 grpc.health.v1.Health/Check
+# { "status": "SERVING" }
+```
+
+This is the endpoint to wire into your orchestration probes:
+
+- **Liveness** — call `Health/Check`. If it responds `SERVING` the gRPC server is accepting connections. A failure means the process is unhealthy and should be restarted.
+- **Readiness** — same call. Sepp reports `SERVING` as soon as the server binds and the committer starts. There is no separate "not ready" state: once the listener is up, the server can accept and queue requests.
+
+The health endpoint is served alongside QueueService on the same gRPC server, behind the same TLS if enabled but the health service itself is not gated by the API-key interceptor — probes work without sending an `authorization` header.
 
 ## Wiring it together
 
+Putting the pieces side by side, here is how the observability surface maps to each listener:
+
+| Purpose | Transport | Default listen address | Config section |
+| --- | --- | --- | --- |
+| gRPC + health | HTTP/2 with optional TLS | `0.0.0.0:50051` | `[server]` |
+| Admin UI + API + SSE | HTTP/1.1 with optional TLS | `127.0.0.1:9465` | `[admin]` |
+| Prometheus `/metrics` | HTTP/1.1, plain | `0.0.0.0:9464` | `[metrics]` |
+| OTLP traces | gRPC, plain | *outbound* to `localhost:4317` | `[tracing]` |
+| OTLP metrics | gRPC, plain | *outbound* to `localhost:4317` | `[metrics]` |
+
+Each listener/export is independent so enable only what you need. A minimal production setup enables the admin UI on a private bind, Prometheus for dashboards and the gRPC health check for your orchestrator.
+
+## Where to next
+
+<Cards>
+  <Card
+    href="/docs/observability/metrics"
+    title="Metrics"
+    description="OTLP export, Prometheus scrape endpoint and the full metric catalogue."
+    icon={<IconBook size={18} />}
+  />
+  <Card
+    href="/docs/observability/tracing"
+    title="Distributed tracing"
+    description="End-to-end span propagation across producers, server and workers."
+    icon={<IconBook size={18} />}
+  />
+  <Card
+    href="/docs/get-started/admin-ui"
+    title="Admin UI"
+    description="The zero-setup live dashboard with per-queue depths, rates and sparklines."
+    icon={<IconBook size={18} />}
+  />
+  <Card
+    href="/docs/operations/configuration"
+    title="Configuration"
+    description="The logging, tracing and metrics sections in sepp.toml."
+    icon={<IconBook size={18} />}
+  />
+</Cards>
