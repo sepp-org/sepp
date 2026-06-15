@@ -19,11 +19,11 @@
   </p>
 
   <p>
-    <a href="#building">Install</a>
+    <a href="https://sepp-org.github.io/sepp/docs/get-started/install/">Install</a>
     ·
-    <a href="proto/queue.proto">Protocol</a>
+    <a href="https://buf.build/sepp-org/sepp-proto/docs/main%3Asepp.v1">Protocol</a>
     ·
-    <a href="https://docs.rs/sepp">Docs</a>
+    <a href="https://sepp-org.github.io/sepp/docs/">Docs</a>
     ·
     <a href="https://github.com/sepp-org/sepp/issues">Issues</a>
   </p>

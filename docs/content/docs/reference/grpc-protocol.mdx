@@ -1,20 +1,14 @@
 ---
 title: "gRPC protocol"
-description: "The QueueService RPCs, request/response messages, and field semantics."
+description: "The wire format of sepp."
 ---
 
-{/* SCAFFOLD — layout only, no prose written yet. */}
-{/* TODO(content): Normative protocol reference from queue.proto. All 8 RPCs; every message/field incl. worker_id (Reserve/Ack/Nack/Extend), NackRequest.reason, full DeadLetterRecord (cause/failed_at/final_attempt/last_reason; embedded Job is a failure-time snapshot, not a live Job), and the response flags JobResult / EnqueueResponse.deduplicated / NackResponse.dead_lettered / ExtendResponse.lease_expires_at. Per-RPC gRPC status codes. The API Reference top-nav target. */}
+The protobuf definitions for sepp are hosted on [buf.build](https://buf.build/sepp-org/sepp-proto/docs/main%3Asepp.v1) which is based on the [sepp proto GitHub repository](https://github.com/sepp-org/proto). If you wish to contribute changes to the protocol, please open a pull request against the proto repository. Once that is merged, the updated protocol files can then be commited into each respository in turn. This is done so that the server and clients can be built without requiring buf to be installed.
 
-## QueueService RPCs
+## Downloading the proto files using buf
 
-## Enqueue messages
+Buf is a tool for managing protobuf files. It can be used to vendor the protocol files into your own project. To do this, you will need to install buf and then run the following command:
 
-## Reserve, Ack, Nack, Extend messages
-
-## Dead-letter messages
-
-## Common types: Job, Payload, PrimitiveValue, TraceContext
-
-## Status codes per RPC
-
+```bash
+buf export buf.build/sepp-org/sepp-proto:main -o proto
+```
