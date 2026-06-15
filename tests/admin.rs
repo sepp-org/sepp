@@ -491,7 +491,7 @@ async fn key_rotation_via_hot_reload_invalidates_sessions() {
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut invalidated = false;
     while Instant::now() < deadline && !invalidated {
-        std::fs::write(&guard.cfg_path.as_deref().unwrap(), &rotated).expect("rewrite config");
+        std::fs::write(guard.cfg_path.as_deref().unwrap(), &rotated).expect("rewrite config");
         let window = Instant::now() + Duration::from_secs(2);
         while Instant::now() < window {
             let resp = http(
@@ -534,7 +534,7 @@ async fn removing_keys_on_loopback_hot_disables_auth() {
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut open = false;
     while Instant::now() < deadline && !open {
-        std::fs::write(&guard.cfg_path.as_deref().unwrap(), ADMIN_CFG).expect("rewrite config");
+        std::fs::write(guard.cfg_path.as_deref().unwrap(), ADMIN_CFG).expect("rewrite config");
         let window = Instant::now() + Duration::from_secs(2);
         while Instant::now() < window {
             let resp = http(port, "GET", "/admin/api/v1/overview", &[], None).await;
@@ -1302,7 +1302,7 @@ async fn put_queue_with_no_overrides_declares_it() {
     assert_eq!(put["applied"], json!(true));
     assert!(put["requires_restart"].as_array().unwrap().is_empty());
 
-    let on_disk = std::fs::read_to_string(&guard.cfg_path.as_deref().unwrap())
+    let on_disk = std::fs::read_to_string(guard.cfg_path.as_deref().unwrap())
         .expect("config file still exists");
     assert!(
         on_disk.contains("name = \"adm-new-q\""),
@@ -1423,7 +1423,7 @@ async fn delete_queue_guards_then_purges_and_removes_declaration() {
         "removing the declaration rewrote the config file"
     );
 
-    let on_disk = std::fs::read_to_string(&guard.cfg_path.as_deref().unwrap())
+    let on_disk = std::fs::read_to_string(guard.cfg_path.as_deref().unwrap())
         .expect("config file still exists");
     assert!(
         !on_disk.contains("adm-del-q"),
