@@ -7,6 +7,11 @@ on:
       - 'docs/**'
       - 'Cargo.toml'
       - '.github/workflows/docs.yml'
+  pull_request:
+    paths:
+      - 'docs/**'
+      - 'Cargo.toml'
+      - '.github/workflows/docs.yml'
   workflow_dispatch:
 
 permissions:
@@ -43,6 +48,7 @@ jobs:
           path: docs/out
 
   deploy:
+    if: github.event_name == 'push'
     needs: build
     runs-on: ubuntu-latest
     environment:
