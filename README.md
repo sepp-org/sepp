@@ -14,7 +14,7 @@
 
   <p>
     <a href="https://github.com/sepp-org/sepp/actions"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/sepp-org/sepp/ci.yml?branch=master&labelColor=181512"></a>
-    <a href="LICENSE"><img alt="license" src="https://img.shields.io/crates/l/sepp.svg?color=ec6a2e&labelColor=181512"></a>
+    <a href="LICENSE"><img alt="license" src="https://img.shields.io/github/license/sepp-org/sepp?color=ec6a2e&labelColor=181512"></a>
     <a href="https://github.com/sepp-org/sepp/stargazers"><img alt="stars" src="https://img.shields.io/github/stars/sepp-org/sepp?style=flat&color=ec6a2e&labelColor=181512"></a>
   </p>
 
