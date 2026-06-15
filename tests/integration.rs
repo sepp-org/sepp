@@ -6,21 +6,21 @@
 //! store, gRPC transport, TLS and auth — so they are intentionally heavier than
 //! the in-crate unit tests under `src/`.
 
+mod helpers;
+use helpers::*;
+
 use std::collections::HashMap;
-use std::io::BufRead;
-use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::process::Child;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use sepp::pb::sepp::v1::{
     AckRequest, DeadLetterCause, DeadLetterRecord, DrainDeadLettersRequest, EnqueueBatchRequest,
-    EnqueueRequest, EnqueueResponse, ExtendRequest, GetServerInfoRequest, Job, NackRequest,
-    NackRetry, Payload, PrimitiveValue, ReserveRequest, enqueue_atomic_response, job_rejection,
-    job_result, nack_retry, primitive_value, queue_service_client::QueueServiceClient,
+    EnqueueRequest, ExtendRequest, GetServerInfoRequest, Job, NackRequest, NackRetry, Payload,
+    PrimitiveValue, ReserveRequest, enqueue_atomic_response, job_rejection, job_result, nack_retry,
+    primitive_value, queue_service_client::QueueServiceClient,
 };
-use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
-
-type Client = QueueServiceClient<Channel>;
+use tonic::transport::{Certificate, ClientTlsConfig, Endpoint};
 
 /// How a nacked job should be retried, mirroring the proto `NackRetry` oneof.
 enum Retry {
@@ -29,158 +29,8 @@ enum Retry {
     DeadLetter,
 }
 
-struct ServerGuard {
-    child: Child,
-    db_path: Option<std::path::PathBuf>,
-}
-
-impl Drop for ServerGuard {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        if let Some(path) = &self.db_path {
-            let _ = std::fs::remove_dir_all(path);
-        }
-    }
-}
-
-/// Startup log-line substrings we extract bound ports from, keyed by the short
-/// name tests ask for. The server binds `127.0.0.1:0` and logs the *actual*
-/// bound address, so these carry the OS-assigned port.
-const PORT_MARKERS: &[(&str, &str)] = &[
-    ("grpc", "queue server listening"),
-    ("prometheus", "prometheus metrics endpoint listening"),
-    ("admin", "admin UI listening"),
-];
-
-/// How long to wait for a freshly spawned server to report its bound port.
-/// Generous on purpose: a healthy server reports in well under a second, so the
-/// large ceiling is free on the happy path but absorbs slow startups on loaded
-/// or oversubscribed machines.
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Bound ports discovered from the server's stdout, filled in as it logs each
-/// "... listening" line. Shared with the stdout-draining thread.
-#[derive(Clone)]
-struct PortBook {
-    ports: Arc<Mutex<HashMap<&'static str, u16>>>,
-}
-
-/// Pulls the port out of a `127.0.0.1:<port>` substring. Works for both the
-/// text (`addr=127.0.0.1:54321`) and JSON (`"addr":"127.0.0.1:54321"`) log
-/// formats.
-fn parse_listen_port(line: &str) -> Option<u16> {
-    const NEEDLE: &str = "127.0.0.1:";
-    let start = line.find(NEEDLE)? + NEEDLE.len();
-    line[start..]
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .collect::<String>()
-        .parse()
-        .ok()
-}
-
-/// Polls `book` until `key`'s port appears, or returns `None` after `timeout`.
-async fn wait_for_port(book: &PortBook, key: &str, timeout: Duration) -> Option<u16> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(port) = book.ports.lock().expect("port book lock").get(key).copied() {
-            return Some(port);
-        }
-        if Instant::now() >= deadline {
-            return None;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-}
-
-/// An empty config file in the temp dir, shared by every test server that
-/// does not bring its own config. The server treats an empty file as
-/// all-defaults; concurrent re-writes of identical content are harmless.
-fn isolated_config_path() -> std::path::PathBuf {
-    let path = std::env::temp_dir().join("sepp-integration-defaults.toml");
-    if !path.exists() {
-        let _ = std::fs::write(&path, "");
-    }
-    path
-}
-
-/// Spawns the server binary with `extra_env`, binding `127.0.0.1:0` so the OS
-/// hands out a free, unique port. Returns the child and a [`PortBook`] the
-/// caller queries (via [`wait_for_port`]) for the actual bound port(s).
-///
-/// Letting the server own the bind closes the TOCTOU window the old
-/// `free_port()` had: it bound `:0`, closed the socket, then handed the bare
-/// number to the server to re-bind, so two concurrent tests could be assigned
-/// the same just-freed port.
-fn spawn_server_process(
-    db_path: &std::path::Path,
-    extra_env: &[(&str, &str)],
-) -> (Child, PortBook) {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_sepp"));
-    command
-        .env("SEPP_SERVER__LISTEN_ADDR", "127.0.0.1:0")
-        // The admin UI is on by default; its fixed default port would clash
-        // across concurrently spawned test servers.
-        .env("SEPP_ADMIN__LISTEN_ADDR", "127.0.0.1:0")
-        .env("SEPP_SERVER__DB_PATH", db_path)
-        // Isolate from any sepp.toml in the developer's working directory:
-        // a local file pinning ports or strict_queues would break
-        // concurrently spawned test servers. Tests that need a config
-        // override SEPP_CONFIG through `extra_env`.
-        .env("SEPP_CONFIG", isolated_config_path())
-        // Force info so the startup "listening" lines are always emitted,
-        // whatever level a test's config might otherwise set.
-        .env("RUST_LOG", "sepp=info")
-        .stdout(Stdio::piped());
-    for (key, value) in extra_env {
-        command.env(key, value);
-    }
-    let mut child = command.spawn().expect("spawn sepp server");
-
-    let book = PortBook {
-        ports: Arc::new(Mutex::new(HashMap::new())),
-    };
-    let stdout = child.stdout.take().expect("child stdout is piped");
-    let sink = book.clone();
-    // Drain stdout for the child's whole life so its log writes never block on a
-    // full pipe; record listening ports as they appear.
-    std::thread::spawn(move || {
-        for line in std::io::BufReader::new(stdout)
-            .lines()
-            .map_while(Result::ok)
-        {
-            for (key, needle) in PORT_MARKERS {
-                if line.contains(needle)
-                    && let Some(port) = parse_listen_port(&line)
-                {
-                    sink.ports.lock().expect("port book lock").insert(key, port);
-                }
-            }
-        }
-    });
-
-    (child, book)
-}
-
-/// Connects a gRPC client to `127.0.0.1:port`, retrying until reachable.
-async fn connect_client(port: u16) -> Client {
-    let addr = format!("http://127.0.0.1:{port}");
-    for _ in 0..100 {
-        if let Ok(client) = QueueServiceClient::connect(addr.clone()).await {
-            return client;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("server did not become reachable on {addr}");
-}
-
 fn temp_db(tag: &str) -> std::path::PathBuf {
-    let unique = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    std::env::temp_dir().join(format!("sepp-it-{tag}-{unique}"))
+    std::env::temp_dir().join(format!("sepp-it-{tag}-{}", unique_suffix()))
 }
 
 async fn spawn_server(db_path: &std::path::Path) -> (Child, Client) {
@@ -209,17 +59,14 @@ async fn start_server(tag: &str) -> (ServerGuard, Client) {
         ServerGuard {
             child,
             db_path: Some(db_path),
+            cfg_path: None,
         },
         client,
     )
 }
 
 fn temp_config_path(tag: &str) -> std::path::PathBuf {
-    let unique = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    std::env::temp_dir().join(format!("sepp-it-{tag}-{unique}.toml"))
+    std::env::temp_dir().join(format!("sepp-it-{tag}-{}.toml", unique_suffix()))
 }
 
 async fn start_server_with_config(tag: &str, toml: &str) -> (ServerGuard, Client) {
@@ -233,35 +80,10 @@ async fn start_server_with_config(tag: &str, toml: &str) -> (ServerGuard, Client
         ServerGuard {
             child,
             db_path: Some(db_path),
+            cfg_path: None,
         },
         client,
     )
-}
-
-fn enqueue_req(queue: &str) -> EnqueueRequest {
-    EnqueueRequest {
-        queue: queue.to_string(),
-        job_type: "smoke-job".to_string(),
-        ..Default::default()
-    }
-}
-
-/// Enqueues a single job through `EnqueueBatch` and unwraps its success result.
-async fn enqueue(client: &Client, req: EnqueueRequest) -> EnqueueResponse {
-    let result = client
-        .clone()
-        .enqueue_batch(EnqueueBatchRequest { jobs: vec![req] })
-        .await
-        .expect("enqueue_batch RPC")
-        .into_inner()
-        .results
-        .into_iter()
-        .next()
-        .expect("one result per submitted job");
-    match result.outcome {
-        Some(job_result::Outcome::Success(s)) => s,
-        other => panic!("job was not accepted: {other:?}"),
-    }
 }
 
 async fn reserve_batch(
@@ -284,25 +106,6 @@ async fn reserve_batch(
         .expect("reserve RPC")
         .into_inner()
         .jobs
-}
-
-async fn reserve(client: &Client, queue: &str, lease: Duration, wait: Duration) -> Option<Job> {
-    reserve_batch(client, &[queue], lease, wait, None)
-        .await
-        .into_iter()
-        .next()
-}
-
-async fn ack(client: &Client, job: &Job) {
-    client
-        .clone()
-        .ack(AckRequest {
-            job_id: job.id.clone(),
-            attempt: job.attempt,
-            worker_id: None,
-        })
-        .await
-        .expect("ack RPC");
 }
 
 /// Nacks a job and returns whether the server dead-lettered it.
@@ -360,32 +163,6 @@ fn prim_int(value: i64) -> PrimitiveValue {
     }
 }
 
-fn epoch_ms_in(d: Duration) -> i64 {
-    (SystemTime::now() + d)
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64
-}
-
-/// Proto v1.1.0 carries durations as `google.protobuf.Duration` and timestamps
-/// as `google.protobuf.Timestamp`. These mirror what a real client does at the
-/// boundary, reusing the library's own conversions.
-fn dur(d: Duration) -> prost_types::Duration {
-    sepp::pb::millis_to_duration(d.as_millis() as u64)
-}
-
-/// An epoch-ms instant as a wire `Timestamp`.
-fn ts_ms(ms: i64) -> prost_types::Timestamp {
-    sepp::pb::millis_to_timestamp(ms)
-}
-
-/// A wire `Timestamp` back to epoch ms.
-fn ts_to_ms(ts: &prost_types::Timestamp) -> i64 {
-    sepp::pb::timestamp_to_millis(ts)
-}
-
-const LEASE: Duration = Duration::from_secs(30);
-const WAIT: Duration = Duration::from_secs(5);
 const NO_WAIT: Duration = Duration::from_millis(200);
 
 #[tokio::test]
@@ -1087,6 +864,7 @@ async fn dead_letter_record_survives_restart() {
         let _server = ServerGuard {
             child,
             db_path: None,
+            cfg_path: None,
         };
         enqueue(
             &client,
@@ -1112,6 +890,7 @@ async fn dead_letter_record_survives_restart() {
     let _server = ServerGuard {
         child,
         db_path: Some(db_path),
+        cfg_path: None,
     };
     let _ = std::fs::remove_file(&cfg_path);
 
@@ -1235,6 +1014,7 @@ async fn api_key_auth_gates_requests() {
     let _guard = ServerGuard {
         child,
         db_path: Some(db_path),
+        cfg_path: None,
     };
 
     // No key at all is rejected.
@@ -1291,6 +1071,7 @@ async fn start_server_reloadable(
         ServerGuard {
             child,
             db_path: Some(db_path),
+            cfg_path: None,
         },
         client,
         cfg_path,
@@ -1479,6 +1260,7 @@ prometheus_listen_addr = "127.0.0.1:0"
     let _guard = ServerGuard {
         child,
         db_path: Some(db_path),
+        cfg_path: None,
     };
     let grpc_port = wait_for_port(&book, "grpc", STARTUP_TIMEOUT)
         .await
@@ -1818,6 +1600,7 @@ async fn durability_survives_restart() {
         let _server = ServerGuard {
             child,
             db_path: None,
+            cfg_path: None,
         };
         enqueue(&client, enqueue_req("smoke-restart")).await.job_id
     };
@@ -1826,6 +1609,7 @@ async fn durability_survives_restart() {
     let _server = ServerGuard {
         child,
         db_path: Some(db_path),
+        cfg_path: None,
     };
 
     let job = reserve(&client, "smoke-restart", LEASE, WAIT)
@@ -1973,6 +1757,7 @@ async fn tls_secures_the_connection() {
     let _guard = ServerGuard {
         child,
         db_path: Some(db_path),
+        cfg_path: None,
     };
     let port = wait_for_port(&book, "grpc", STARTUP_TIMEOUT)
         .await
@@ -2112,6 +1897,7 @@ async fn admin_ui_serves_https_when_tls_configured() {
     let _guard = ServerGuard {
         child,
         db_path: Some(db_path),
+        cfg_path: None,
     };
     let port = wait_for_port(&book, "admin", STARTUP_TIMEOUT)
         .await
@@ -2787,6 +2573,7 @@ async fn health_service_reports_serving() {
     let _guard = ServerGuard {
         child,
         db_path: Some(db_path),
+        cfg_path: None,
     };
     let port = wait_for_port(&book, "grpc", STARTUP_TIMEOUT)
         .await
@@ -2864,6 +2651,7 @@ async fn inflight_job_survives_restart_and_is_redelivered() {
         let _server = ServerGuard {
             child,
             db_path: None,
+            cfg_path: None,
         };
         let id = enqueue(&client, enqueue_req("smoke-restart-inflight"))
             .await
@@ -2887,6 +2675,7 @@ async fn inflight_job_survives_restart_and_is_redelivered() {
     let _server = ServerGuard {
         child,
         db_path: Some(db_path),
+        cfg_path: None,
     };
 
     let job = reserve(
@@ -2914,6 +2703,7 @@ async fn scheduled_job_survives_restart() {
         let _server = ServerGuard {
             child,
             db_path: None,
+            cfg_path: None,
         };
         enqueue(
             &client,
@@ -2930,6 +2720,7 @@ async fn scheduled_job_survives_restart() {
     let _server = ServerGuard {
         child,
         db_path: Some(db_path),
+        cfg_path: None,
     };
 
     let job = reserve(

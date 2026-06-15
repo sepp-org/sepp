@@ -1,14 +1,12 @@
 //! End-to-end tests for the admin web UI plane: HTTP API, SSE stats, job
 //! inspection, dead-letter operations, queue creation and deletion and the
-//! config editor, driven against a real server process. Mirrors the harness
-//! in `tests/integration.rs`, plus a raw HTTP/1.1 client over `TcpStream` so
-//! no extra dependencies are needed.
+//! config editor, driven against a real server process.
 
-use std::collections::{HashMap, HashSet};
-use std::io::BufRead;
-use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+mod helpers;
+use helpers::*;
+
+use std::collections::HashSet;
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
@@ -17,126 +15,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use sepp::pb::sepp::v1::{
-    AckRequest, EnqueueBatchRequest, EnqueueRequest, EnqueueResponse, Job, NackRequest, NackRetry,
-    Payload, ReserveRequest, job_result, nack_retry, queue_service_client::QueueServiceClient,
+    EnqueueBatchRequest, EnqueueRequest, Job, NackRequest, NackRetry, Payload, job_result,
+    nack_retry,
 };
-use tonic::transport::Channel;
-
-type Client = QueueServiceClient<Channel>;
 
 // ---------------------------------------------------------------------------
-// Server harness (mirrors tests/integration.rs)
+// Admin-specific configs and server boot
 // ---------------------------------------------------------------------------
-
-/// Startup log-line substrings we extract bound ports from. The server binds
-/// `127.0.0.1:0` and logs the actual bound address.
-const PORT_MARKERS: &[(&str, &str)] = &[
-    ("grpc", "queue server listening"),
-    ("admin", "admin UI listening"),
-];
-
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
-
-#[derive(Clone)]
-struct PortBook {
-    ports: Arc<Mutex<HashMap<&'static str, u16>>>,
-}
-
-fn parse_listen_port(line: &str) -> Option<u16> {
-    const NEEDLE: &str = "127.0.0.1:";
-    let start = line.find(NEEDLE)? + NEEDLE.len();
-    line[start..]
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .collect::<String>()
-        .parse()
-        .ok()
-}
-
-async fn wait_for_port(book: &PortBook, key: &str, timeout: Duration) -> Option<u16> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(port) = book.ports.lock().expect("port book lock").get(key).copied() {
-            return Some(port);
-        }
-        if Instant::now() >= deadline {
-            return None;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-}
-
-fn spawn_server_process(
-    db_path: &std::path::Path,
-    extra_env: &[(&str, &str)],
-) -> (Child, PortBook) {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_sepp"));
-    command
-        .env("SEPP_SERVER__LISTEN_ADDR", "127.0.0.1:0")
-        .env("SEPP_SERVER__DB_PATH", db_path)
-        .env("RUST_LOG", "sepp=info")
-        .stdout(Stdio::piped());
-    for (key, value) in extra_env {
-        command.env(key, value);
-    }
-    let mut child = command.spawn().expect("spawn sepp server");
-
-    let book = PortBook {
-        ports: Arc::new(Mutex::new(HashMap::new())),
-    };
-    let stdout = child.stdout.take().expect("child stdout is piped");
-    let sink = book.clone();
-    // Drain stdout for the child's whole life so its log writes never block.
-    std::thread::spawn(move || {
-        for line in std::io::BufReader::new(stdout)
-            .lines()
-            .map_while(Result::ok)
-        {
-            for (key, needle) in PORT_MARKERS {
-                if line.contains(needle)
-                    && let Some(port) = parse_listen_port(&line)
-                {
-                    sink.ports.lock().expect("port book lock").insert(key, port);
-                }
-            }
-        }
-    });
-
-    (child, book)
-}
-
-async fn connect_client(port: u16) -> Client {
-    let addr = format!("http://127.0.0.1:{port}");
-    for _ in 0..100 {
-        if let Ok(client) = QueueServiceClient::connect(addr.clone()).await {
-            return client;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("server did not become reachable on {addr}");
-}
-
-fn unique_suffix() -> u128 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos()
-}
-
-struct ServerGuard {
-    child: Child,
-    db_path: std::path::PathBuf,
-    cfg_path: std::path::PathBuf,
-}
-
-impl Drop for ServerGuard {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.db_path);
-        let _ = std::fs::remove_file(&self.cfg_path);
-    }
-}
 
 const ADMIN_CFG: &str = "[admin]\nenabled = true\nlisten_addr = \"127.0.0.1:0\"\n";
 
@@ -179,8 +64,8 @@ async fn start_admin_server(
     (
         ServerGuard {
             child,
-            db_path,
-            cfg_path,
+            db_path: Some(db_path),
+            cfg_path: Some(cfg_path),
         },
         client,
         admin_port,
@@ -188,81 +73,8 @@ async fn start_admin_server(
 }
 
 // ---------------------------------------------------------------------------
-// gRPC helpers (subset of tests/integration.rs)
+// Admin-specific gRPC helpers
 // ---------------------------------------------------------------------------
-
-const LEASE: Duration = Duration::from_secs(30);
-const WAIT: Duration = Duration::from_secs(5);
-
-fn dur(d: Duration) -> prost_types::Duration {
-    sepp::pb::millis_to_duration(d.as_millis() as u64)
-}
-
-fn ts_ms(ms: i64) -> prost_types::Timestamp {
-    sepp::pb::millis_to_timestamp(ms)
-}
-
-fn epoch_ms_in(d: Duration) -> i64 {
-    (SystemTime::now() + d)
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64
-}
-
-fn enqueue_req(queue: &str) -> EnqueueRequest {
-    EnqueueRequest {
-        queue: queue.to_string(),
-        job_type: "smoke-job".to_string(),
-        ..Default::default()
-    }
-}
-
-async fn enqueue(client: &Client, req: EnqueueRequest) -> EnqueueResponse {
-    let result = client
-        .clone()
-        .enqueue_batch(EnqueueBatchRequest { jobs: vec![req] })
-        .await
-        .expect("enqueue_batch RPC")
-        .into_inner()
-        .results
-        .into_iter()
-        .next()
-        .expect("one result per submitted job");
-    match result.outcome {
-        Some(job_result::Outcome::Success(s)) => s,
-        other => panic!("job was not accepted: {other:?}"),
-    }
-}
-
-async fn reserve(client: &Client, queue: &str, lease: Duration, wait: Duration) -> Option<Job> {
-    client
-        .clone()
-        .reserve(ReserveRequest {
-            queues: vec![queue.to_string()],
-            wait_timeout: Some(dur(wait)),
-            lease_duration: Some(dur(lease)),
-            worker_id: None,
-            max_jobs: None,
-        })
-        .await
-        .expect("reserve RPC")
-        .into_inner()
-        .jobs
-        .into_iter()
-        .next()
-}
-
-async fn ack(client: &Client, job: &Job) {
-    client
-        .clone()
-        .ack(AckRequest {
-            job_id: job.id.clone(),
-            attempt: job.attempt,
-            worker_id: None,
-        })
-        .await
-        .expect("ack RPC");
-}
 
 async fn nack_dead_letter(client: &Client, job: &Job, reason: &str) -> bool {
     client
@@ -679,7 +491,7 @@ async fn key_rotation_via_hot_reload_invalidates_sessions() {
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut invalidated = false;
     while Instant::now() < deadline && !invalidated {
-        std::fs::write(&guard.cfg_path, &rotated).expect("rewrite config");
+        std::fs::write(&guard.cfg_path.as_deref().unwrap(), &rotated).expect("rewrite config");
         let window = Instant::now() + Duration::from_secs(2);
         while Instant::now() < window {
             let resp = http(
@@ -722,7 +534,7 @@ async fn removing_keys_on_loopback_hot_disables_auth() {
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut open = false;
     while Instant::now() < deadline && !open {
-        std::fs::write(&guard.cfg_path, ADMIN_CFG).expect("rewrite config");
+        std::fs::write(&guard.cfg_path.as_deref().unwrap(), ADMIN_CFG).expect("rewrite config");
         let window = Instant::now() + Duration::from_secs(2);
         while Instant::now() < window {
             let resp = http(port, "GET", "/admin/api/v1/overview", &[], None).await;
@@ -1490,7 +1302,8 @@ async fn put_queue_with_no_overrides_declares_it() {
     assert_eq!(put["applied"], json!(true));
     assert!(put["requires_restart"].as_array().unwrap().is_empty());
 
-    let on_disk = std::fs::read_to_string(&guard.cfg_path).expect("config file still exists");
+    let on_disk = std::fs::read_to_string(&guard.cfg_path.as_deref().unwrap())
+        .expect("config file still exists");
     assert!(
         on_disk.contains("name = \"adm-new-q\""),
         "the declaration landed in the file:\n{on_disk}"
@@ -1610,7 +1423,8 @@ async fn delete_queue_guards_then_purges_and_removes_declaration() {
         "removing the declaration rewrote the config file"
     );
 
-    let on_disk = std::fs::read_to_string(&guard.cfg_path).expect("config file still exists");
+    let on_disk = std::fs::read_to_string(&guard.cfg_path.as_deref().unwrap())
+        .expect("config file still exists");
     assert!(
         !on_disk.contains("adm-del-q"),
         "the [[queues]] declaration is gone from the file:\n{on_disk}"
