@@ -44,7 +44,7 @@ toml_edit = "0.22"
 tokio-stream = { version = "0.1", features = ["sync"] }
 rust-embed = "8"
 base64 = "0.22"
-sha2 = "0.10"
+sha2 = "0.11"
 
 
 [build-dependencies]
