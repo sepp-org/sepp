@@ -3,7 +3,7 @@ title: "Queues & payloads"
 description: "Named queues and strict mode, per-queue configuration, and what a job carries: opaque payloads, the custom map and their limits."
 ---
 
-A queue is a named channel jobs flow through, and every queue carries its own configuration and limits. A job on it carries two kinds of data: an opaque payload and a typed custom map. This page covers both halves: defining queues, and the shape of the jobs they hold.
+A queue is a named channel jobs flow through and every queue carries its own configuration and limits. A job on it carries two kinds of data: an opaque payload and a typed custom map. This page covers both halves: defining queues and the shape of the jobs they hold.
 
 ## Auto-create vs strict mode
 
@@ -33,7 +33,7 @@ max_payload_bytes = 8388608
 dedup_window_ms = 3600000
 ```
 
-An `allowed_job_types` list restricts which job types a queue accepts, a simple way to enforce separation between queues and catch a producer enqueueing the wrong type. The full set of per-queue overrides (`max_lease_duration_ms`, `default_max_attempts`, `max_attempts_ceiling`, `default_priority`, `max_payload_bytes`, `allowed_encodings`, `max_schedule_horizon_ms`, `max_custom_entries`, `max_custom_total_bytes`, `max_custom_key_bytes`, `dedup_window_ms`, `max_queue_depth`) is listed in the [configuration reference](/docs/reference/configuration).
+An `allowed_job_types` list restricts which job types a queue accepts, a simple way to enforce separation between queues and catch a producer enqueueing the wrong type. The full set of per-queue overrides is listed in the [configuration reference](/docs/reference/configuration).
 
 <Callout type="info" title="Hot reloading">
 Queues declared in the configuration are hot-reloadable, so you can add, remove or change them on the fly without restarting the server. Just edit the config file, save and the server picks up the changes automatically. The [admin UI](/docs/get-started/admin-ui) edits the same file, so queues created or changed there apply the same way.
@@ -93,13 +93,13 @@ if (payload) {
 
 ## The custom value map
 
-For small structured fields, a record id, a flag, a locale, reach for the custom map instead of a payload. It is a set of key-value pairs whose values are typed primitives: strings, integers, floats and booleans. Sepp stores them as typed values and hands them back on `ctx.custom`, so unlike a payload there is no encoding to agree on and nothing to decode. Because the values are typed, integers survive as 64-bit integers across languages, so the precision loss that bites large integers in a JSON payload does not happen here (in TypeScript a value beyond 2<sup>53</sup> comes back as a `bigint`).
+For small structured fields like a record id, a flag, a locale; reach for the custom map instead of a payload. It is a set of key-value pairs whose values are typed primitives: strings, integers, floats and booleans. Sepp stores them as typed values and hands them back on `ctx.custom`, so unlike a payload there is no encoding to agree on and nothing to decode. Because the values are typed, integers survive as 64-bit integers across languages, so the precision loss that bites large integers in a JSON payload does not happen here (in TypeScript a value beyond 2<sup>53</sup> comes back as a `bigint`).
 
-Queues cap the map so it stays lightweight: a maximum number of entries (64 by default), a per-key length (256 bytes) and a combined size across keys and values (16 KiB). Go over and the enqueue is rejected with `CustomEntriesTooMany`, `CustomKeyTooLong` or `CustomMapTooLarge`. Keep it to metadata; if you find yourself packing real data in here, that belongs in a payload.
+Queues cap the map so it stays lightweight: a maximum number of entries (64 by default), a per-key length (256 bytes) and a combined size across keys and values (16 KiB). Go over and the enqueue is rejected with `CustomEntriesTooMany`, `CustomKeyTooLong` or `CustomMapTooLarge`. Keep it to metadata; if you find yourself packing objects in here, that belongs in a payload.
 
 ## Payload size and the claim-check pattern
 
-A payload travels inline with the job and is held in memory until the job finishes, so large blobs cost throughput and memory on the hot path. To keep that bounded, each queue caps payload size at `max_payload_bytes`, 1 MiB by default, and rejects anything larger with `PayloadTooLarge`. You can raise it per queue, but only up to `max_message_bytes` (16 MiB by default), the hard ceiling on a single gRPC message that the payload has to fit inside.
+A payload travels inline with the job and is held in memory until the job finishes, so large blobs cost throughput and memory on the hot path. To keep that bounded, each queue caps payload size at `max_payload_bytes`, 1 MiB by default, and rejects anything larger with `PayloadTooLarge`. You can raise it per queue but only up to `max_message_bytes` (16 MiB by default), the hard ceiling on a single gRPC message that the payload has to fit inside.
 
 ```toml
 [limits]
@@ -153,7 +153,11 @@ await client.enqueue({
 
 ## Encoding allow-lists
 
-By default a queue accepts any encoding; the hint is a free label and the server never checks it. Set `allowed_encodings` to a list and the queue accepts only those, rejecting the rest with `EncodingNotAllowed`. An empty list rejects every payload, so the queue takes payload-free jobs only. The check runs only when a job actually carries a payload, so a job with no payload is never caught by it.
+By default a queue accepts any encoding; the hint is a free label and the server never checks it. Set `allowed_encodings` to a list and the queue accepts only those, rejecting the rest with `EncodingNotAllowed`. An empty list rejects every payload, so the queue takes payload-free jobs only.
+
+<Callout type="warn" title="Payloads are not inspected">
+The server trusts the producer to set the encoding correctly. It does not inspect the payload to see if it is actually JSON, Protobuf or whatever the hint says. A worker that decodes the bytes according to the hint may fail if the producer lied.
+</Callout>
 
 Like the other limits, `allowed_encodings` is global with a per-queue override: a queue without its own list inherits the global one. The capability shows up as `restricts_encodings` and `allowed_encodings` in the server info, so a producer can see the rule before sending.
 

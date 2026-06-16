@@ -3,7 +3,7 @@ title: "Architecture"
 description: "Learn more about how sepp is structured under the hood."
 ---
 
-A sepp server is a single binary: a gRPC front backed by an embedded fjall LSM store, with every state change funneled through one committer thread that applies it in memory and fsyncs it to disk in order. Here is a visual diagram.
+A sepp server is a single binary: a gRPC front backed by an embedded fjall LSM store, with every state change funneled through one committer thread that applies it in memory and fsyncs it to disk in order. Here is a visual diagram:
 
 <Mermaid chart={`
 flowchart TB
@@ -42,7 +42,7 @@ flowchart TB
 
 ## The storage engine
 
-Sepp uses [fjall](https://github.com/fjall-rs/fjall), a pure Rust embedded LSM store that is similar to [RocksDB](https://github.com/facebook/rocksdb/) as its storage engine. LSM based stores are great for implementing queues because they offer great write performance and fast scans for "smallest key in a range" which is exactly what you need to find the next ready job in a queue. 
+Sepp uses [fjall](https://github.com/fjall-rs/fjall), a pure Rust embedded LSM store that is similar to [RocksDB](https://github.com/facebook/rocksdb/), as its storage engine. LSM based stores are great for implementing queues because they offer great write performance and fast scans for "smallest key in a range" which is exactly what you need to find the next ready job in a queue. 
 
 <Callout type="warn" title="The tombstone trap">
 LSM stores don't delete in place. Instead, a delete writes a *tombstone* marking the key gone, reclaimed later during compaction. A high-churn queue (every reserve and ack deletes a key) piles these up and a range scan then has to step over the whole graveyard to reach a live job. Repeated for each of the n jobs, draining the queue that way degrades to O(n<sup>2</sup>).
@@ -54,7 +54,7 @@ So sepp never scans the store for ready jobs at runtime. It serves them from an 
 
 Sepp uses a single writer architecture, where all of the state changes are funneled through a single committer thread. This means we don't have to worry about lock contention or consistency issues that arise from having multiple writers, at the cost of some write throughput when running in `buffer` persist mode.
 
-In a durable system, fsync cost almost always dominates. Every time we write something to disk, we must call fsync to ensure that it is actually written and doesn't sit in some OS buffer somewhere. Because we only have a single writer, we can batch multiple state changes into a single fsync call, amortizing the time cost per change. Thanks to this sepp can achieve a very high throughput as well as stay fully durable at the cost of some additional latency.
+In a durable system, the `fsync` cost almost always dominates. Every time we write something to disk, we must call `fsync` to ensure that it is actually written and doesn't sit in some OS buffer somewhere. Because we only have a single writer, we can batch multiple state changes into a single `fsync` call, amortizing the time cost per change. Thanks to this sepp can achieve a very high throughput as well as stay fully durable at the cost of some additional latency.
 
 <Mermaid chart={`
 sequenceDiagram
@@ -73,16 +73,12 @@ How aggressively the committer flushes is configurable:
 | mode | flush | durability | throughput |
 | --- | --- | --- | --- |
 | `sync_all` *(default)* | `fsync` — data + metadata | a response means it's on disk | baseline |
-| `sync_data` | `fdatasync` — data only | a response means it's on disk | baseline |
+| `sync_data` | `fdatasync` — data only | a response means it's on disk | slightly better than baseline |
 | `buffer` | left to the OS | recent writes can be lost on a crash | ~4× the sync modes |
 
 <Callout type="info" title="Full durability">
 In the sync modes, once a client receives a response the effect is already on disk. There's no window where a crash between responding and writing loses an acknowledged change, which is a weakness of systems that only fsync in the background.
 </Callout>
-
-## Tonic gRPC server
-
-Sepp uses [Tonic](https://github.com/hyperium/tonic)(soon to be grpc-rust) to serve the gRPC API. Tonic is the de-facto Rust gRPC library that is built on top of the async runtime Tokio, which allows us to handle multiple concurrent client connections and requests with ease. The gRPC server is responsible for validating incoming requests and translating them into commands that are sent to the committer thread via a channel. It also handles sending responses back to clients, including pushing ready jobs to workers that are waiting on a reserve call.
 
 ## See also
 

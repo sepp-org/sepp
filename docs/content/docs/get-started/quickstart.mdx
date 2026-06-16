@@ -28,12 +28,12 @@ as long as it is named `sepp.toml` and in the same directory as the binary or yo
 ## Talk to the server
 
 First you need a client library. There are official clients for [Rust](TODO), [Python](TODO) and [Node.js](TODO).
-Sepp has a fairly simple gRPC line protocol, so you can also roll your own client in any language you want. See the 
-[protobuf definitions](https://github.com/sepp-org/proto) for more.
+Sepp has a fairly simple gRPC line protocol, so you can also roll your own client in any language you want. See
+[build your own client](/docs/clients/build-your-own/) for more.
 
 ### Enqueue a job
 
-This simple example enqueues a single job with type "job type" onto the "queue name" queue. For more details and options, see the [producer docs](/docs/producers).
+This simple example enqueues a single job with type `job type` onto the `queue name` queue. For more details and options, see the [producer docs](/docs/producers).
 
 <LangTabs items={['Rust', 'Python', 'TypeScript']} groupId="enqueue">
 
@@ -84,9 +84,9 @@ console.log(`Enqueued job with ID: ${response.jobId}`);
 
 ### Reserve, process and ack
 
-Getting a job from a queue is called "reserving" a job. Each reserved job has a lease attached to it. If the lease expires before the job is acknowledged, the server will consider this attempt as failed and makes the job available for reservation again. A successful job completion is acknowledged by sending an "ack" message to the server and a failed one by sending a "nack".
+Getting a job from a queue is called *reserving* a job. Each reserved job has a lease attached to it. If the lease expires before the job is acknowledged, the server will consider this attempt as failed and makes the job available for reservation again. A successful job completion is acknowledged by sending an `ack` message to the server and a failed one by sending a `nack`.
 
-The easiest way of processing jobs is to use the Worker abstraction which will automatically handle the reservation, processing and acknowledgment logic for you. For more details and options, see the [worker docs](/docs/workers).
+The easiest way of processing jobs is to use the `Worker` abstraction which will automatically handle the reservation, processing and acknowledgment logic for you. For more details and options, see the [worker docs](/docs/workers).
 
 <LangTabs items={['Rust', 'Python', 'TypeScript']} groupId="process">
 

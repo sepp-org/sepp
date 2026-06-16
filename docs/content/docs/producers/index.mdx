@@ -3,9 +3,9 @@ title: "Producing jobs"
 description: "The producer API end to end: build an enqueue request field by field, schedule and batch jobs, and stay within server limits."
 ---
 
-A producer is any code that puts work on a queue. The job is to connect a client, build an `EnqueueRequest` (at minimum a queue and a job type) and send it. The server stores the job durably and hands back its ID. Everything else, payloads, custom fields, priority, scheduling, idempotency keys, is optional detail you attach to that request. This page is the producer's home base: the calls you make, the single `enqueue` walked field by field, scheduling, batching and the limits your requests are validated against.
+A producer is any code that puts work on a queue. The job is to connect a client, build an `EnqueueRequest` (at minimum a queue and a job type) and send it. The server stores the job durably and hands back its ID. Everything else, payloads, custom fields, priority, scheduling, idempotency keys, is optional detail you attach to that request. This page is the comprehensive overview of the producer API surface: the calls you make, the single `enqueue` walked field by field, scheduling, batching and the limits your requests are validated against.
 
-The snippets below assume a connected `client`. See [connecting](/docs/clients) to set one up, or the [quickstart](/docs/get-started/quickstart) for the end-to-end version.
+The snippets below assume a connected `client`. See the [quickstart](/docs/get-started/quickstart) for how that looks like.
 
 ## The producer surface
 
@@ -13,7 +13,7 @@ The producer side of sepp is small: three enqueue calls and one request message,
 
 - **`enqueue`** sends a single job and returns whether it was enqueued.
 - **`enqueueBatch`** sends many jobs in one round-trip and returns a per-job result list, so some can succeed while others are refused.
-- **`enqueueAtomic`** sends many jobs with an all-or-none guarantee: either every job lands or none do.
+- **`enqueueAtomic`** sends many jobs with an all-or-nothing guarantee: either every job lands or none do.
 - **`getServerInfo`** returns the server's version, feature flags and advertised limits. Clients use it to [validate locally](#validating-against-server-limits) before sending.
 
 There is also a no-code path: the [admin UI](/docs/producers/admin-ui) can enqueue a job from the browser, useful for trying out a queue or firing a one-off job without a producer script.
@@ -252,7 +252,7 @@ if (ack.deduplicated) {
 
 ## Batch & atomic enqueue
 
-Enqueuing one job at a time is simple, but each call is its own network round-trip and, in the sync persist modes, its own fsync. The batch calls amortize both: the jobs ride in one request and the committer folds them into a single disk sync, so a batch of 100 costs far less than 100 separate enqueues. They carry the same `EnqueueRequest` you just built. Both are capped at `max_enqueue_batch` (256 by default); an over-cap or empty batch is refused with `InvalidArgument` before any job is stored.
+Enqueuing one job at a time is simple but each call is its own network round-trip and, in the sync persist modes, its own `fsync`. The batch calls amortize both: the jobs ride in one request and the committer folds them into a single disk sync, so a batch of 100 costs far less than 100 separate enqueues. They carry the same `EnqueueRequest` you just built. Both are capped at `max_enqueue_batch` (256 by default); an over-cap or empty batch is refused with `InvalidArgument` before any job is stored.
 
 `enqueueBatch` is **best-effort**: each job is validated on its own, so some can succeed while others are refused. You get one result per job in request order, each an ack or a per-job rejection.
 
@@ -313,7 +313,7 @@ results.forEach((result, i) => {
 
 </LangTabs>
 
-`enqueueAtomic` is **all-or-none**: it validates the whole batch first, and if any job fails, nothing is enqueued and you get back every failure tagged with its index. Use it when the jobs are coordinated steps and a partial enqueue would be a bug.
+`enqueueAtomic` is **all-or-nothing**: it validates the whole batch first and if any job fails, nothing is enqueued and you get back every failure tagged with its index. Use it when the jobs are coordinated steps and a partial enqueue would be a bug.
 
 <LangTabs items={['Rust', 'Python', 'TypeScript']} groupId="atomic">
 

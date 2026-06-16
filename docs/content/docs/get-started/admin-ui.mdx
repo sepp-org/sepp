@@ -12,7 +12,7 @@ Sepp ships with a web admin UI embedded in the binary. It streams a live dashboa
 
 The UI is on by default, on its own HTTP listener separate from the gRPC port. Start the server and open [http://localhost:9465](http://localhost:9465).
 
-The default bind is `127.0.0.1:9465`, so out of the box the UI is reachable only from the machine the server runs on and no login is required. Binding anything else requires named keys with roles and the server refuses to start without them. For remote access serve the listener over HTTPS by setting `tls_cert_path` and `tls_key_path` under `[admin]`, or keep it plain HTTP behind a TLS-terminating reverse proxy or an SSH tunnel. See [admin UI authentication](/docs/operations/security#admin-ui-authentication) for keys, roles and sessions.
+The default bind is `127.0.0.1:9465`, so out of the box the UI is reachable only from the machine the server runs on and no login is required. Binding anything else requires named keys with roles and the server refuses to start without them. For remote access serve the listener over HTTPS by setting `tls_cert_path` and `tls_key_path` under `[admin]` or keep it plain HTTP behind a TLS-terminating reverse proxy or an SSH tunnel. See [admin UI authentication](/docs/operations/security#admin-ui-authentication) for keys, roles and sessions.
 
 To turn the UI off, set in `sepp.toml`:
 
@@ -20,8 +20,6 @@ To turn the UI off, set in `sepp.toml`:
 [admin]
 enabled = false
 ```
-
-`enabled`, `listen_addr` and the TLS paths are the admin fields that need a restart to apply.
 
 ### In Docker
 
@@ -45,11 +43,11 @@ docker run --rm \
 
 ## What you can do
 
-- **Watch queues live.** The dashboard shows a card per queue with its depths (ready, scheduled, in-flight, dead-lettered), per-second enqueue and ack rates and a sparkline of the last minute, streamed over SSE with no polling to configure.
+- **Watch queues live.** The dashboard shows a card per queue with its depths (ready, scheduled, in-flight, dead-lettered), per-second enqueue and ack rates and a sparkline of the last minute, streamed over SSE.
 - **Inspect jobs.** Open a queue and page through its jobs by state. A job's detail view shows every field, the custom map and the payload decoded by its encoding hint (pretty-printed JSON, text or a hex dump).
 - **Enqueue jobs.** Every queue has an enqueue form covering the full request: payload, priority, scheduling, idempotency key and custom fields. See [enqueue from the admin UI](/docs/producers/admin-ui).
 - **Manage dead letters.** List a queue's dead letters with their cause and last failure reason, then requeue the ones worth another go or delete the rest. Unlike a [drain](/docs/concepts/retries-and-dead-letter#retention-and-replay), looking is not destructive.
-- **Manage queues.** Create a queue, edit its per-queue overrides, and purge or delete it. Deleting refuses while jobs are in flight.
+- **Manage queues.** Create a queue, edit its per-queue overrides, and purge or delete it.
 - **Edit configuration.** The config editor writes `sepp.toml` through the same [hot-reload](/docs/operations/configuration) path you would use by hand, preserving comments. Fields that need a restart are flagged, and fields pinned by `SEPP_` environment variables are locked.
 
 ## See also

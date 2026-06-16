@@ -62,7 +62,7 @@ await client.enqueue({
 
 ## Priority dequeue order
 
-When a worker reserves from a queue, sepp gives it the highest-priority job waiting there. Within one priority level, jobs are first-in first-out, so among equal priorities the one that has waited longest goes first. The two rules compose into a strict order: every priority 9 job is handed out before any priority 8 job, and so on down the levels.
+When a worker reserves from a queue, sepp gives it the highest-priority job waiting there. Within one priority level, jobs are first-in first-out, so among equal priorities the one that has waited longest goes first. The two rules compose into a strict order: every priority 9 job is handed out before any priority 8 job and so on down the levels.
 
 <Callout type="warn" title="Priority is strict">
 A higher-priority job always dequeues before a lower-priority one, no matter how long the lower one has waited. There is no aging to rescue a starved job, so a sustained flood of high-priority work can hold back everything beneath it. Keep the high bands for genuinely urgent jobs or split very different urgencies into separate queues so a flood of one cannot crowd out the other.
@@ -73,6 +73,10 @@ A higher-priority job always dequeues before a lower-priority one, no matter how
 By default a job is ready the moment it is enqueued. Set `scheduled_at` to a future time and the job is held back: it lands in the `Scheduled` state, hidden from workers until its time arrives, when a background sweep promotes it to `Ready`. The scheduled time is the earliest a job can run, not an exact firing time; once promoted it waits for a free worker like any other ready job and takes its place in line by priority and its original enqueue time.
 
 There is no separate delay parameter. You pass an absolute instant, so to delay by a duration you add it to the current time yourself.
+
+<Callout type="info" title="Scheduling a job in the past">
+If the `scheduled_at` time is in the past, the job lands in `Ready` immediately instead of being rejected. 
+</Callout>
 
 <LangTabs items={['Rust', 'Python', 'TypeScript']} groupId="schedule">
 

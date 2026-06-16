@@ -3,16 +3,13 @@ title: "Install"
 description: "Get the sepp binary: prebuilt release, cargo install, Docker image or build from source."
 ---
 
-{/* SCAFFOLD — layout only, no prose written yet. */}
-{/* TODO(content): Install paths as sibling options (release, cargo, ghcr.io/sepp-org/sepp Docker, source). protoc is a hard build prerequisite; verify with sepp on PATH. */}
-
 ## Download a release binary
 
 Prebuilt binaries are available for Linux, Windows and macOS on the [releases page](https://github.com/sepp-org/sepp/releases).
 
 ## Install with Cargo
 
-If you have Rust and Cargo installed, you can install the latest release of sepp with:
+If you have Cargo installed, you can install the latest release of sepp with:
 
 ```bash
 cargo install sepp --locked
@@ -42,7 +39,7 @@ docker pull ghcr.io/sepp-org/sepp:latest
 Several tags are published:
 
 - `latest` is the most recent tagged release.
-- `1.2.3`, `1.2` and `1` let you pin to an exact release, or to a minor or major version line.
+- `1.2.3`, `1.2` and `1` let you pin to an exact release or to a minor or major version line.
 - `master` follows the tip of the `master` branch and is rebuilt on every push.
 - `sha-<short>` points at a single commit, for example `sha-caa284e`.
 
@@ -61,8 +58,8 @@ docker run --rm \
 
 sepp listens for gRPC on port `50051` and writes its database to
 `/sepp/sepp-data` inside the container. The [admin UI](/docs/get-started/admin-ui)
-is on too but bound to loopback inside the container where you cannot reach
-it; publishing its port is not enough, so follow the
+is on by default too but bound to loopback inside the container where you cannot reach
+it for security reasons. Publishing its port is not enough, so follow the
 [admin UI Docker setup](/docs/get-started/admin-ui#in-docker) to expose it.
 
 <Callout type="warn" title="Mount a volume for the data directory">
