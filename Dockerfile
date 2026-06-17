@@ -3,11 +3,6 @@
 FROM lukemathwalker/cargo-chef:latest-rust-1-bookworm AS chef
 WORKDIR /app
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev \
-    && rm -rf /var/lib/apt/lists/*
-ENV PROTOC_INCLUDE=/usr/include
-
 FROM chef AS planner
 COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
