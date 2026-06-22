@@ -1,11 +1,10 @@
 {
   "title": "Reference",
   "pages": [
-    "index",
-    "grpc-protocol",
     "configuration",
     "rejections",
     "server-capabilities",
-    "cli"
+    "cli",
+    "grpc-protocol"
   ]
 }

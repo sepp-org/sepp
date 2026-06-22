@@ -1,25 +1,248 @@
 ---
-title: "Configuration reference"
-description: "Every sepp.toml key with type, default, hot-reloadable flag, and description."
+title: "Configuration"
+description: "Every sepp.toml key with type, default, hot-reloadable flag and description."
 ---
 
-{/* SCAFFOLD — layout only, no prose written yet. */}
-{/* TODO(content): Exhaustive key tables (TypeTable-friendly) with type / default / hot-reloadable. Must include max_message_bytes, default_max_attempts, max_attempts_ceiling, default_priority, max_queue_depth tri-state, prometheus_listen_addr, export_interval_ms. Cross-validation rules (max_payload_bytes <= max_message_bytes; default_max_attempts <= max_attempts_ceiling; max_queue_name_bytes <= 65535). [[queues]]-only key: allowed_job_types. Env mapping: SEPP_<SECTION>__<FIELD>, env wins over file. */}
-{/* TODO(content): [admin] keys: enabled (default true, restart-only), listen_addr (default 127.0.0.1:9465, restart-only), tls_cert_path/tls_key_path (optional, both or neither, restart-only; HTTPS for the admin listener, independent of [server] TLS but may point at the same files), keys (list of {name, key, role}; roles viewer/operator/admin, role defaults to admin; omitted = auth off, loopback only; required for non-loopback binds; hot-reloadable), session_ttl_ms (default 43200000). */}
+Configuration is loaded from three layers, in order of increasing priority:
+
+1. Built-in defaults (the values listed in the tables below)
+2. The `sepp.toml` file
+3. `SEPP_`-prefixed environment variables
+
+See the [configuration guide](/docs/operations/configuration) for how the file is resolved, how hot-reloading works and the available editing paths. This page is the exhaustive key catalogue.
 
 ## [server]
 
+gRPC server bind address, data directory, TLS and queue creation policy.
+
+| Key | Type | Default | Hot-reload | Description |
+| --- | --- | --- | --- | --- |
+| `listen_addr` | string (socket address) | `0.0.0.0:50051` | restart-only | gRPC server bind address. |
+| `db_path` | string | `"./sepp-data"` | restart-only | Directory for the durable database. Must be non-empty. |
+| `tls_cert_path` | optional string | none | restart-only | TLS certificate path for the gRPC listener. Set only together with `tls_key_path`. |
+| `tls_key_path` | optional string | none | restart-only | TLS private key path for the gRPC listener. Set only together with `tls_cert_path`. |
+| `strict_queues` | boolean | `false` | yes | When `false`, the first enqueue to an unknown queue implicitly creates it. When `true`, undeclared queues are rejected with `UnknownQueue`. |
+
+<Callout type="warn" title="TLS requires both cert and key">
+Setting only one of `tls_cert_path` / `tls_key_path` is rejected at startup. Set both or leave both unset. The same rule applies to `[admin]` TLS.
+</Callout>
+
 ## [admin]
+
+The admin web UI listener, its keys, and session management. Admin TLS is independent of `[server]` TLS, though both may point at the same certificate files.
+
+| Key | Type | Default | Hot-reload | Description |
+| --- | --- | --- | --- | --- |
+| `enabled` | boolean | `true` | restart-only | Serve the admin web UI. |
+| `listen_addr` | string (socket address) | `127.0.0.1:9465` | restart-only | Admin UI bind address. |
+| `tls_cert_path` | optional string | none | restart-only | TLS certificate path for the admin listener. Both or neither. |
+| `tls_key_path` | optional string | none | restart-only | TLS private key path for the admin listener. Both or neither. |
+| `keys` | optional array of tables | none | yes | Named API keys for admin authentication. Omit to disable auth (loopback bind required). |
+| `session_ttl_ms` | integer | `43200000` (12 h) | yes | Login session validity in milliseconds. Range: `60000` (1 minute) to `31536000000` (365 days). |
+
+Each entry in `keys` is a table with three fields:
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | string | (required) | Key identifier. Must be non-empty and unique across all keys. |
+| `key` | string | (required) | Secret value. Must be non-empty and unique across all keys. |
+| `role` | string enum | `"admin"` | One of `"viewer"`, `"operator"`, or `"admin"`. |
+
+<Callout type="info" title="Role capabilities">
+**Viewer** can read dashboards and the redacted config. **Operator** can enqueue, manage dead letters and requeue jobs on top of viewer access. **Admin** has full access including queue CRUD and config edits. See the [admin UI guide](/docs/get-started/admin-ui) for details.
+</Callout>
+
+<Callout type="warn" title="Non-loopback requires keys">
+Binding the admin UI to a non-loopback address without setting `keys` is rejected at startup. Use TLS (`tls_cert_path` / `tls_key_path`) for transport encryption, or terminate TLS in a reverse proxy in front of sepp.
+</Callout>
 
 ## [auth]
 
+gRPC API key authentication for clients (producers and workers).
+
+| Key | Type | Default | Hot-reload | Description |
+| --- | --- | --- | --- | --- |
+| `api_keys` | optional array of strings | none | yes | gRPC API keys. `None` (or omitted) allows all connections. `[]` denies all. `["k1", "k2"]` allows only those keys. |
+
+<Callout type="info" title="gRPC vs admin auth">
+`[auth]` keys protect the gRPC endpoint used by SDKs. `[admin]` keys protect the web UI. They are entirely separate; you can have one, both, or neither. See [Authentication & TLS](/docs/operations/security) for the full picture.
+</Callout>
+
 ## [limits]
+
+Global ceilings checked against every request. Most limits can be overridden per-queue via a `[[queues]]` entry.
+
+| Key | Type | Default | Hot-reload | Description |
+| --- | --- | --- | --- | --- |
+| `max_lease_duration_ms` | integer | `300000` (5 min) | yes | Maximum lease time a worker may claim. Range `>= 1`. |
+| `default_max_attempts` | integer | `3` | yes | Default retry count before dead-letter. Range `>= 1`. May not exceed `max_attempts_ceiling`. |
+| `max_attempts_ceiling` | integer | `100` | yes | Hard ceiling on a job's `max_attempts` field. Range `>= 1`. Must be `>= default_max_attempts`. |
+| `default_priority` | integer | `0` | yes | Default priority when the client omits it. Range `0` to `9`; higher is more urgent. |
+| `max_reserve_batch` | integer | `256` | yes | Largest batch a `Reserve` call may claim. Range `>= 1`. |
+| `max_reserve_queues` | integer | `32` | yes | Maximum queues per `Reserve` call. Range `>= 1`. |
+| `max_wait_timeout_ms` | integer | `300000` (5 min) | yes | Clamps the `Reserve` wait timeout. Range `>= 1`. |
+| `max_enqueue_batch` | integer | `256` | yes | Largest batch in `EnqueueBatch` and `EnqueueAtomic`. Range `>= 1`. |
+| `max_queue_depth` | optional integer | none (unlimited) | yes | Cap on live jobs per queue. Omit for unlimited; `0` rejects every enqueue; a positive number enforces a hard cap. |
+| `max_payload_bytes` | integer | `1048576` (1 MiB) | yes | Largest individual job payload. Must not exceed `max_message_bytes`. |
+| `max_message_bytes` | integer | `16777216` (16 MiB) | restart-only | gRPC decode ceiling for the entire request. Must be `>= max_payload_bytes`. Range `>= 1`. |
+| `max_custom_entries` | integer | `64` | yes | Maximum key-value pairs in the job's custom map. Range `>= 1`. |
+| `max_custom_total_bytes` | integer | `16384` (16 KiB) | yes | Maximum total key-plus-value bytes in the custom map. Range `>= 1`. |
+| `max_custom_key_bytes` | integer | `256` | yes | Maximum bytes per custom map key. Range `>= 1`. |
+| `max_queue_name_bytes` | integer | `512` | yes | Maximum queue name length. Range `1` to `65535` (on-disk key format limit). |
+| `max_job_type_bytes` | integer | `256` | yes | Maximum `job_type` string length. Range `>= 1`. |
+| `max_idempotency_key_bytes` | integer | `256` | yes | Maximum idempotency key length. Range `>= 1`. |
+| `max_schedule_horizon_ms` | integer | `2592000000` (30 days) | yes | Furthest point in the future a job may be scheduled. Range `>= 1`. |
+| `allowed_encodings` | optional array of strings | none (accept all) | yes | Accepted payload `encoding` values. Omit to accept any. `[]` rejects all. `["json", "protobuf"]` allows only those. Each entry must be non-empty. |
+
+<Callout type="warn" title="Limits that gate restart-only fields">
+`max_message_bytes` is restart-only because it controls a low-level gRPC decoder parameter. `max_payload_bytes` is hot-reloadable but must never exceed `max_message_bytes`; invalid combinations are rejected at load time and on every hot-reload, leaving the previous config in place on failure.
+</Callout>
 
 ## [storage]
 
-## [logging] / [tracing] / [metrics]
+Durability, the background maintenance sweeper, deduplication, dead-letter retention, and the underlying fjall engine knobs. Every field in this section is restart-only.
+
+| Key | Type | Default | Hot-reload | Description |
+| --- | --- | --- | --- | --- |
+| `persist_mode` | string enum | `"sync_all"` | restart-only | Durability mode. See the modes table below. |
+| `sweep_interval_ms` | integer | `1000` | restart-only | Maximum time between maintenance sweeps (safety backstop). Range `>= 1`. |
+| `sweep_limit` | integer | `10000` | restart-only | Maximum jobs touched per sweep. Range `>= 1`. |
+| `dedup_window_ms` | integer | `86400000` (24 h) | restart-only | How long an idempotency key is remembered for deduplication. Range `>= 1`. |
+| `dead_letter_retention_ms` | integer | `0` (disabled) | restart-only | How long dead-lettered jobs are retained. `0` disables automatic cleanup. |
+| `command_queue_capacity` | integer | `4096` | restart-only | Capacity of the committer channel. Range `>= 1`. |
+| `cache_size_bytes` | optional integer | none (fjall default) | restart-only | Block cache size in bytes. Range `>= 1`. |
+| `max_journaling_size_bytes` | optional integer | none (fjall default: 512 MiB) | restart-only | Write-ahead log size ceiling. Minimum `67108864` (64 MiB). |
+| `max_cached_files` | optional integer | none (fjall default) | restart-only | Open file-descriptor cache limit. Minimum `10`. |
+| `worker_threads` | optional integer | none (fjall default: min(cpus, 4)) | restart-only | Flush and compaction thread count. Range `>= 1`. |
+
+### Persist modes
+
+| Mode | Behaviour |
+| --- | --- |
+| `"sync_all"` | fsync data and metadata on every commit. Strongest durability. |
+| `"sync_data"` | Flush data with `fdatasync`, skip extra metadata sync. Faster commits than `sync_all`. |
+| `"buffer"` | No fsync; relies on the OS page cache. Maximum throughput, not crash-safe. |
+
+<Callout type="warn" title="Buffer mode is not crash-safe">
+In `"buffer"` mode an acknowledged enqueue lives only in the OS page cache. An OS crash or power loss can lose writes the kernel has not yet flushed. The server logs a warning at startup when this mode is active.
+</Callout>
+
+## [logging]
+
+Log output level and format. The entire section is restart-only.
+
+| Key | Type | Default | Hot-reload | Description |
+| --- | --- | --- | --- | --- |
+| `level` | string | `"info,lsm_tree=warn,fjall=warn"` | restart-only | Log filter string (`RUST_LOG` syntax). The `RUST_LOG` environment variable overrides this value. |
+| `format` | string enum | `"text"` | restart-only | Output format: `"text"` or `"json"`. |
+
+## [tracing]
+
+OpenTelemetry trace export. The entire section is restart-only.
+
+| Key | Type | Default | Hot-reload | Description |
+| --- | --- | --- | --- | --- |
+| `enabled` | boolean | `false` | restart-only | Enable OTLP trace export. |
+| `otlp_endpoint` | string | `"http://localhost:4317"` | restart-only | OTLP collector URL. |
+| `service_name` | string | `"sepp"` | restart-only | `service.name` resource attribute. Must be non-empty when `enabled` is true. |
+| `sample_ratio` | float | `1.0` | restart-only | Head sampling ratio. Range `0.0` to `1.0`. |
+
+## [metrics]
+
+OpenTelemetry metric export and the standalone Prometheus scrape endpoint. The entire section is restart-only.
+
+| Key | Type | Default | Hot-reload | Description |
+| --- | --- | --- | --- | --- |
+| `enabled` | boolean | `false` | restart-only | Enable OTLP metric export. |
+| `otlp_endpoint` | string | `"http://localhost:4317"` | restart-only | OTLP collector URL. Must be non-empty when `enabled` is true. |
+| `export_interval_ms` | integer | `5000` | restart-only | Metric flush interval in milliseconds. Must be `> 0` when `enabled` is true. |
+| `prometheus_enabled` | boolean | `false` | restart-only | Expose a standalone Prometheus `/metrics` scrape endpoint. |
+| `prometheus_listen_addr` | string (socket address) | `0.0.0.0:9464` | restart-only | Prometheus scrape bind address. |
+
+The Prometheus endpoint is independent of OTLP and can be enabled without it. It is a plain-text HTTP endpoint; place a reverse proxy or firewall in front of it when exposing it beyond localhost.
 
 ## [[queues]] overrides
 
+An array of tables declaring named queues with per-queue limit overrides. Every field except `name` is optional and falls back to the global value from `[limits]` or `[storage]` when omitted. Adding or removing a `[[queues]]` entry is itself hot-reloadable; the queue registry swaps atomically.
+
+| Key | Type | Default | Hot-reload | Description |
+| --- | --- | --- | --- | --- |
+| `name` | string | (required) | — | Queue name. Must be valid (not empty, not `"."` or `".."`, no `/`, no control characters) and unique across all entries. |
+| `max_lease_duration_ms` | optional integer | falls to global | yes | Per-queue lease ceiling. |
+| `default_max_attempts` | optional integer | falls to global | yes | Per-queue retry budget. |
+| `max_attempts_ceiling` | optional integer | falls to global | yes | Per-queue attempt ceiling. |
+| `default_priority` | optional integer | falls to global | yes | Per-queue default priority (`0`–`9`). |
+| `max_payload_bytes` | optional integer | falls to global | yes | Per-queue payload cap. |
+| `allowed_encodings` | optional array of strings | falls to global | yes | Per-queue encoding allowlist. |
+| `allowed_job_types` | optional array of strings | none (allow all) | yes | Per-queue job type allowlist. Queue-only — there is no global equivalent. |
+| `max_schedule_horizon_ms` | optional integer | falls to global | yes | Per-queue scheduling horizon. |
+| `max_custom_entries` | optional integer | falls to global | yes | Per-queue custom entry limit. |
+| `max_custom_total_bytes` | optional integer | falls to global | yes | Per-queue custom byte limit. |
+| `max_custom_key_bytes` | optional integer | falls to global | yes | Per-queue key byte limit. |
+| `dedup_window_ms` | optional integer | falls to global | restart-only | Per-queue deduplication window. Changing this value or adding/removing a per-queue `dedup_window_ms` override requires a restart. |
+| `max_queue_depth` | optional integer | falls to global | yes | Per-queue depth cap (tri-state: omit/`0`/number). |
+
+<Callout type="info" title="Per-queue effective limits">
+When a queue has no explicit override, the global `[limits]` value applies. When an override is set, it replaces the global for that queue only. The merged effective limits are validated at load time: `default_max_attempts` must not exceed `max_attempts_ceiling`, and `max_payload_bytes` must not exceed `max_message_bytes`.
+</Callout>
+
+```toml
+[[queues]]
+name = "emails"
+default_priority = 2
+max_payload_bytes = 1048576
+
+[[queues]]
+name = "thumbnails"
+max_lease_duration_ms = 300000
+dedup_window_ms = 3600000
+```
+
 ## Environment variable mapping
 
+Every scalar config field can be set via an environment variable. The mapping rule is:
+
+```
+SEPP_<SECTION>__<FIELD>=<value>
+```
+
+The prefix `SEPP_` is stripped and the `__` (double underscore) separates the TOML section name from the field name. Values are parsed according to the field's type. Environment variables take precedence over the file, which takes precedence over built-in defaults.
+
+| Environment variable | Config path |
+| --- | --- |
+| `SEPP_SERVER__LISTEN_ADDR=0.0.0.0:6000` | `server.listen_addr` |
+| `SEPP_SERVER__STRICT_QUEUES=true` | `server.strict_queues` |
+| `SEPP_AUTH__API_KEYS` | `auth.api_keys` |
+| `SEPP_STORAGE__PERSIST_MODE=buffer` | `storage.persist_mode` |
+| `SEPP_METRICS__PROMETHEUS_LISTEN_ADDR=127.0.0.1:9464` | `metrics.prometheus_listen_addr` |
+| `SEPP_ADMIN__SESSION_TTL_MS=86400000` | `admin.session_ttl_ms` |
+
+Structured values like `[[queues]]` array entries and `[admin] keys` (arrays of tables) cannot be set through environment variables. Keep those in the `sepp.toml` file.
+
+The environment variable `SEPP_CONFIG` is reserved: it sets the path to the config file itself, not a config key. Fields pinned by environment variables override any file value and are shown as locked in the admin UI editor.
+
+## Cross-validation rules
+
+The following rules are checked when the config is loaded and on every hot-reload. If any check fails the entire new config is rejected and the server keeps running the previous valid configuration.
+
+| Rule | Scope |
+| --- | --- |
+| `tls_cert_path` and `tls_key_path` must both be set or both unset. | `[server]`, `[admin]` |
+| `max_payload_bytes` must not exceed `max_message_bytes`. | `[limits]` (and all `[[queues]]`) |
+| `default_max_attempts` must not exceed `max_attempts_ceiling`. | `[limits]` (and all `[[queues]]`) |
+| `max_queue_name_bytes` must be between `1` and `65535`. | `[limits]` |
+| Queue names must be valid (no empty, `"."`, `".."`, `/`, or control characters) and unique. | `[[queues]]` |
+| Queue names must not exceed `limits.max_queue_name_bytes`. | `[[queues]]` |
+| Admin UI on a non-loopback address requires `keys` to be set. | `[admin]` |
+| Admin `keys` entries must have non-empty, unique names and non-empty, unique secrets. | `[admin]` |
+| `session_ttl_ms` must be between `60000` and `31536000000`. | `[admin]` |
+| When `tracing.enabled` is true, `service_name` must be non-empty. | `[tracing]` |
+| When `metrics.enabled` is true, `otlp_endpoint` must be non-empty and `export_interval_ms` must be `> 0`. | `[metrics]` |
+
+## See also
+
+- [Configuration guide](/docs/operations/configuration) — how to configure sepp, hot-reloading, and the admin UI editor
+- [Authentication & TLS](/docs/operations/security) — setting up API keys, TLS, and admin authentication
+- [Queues](/docs/concepts/queues) — queue declarations, overrides, and how effective limits work
+- [Rejection catalogue](/docs/reference/rejections) — every rejection reason and which limit triggers it
+- [Server capabilities](/docs/reference/server-capabilities) — what the server advertises to clients

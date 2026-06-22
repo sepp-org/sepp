@@ -1,20 +1,252 @@
 ---
 title: "Rejection catalogue"
-description: "Every deterministic JobRejection reason, what triggers it, and how to avoid it."
+description: "Every deterministic JobRejection reason, what triggers it and how to avoid it."
 ---
 
-{/* SCAFFOLD — layout only, no prose written yet. */}
-{/* TODO(content): The 12 JobRejection variants (UnknownQueue, PayloadTooLarge, EncodingNotAllowed, JobTypeNotAllowed, CustomEntriesTooMany, CustomMapTooLarge, CustomKeyTooLong, QueueNameTooLong, JobTypeNameTooLong, IdempotencyKeyTooLong, ScheduledTooFar, InvalidRequest) with trigger, fields, governing limit. CANONICAL home — how-to pages link here. ABSORBED error-codes: the gRPC status codes (INVALID_ARGUMENT, FAILED_PRECONDITION, NOT_FOUND, UNAUTHENTICATED, INTERNAL=transient/retryable) and their per-RPC mapping, as the transient counterpart to these deterministic rejections. */}
+Sepp returns two kinds of failures: **job rejections** embedded in response messages and **gRPC status errors** that reject an entire request. This page catalogues both so you can reliably distinguish a malformed job from a transient server fault.
 
 ## Rejections vs gRPC status errors
 
+A `JobRejection` is a structured proto message returned inside a response envelope — it means *this specific job* cannot be accepted, but the rest of the batch may still succeed. A gRPC status error (e.g. `INTERNAL`, `INVALID_ARGUMENT`) means the *entire request* was rejected before any individual job was considered.
+
+| Failure type | Scope | Retryable? | Examples |
+| --- | --- | --- | --- |
+| `JobRejection` | Single job | Depends on reason | Payload too large, unknown queue |
+| gRPC `INVALID_ARGUMENT` | Whole request | No (fix the request) | Empty batch, batch exceeds max size |
+| gRPC `INTERNAL` | Whole request | Yes (transient server fault) | Storage I/O error, commit failure |
+| gRPC `UNAUTHENTICATED` | Whole request | No (fix credentials) | Missing or invalid API key |
+
 ## Queue and strict-mode rejections
+
+Rejections driven by the queue's existence, depth, or lifecycle.
+
+### UnknownQueue
+
+Returned when `strict_queues` is `true` and a job targets a queue that has not been declared via `[[queues]]` or implicitly created. When `strict_queues` is `false` (the default), the first enqueue to an unknown queue implicitly creates it and this rejection never occurs.
+
+| Property | Value |
+| --- | --- |
+| Proto field | `unknown_queue` (field 1) |
+| Deterministic | Yes |
+| Governing limit | `server.strict_queues` |
+| Response fields | `queue` (string) — the unrecognised queue name |
+
+### QueueFull
+
+Returned when the queue's live job count has reached `max_queue_depth` at admission time. Automatically clears once jobs are acknowledged and the depth drops below the cap. During atomic enqueue, capacity is checked conservatively across all jobs in the batch before any are committed; if any job would overflow its queue the entire batch is rejected.
+
+| Property | Value |
+| --- | --- |
+| Proto field | `queue_full` (field 13) |
+| Deterministic | No — transient |
+| Governing limit | `max_queue_depth` (global or per-queue) |
+| Response fields | `queue` (string), `limit` (uint64) — the configured cap that was hit |
+
+### QueueClosing
+
+Returned when a queue has an active close tombstone (a deletion is in progress). The tombstone expires 30 seconds after the last admin heartbeat; once the deletion completes or is abandoned, enqueues resume normally.
+
+| Property | Value |
+| --- | --- |
+| Proto field | `queue_closing` (field 14) |
+| Deterministic | No — transient |
+| Governing limit | None (queue lifecycle) |
+| Response fields | `queue` (string) — the closing queue name |
 
 ## Size and limit rejections
 
+Rejections triggered by job payload size, name lengths, or encoding / type allowlists.
+
+### PayloadTooLarge
+
+The job's serialised payload exceeds the effective `max_payload_bytes` for the target queue. Checked against the byte length of `payload.data`.
+
+| Property | Value |
+| --- | --- |
+| Proto field | `payload_too_large` (field 2) |
+| Deterministic | Yes |
+| Governing limit | `max_payload_bytes` (global or per-queue) |
+| Response fields | `limit` (uint64), `actual` (uint64) |
+
+### QueueNameTooLong
+
+The queue name exceeds the global `limits.max_queue_name_bytes` (default 512, capped at 65535).
+
+| Property | Value |
+| --- | --- |
+| Proto field | `queue_name_too_long` (field 8) |
+| Deterministic | Yes |
+| Governing limit | `max_queue_name_bytes` |
+| Response fields | `limit` (uint32), `actual` (uint64) |
+
+### JobTypeNameTooLong
+
+The `job_type` string exceeds `limits.max_job_type_bytes` (default 256).
+
+| Property | Value |
+| --- | --- |
+| Proto field | `job_type_name_too_long` (field 9) |
+| Deterministic | Yes |
+| Governing limit | `max_job_type_bytes` |
+| Response fields | `limit` (uint32), `actual` (uint64) |
+
+### IdempotencyKeyTooLong
+
+The idempotency key exceeds `limits.max_idempotency_key_bytes` (default 256).
+
+| Property | Value |
+| --- | --- |
+| Proto field | `idempotency_key_too_long` (field 10) |
+| Deterministic | Yes |
+| Governing limit | `max_idempotency_key_bytes` |
+| Response fields | `limit` (uint32), `actual` (uint64) |
+
+### EncodingNotAllowed
+
+The payload `encoding` field is not in the effective `allowed_encodings` allowlist. When `allowed_encodings` is `None` (the default) all encodings are accepted. When it is `Some([])` all encodings are rejected.
+
+| Property | Value |
+| --- | --- |
+| Proto field | `encoding_not_allowed` (field 3) |
+| Deterministic | Yes |
+| Governing limit | `allowed_encodings` (global or per-queue) |
+| Response fields | `encoding` (string), `allowed` (repeated string) |
+
+### JobTypeNotAllowed
+
+The job's `job_type` is not in the queue's `allowed_job_types` allowlist. This is a queue-only field — there is no global equivalent. When omitted all job types are accepted for that queue.
+
+| Property | Value |
+| --- | --- |
+| Proto field | `job_type_not_allowed` (field 4) |
+| Deterministic | Yes |
+| Governing limit | `allowed_job_types` (per-queue only) |
+| Response fields | `job_type` (string), `allowed` (repeated string) |
+
 ## Custom-map rejections
+
+Rejections from the job's custom key-value metadata map. All three are deterministic.
+
+### CustomEntriesTooMany
+
+The number of entries in the job's custom map exceeds the effective `max_custom_entries` (default 64).
+
+| Property | Value |
+| --- | --- |
+| Proto field | `custom_entries_too_many` (field 5) |
+| Deterministic | Yes |
+| Governing limit | `max_custom_entries` (global or per-queue) |
+| Response fields | `limit` (uint32), `actual` (uint32) |
+
+### CustomMapTooLarge
+
+The sum of all key and value byte lengths in the custom map exceeds the effective `max_custom_total_bytes` (default 16 KiB).
+
+| Property | Value |
+| --- | --- |
+| Proto field | `custom_map_too_large` (field 6) |
+| Deterministic | Yes |
+| Governing limit | `max_custom_total_bytes` (global or per-queue) |
+| Response fields | `limit` (uint64), `actual` (uint64) |
+
+### CustomKeyTooLong
+
+Any individual key in the custom map exceeds the effective `max_custom_key_bytes` (default 256).
+
+| Property | Value |
+| --- | --- |
+| Proto field | `custom_key_too_long` (field 7) |
+| Deterministic | Yes |
+| Governing limit | `max_custom_key_bytes` (global or per-queue) |
+| Response fields | `key` (string) — the offending key, `limit` (uint32), `actual` (uint64) |
 
 ## Schedule and validation rejections
 
+### ScheduledTooFar
+
+The job's `scheduled_at` timestamp is further into the future than the effective `max_schedule_horizon_ms` allows from the server's current time. Default horizon is 30 days.
+
+| Property | Value |
+| --- | --- |
+| Proto field | `scheduled_too_far` (field 11) |
+| Deterministic | Yes |
+| Governing limit | `max_schedule_horizon_ms` (global or per-queue) |
+| Response fields | `horizon` (Duration), `actual` (Timestamp) |
+
+### InvalidRequest
+
+Catch-all for structural validation failures that don't have a dedicated rejection reason. Includes: an empty or malformed queue name (empty, `"."`, `".."`, contains `/` or control characters), an empty payload, priority outside `0`–`9`, `max_attempts` less than `1`, or a missing required field.
+
+| Property | Value |
+| --- | --- |
+| Proto field | `invalid_request` (field 12) |
+| Deterministic | Yes |
+| Governing limit | Structural constraints |
+| Response fields | `message` (string) — human-readable description of what was invalid |
+
 ## gRPC status codes per RPC
 
+The following tables map gRPC status codes to conditions for each RPC method. Codes not listed here (e.g. `UNAUTHENTICATED` from the API key interceptor) apply uniformly.
+
+### EnqueueBatch
+
+| Code | Condition |
+| --- | --- |
+| `INVALID_ARGUMENT` | Empty batch (`jobs` is empty). |
+| `INVALID_ARGUMENT` | Batch exceeds `max_enqueue_batch`. |
+| `INTERNAL` | Storage I/O error or commit failure. |
+
+Per-job rejections are returned in `JobResult.rejection` — they are not gRPC errors.
+
+### EnqueueAtomic
+
+| Code | Condition |
+| --- | --- |
+| `INVALID_ARGUMENT` | Empty batch. |
+| `INVALID_ARGUMENT` | Batch exceeds `max_enqueue_batch`. |
+| `INTERNAL` | Storage I/O error or commit failure. |
+
+Pre-flight and commit-time rejections are returned in `BatchValidationFailure` — they are not gRPC errors.
+
+### Reserve
+
+| Code | Condition |
+| --- | --- |
+| `INVALID_ARGUMENT` | Malformed request (missing `lease_duration`, empty queue list, etc.). |
+| `INVALID_ARGUMENT` | Queue name exceeds `max_queue_name_bytes`. |
+| `INVALID_ARGUMENT` | Number of queues exceeds `max_reserve_queues`. |
+| `FAILED_PRECONDITION` | `strict_queues` is active and a requested queue is undeclared. |
+| `INTERNAL` | Storage I/O error during sweep or claim. |
+
+When the server shuts down during a long-poll reserve, the call returns an empty job list rather than an error.
+
+### Ack, Nack, Extend
+
+| Code | Condition |
+| --- | --- |
+| `INVALID_ARGUMENT` | Malformed request (invalid job ID, attempt count `< 1`, etc.). |
+| `NOT_FOUND` | The job is not in-flight (already acknowledged, lease expired, or unknown). |
+| `FAILED_PRECONDITION` | Attempt mismatch — the lease has been reassigned to another worker. |
+| `INTERNAL` | Storage I/O error or commit failure. |
+
+### DrainDeadLetters
+
+| Code | Condition |
+| --- | --- |
+| `INVALID_ARGUMENT` | Malformed request. |
+| `INTERNAL` | Storage I/O error. |
+
+### GetServerInfo
+
+| Code | Condition |
+| --- | --- |
+| `INTERNAL` | Storage I/O error (rare). |
+
+`GetServerInfo` is otherwise infallible.
+
+## See also
+
+- [Configuration reference](/docs/reference/configuration) — every governing limit key with type, default, and hot-reloadable flag
+- [Queues](/docs/concepts/queues) — queue declarations, `strict_queues`, and per-queue limit overrides
+- [Dead-letter management](/docs/operations/dead-letter-management) — what happens when a job exhausts `max_attempts`
+- [Server capabilities](/docs/reference/server-capabilities) — what the server advertises to clients via `GetServerInfo`

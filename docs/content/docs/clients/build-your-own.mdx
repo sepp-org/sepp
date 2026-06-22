@@ -3,12 +3,147 @@ title: "Build your own client"
 description: "Implement a client against the open gRPC protocol from the .proto files."
 ---
 
-## Generate stubs from the proto
+Sepp speaks standard gRPC over a single proto file. If your language has a protobuf compiler and an HTTP/2 gRPC library, you can build a client. The three official clients — [sepp-rs](https://github.com/sepp-org/sepp-rs), [sepp-py](https://github.com/sepp-org/sepp-py), and [sepp-js](https://github.com/sepp-org/sepp-js) — are small enough to read in an afternoon and demonstrate the patterns below.
 
-## Implement enqueue and reserve
+## Get the proto
 
-## Inject trace context
+The canonical proto lives on the [Buf Schema Registry](https://buf.build/sepp-org/sepp-proto). Pin a version and vendor the file:
 
-## Validate against GetServerInfo
+```bash
+buf export buf.build/sepp-org/sepp-proto:v1.2.0 -o proto
+```
+
+This drops `proto/sepp/v1/queue.proto` into your tree. The file is plain proto3 — no custom options, imports only `google/protobuf/duration.proto`, `timestamp.proto`, and `empty.proto`. The service is `sepp.v1.QueueService` with eight unary RPCs. How you compile it is up to your toolchain: `prost`/`tonic` at build time (Rust), `buf generate` with language plugins committed into the repo (Python, TypeScript), or `protoc` directly (Go, Java, C#, etc.).
+
+The full message catalogue and RPC signatures are in the [protocol reference](/docs/reference/grpc-protocol). This guide focuses on what you can't learn by reading the proto file.
+
+## Establish a connection
+
+Connect to the server's gRPC address over HTTP/2. The address is a plain `host:port` string. If you accept a URL-like argument, strip the `https://` scheme and use it to decide TLS. Three channel settings matter beyond the defaults:
+
+- **Keepalive** — interval 30 s, timeout 10 s, and keepalive-while-idle must be on. `Reserve` is a long-poll that holds the connection open with no data; without keepalive the connection will be dropped by proxies and load balancers.
+- **User-Agent** — set it to `your-client/<version>`. It shows up in server logs and metrics, which makes debugging a lot easier when someone reports a problem.
+- **Max receive message size** — the server's `max_message_bytes` defaults to 16 MiB. Set your client's receive limit at least as high, otherwise a batch of jobs with large payloads will fail at the transport layer before you ever see a rejection.
+
+Authentication is a single metadata header on every call: `authorization: Bearer <api_key>`. Pre-render it once at connection time and reuse it. If the user provides an API key without TLS, log a warning. If `[auth]` is not configured on the server the header is silently ignored.
+
+## The enqueue-reserve-ack cycle
+
+A sepp client has two halves that share a gRPC channel but otherwise operate independently: the producer side calls `EnqueueBatch` (and optionally `EnqueueAtomic`), the consumer side calls `Reserve` → `Ack`/`Nack`/`Extend` in a loop.
+
+### Enqueue
+
+`EnqueueBatch` takes a list of jobs and returns a same-length list of results. Every result is either a success (carrying the job `id`) or a rejection. A rejection is a *value*, not an error — the rest of the batch may have succeeded. The caller decides what to do with partial failures.
+
+Don't send an empty batch. The server rejects it with `INVALID_ARGUMENT`, but it's a client bug — catch it before the RPC.
+
+Retry the RPC itself only on transient statuses: `UNAVAILABLE`, `DEADLINE_EXCEEDED`, `ABORTED`, `RESOURCE_EXHAUSTED`. Use exponential backoff with jitter (the official clients use a `[0.5, 1.0)` multiplier). Don't retry `INVALID_ARGUMENT`, `UNAUTHENTICATED`, or `INTERNAL` — the first two need a code fix, the third needs the server to recover.
+
+`EnqueueAtomic` takes the same input but has different semantics: either every job is accepted, or none are. The response contains per-job validation failures rather than a mix of successes and rejections. Use it when a batch forms a transactional unit.
+
+### Reserve
+
+`Reserve` is a long-poll. You send a list of queue names (ordered — the server checks them in order and returns jobs from the first non-empty one), a `lease_duration`, and an optional `wait_timeout`. The call blocks until a job arrives or the timeout elapses.
+
+The most important implementation detail: **set the gRPC call deadline to `wait_timeout + 10 s` of slack.** If the call deadline fires before the server's internal timeout, you get a `DEADLINE_EXCEEDED` error instead of a clean empty response. The slack lets the server finish and return normally.
+
+Do not retry `Reserve`. An empty response is the normal idle case — no jobs are ready. Just call it again.
+
+Each returned `Job` carries an `id` (opaque UUID), an `attempt` number, and a `lease_expires_at` timestamp. You need all three to perform lease operations. The `attempt` is particularly important: the server uses it to detect when a lease has been reassigned to another worker. Echo it back exactly in `Ack`/`Nack`/`Extend`.
+
+Malformed jobs in a response batch (unparseable UUID, missing required fields) are possible in theory. Skip them, log a warning, and continue. One corrupt entry should not crash the consumer.
+
+### Ack, Nack, Extend
+
+All three lease operations require `job_id` and `attempt`. They share the same error semantics:
+
+- `NOT_FOUND` means the job is no longer in flight (already acked or lease expired). This is a terminal state for that particular lease — map it to a `JobNotFound` error.
+- `FAILED_PRECONDITION` means the attempt number doesn't match (the server reassigned the lease to another worker). Map it to an `AttemptMismatch` error.
+- Transient statuses (`UNAVAILABLE`, etc.) should be retried.
+
+`Nack` additionally takes a `retry` directive with three choices: an empty oneof means retry immediately under the server's default policy, `delay` schedules a retry after a given duration, and `dead_letter` sends the job straight to the dead-letter queue. Return a boolean from your `nack` wrapper indicating whether the job was dead-lettered, so the caller can drain it later.
+
+`Extend` lets a long-running handler push out the lease before it expires. Call it well before `lease_expires_at` — the server rejects extensions after the lease has already lapsed. The response carries the new expiry.
+
+## The worker pattern
+
+Your consumer API should provide a `Worker` abstraction that runs the reserve-ack-nack loop so application code only writes handler functions. Every official client ships one.
+
+A minimal worker:
+
+1. Call `GetServerInfo` at startup to discover limits and feature flags.
+2. Enter a loop: call `Reserve`, for each returned job invoke the user's handler, on success call `Ack`, on a retryable failure call `Nack` with a delay, on a permanent failure call `Nack` with `DeadLetter`.
+3. If `Reserve` returns empty, poll again immediately.
+4. Run a background task that watches `lease_expires_at` and calls `Extend` on jobs still being processed when the deadline approaches.
+5. Expose a shutdown signal. On shutdown: stop accepting new jobs (break the reserve loop), extend leases on in-flight jobs once more to give them a grace period, then cancel remaining handlers after a deadline.
+
+The official clients implement this in `worker.rs` (Rust, ~400 lines), `worker.py` (Python, ~250 lines), and `worker.ts` (TypeScript, ~350 lines). They also track which handler is processing which job so they never `Ack`/`Nack` a job that a concurrently-acked handler has already released.
+
+<Callout type="info" title="Handler errors: retryable or fatal?">
+Your `Worker` needs a way for the handler to signal intent. In the official clients the handler returns a result or raises a typed error: a `retry` variant means `Nack` with a delay, a `dead_letter` variant means `Nack` with `DeadLetter`, and anything else is treated as fatal (dead-letter). Let the handler choose what happens to the job — the worker just executes the lease operations.
+</Callout>
+
+## Propagate trace context
+
+Sepp threads W3C trace context between producer and consumer through the `trace_context` field on `EnqueueRequest` and `Job`. If you don't use distributed tracing, leave the field unset and the server ignores it. If you do, here is how to stay compatible with the official clients and the server's own tracing.
+
+### W3C traceparent format
+
+The `trace_context` message has two fields: `traceparent` (string, required) and `tracestate` (string, optional). The `traceparent` follows the [W3C Trace Context](https://www.w3.org/TR/trace-context/) spec:
+
+```
+version-trace_id-parent_id-trace_flags
+  00   -<32 hex> -<16 hex>  -<2 hex>
+```
+
+The `version` is always `00`. The `trace_id` is 32 hex characters. The `parent_id` is 16 hex characters — set this to the current span's ID so the server creates a child span linked to your producer span. The `trace_flags` is 2 hex characters; `01` means sampled, `00` means not.
+
+### On enqueue
+
+Before calling `EnqueueBatch`, get the current active span from your tracing library. If it has a valid context, build the `traceparent` string and set it on each job's `trace_context` (skip jobs that already have one). Also set `traceparent` and `tracestate` as gRPC metadata headers on every RPC call — the server's interceptor reads these to continue the gRPC-level span.
+
+All three official clients do this as a best-effort, optional step. If no tracing library is configured (or the feature flag is off), the `trace_context` field is simply left empty. The server treats a missing `trace_context` identically to one that is present — it just won't create a consumer side link.
+
+### On job processing
+
+When a `Job` arrives with a `trace_context`, create a consumer span:
+
+1. Parse `traceparent` to extract `trace_id` and `parent_span_id`.
+2. Build a `SpanContext` from them.
+3. Create a span named `sepp.process` with kind `CONSUMER`.
+4. Add a **link** from the consumer span to the producer's span context. Use a link, not a parent relationship — the producer enqueued the work asynchronously, and linking preserves the causal graph while keeping the spans in separate traces.
+5. Run the handler inside this span.
+
+The official clients back this behaviour. The Rust worker creates the span in `worker.rs` with `otel.kind = "consumer"` and a link. The Python worker does the same in `_otel.py`. The TypeScript worker decodes `traceparent` to a `SpanContext` and links it with `span.addLink(...)`.
 
 ## Conformance checklist
+
+Use this list to track completeness against the official clients.
+
+- [ ] Plaintext and TLS connection with system CA and custom CA/domain override.
+- [ ] `authorization: Bearer <key>` on every RPC; warning when API key is set without TLS.
+- [ ] Channel keepalive: 30 s interval, 10 s timeout, keepalive-while-idle on.
+- [ ] User-Agent header.
+- [ ] `EnqueueBatch` with per-job success/rejection mapping; empty batch rejected client-side; response count validated.
+- [ ] `EnqueueAtomic` with all-or-nothing semantics.
+- [ ] Retry on `UNAVAILABLE | DEADLINE_EXCEEDED | ABORTED | RESOURCE_EXHAUSTED` with exponential backoff and jitter; no retry on `INVALID_ARGUMENT | UNAUTHENTICATED | INTERNAL`.
+- [ ] `Reserve` with call deadline set to `wait_timeout + 10 s`; no retry on empty; skip malformed jobs.
+- [ ] Lease handle on each job context carrying `id`, `attempt`, and a reference back to the client.
+- [ ] `Ack` with retry; `NOT_FOUND` → job-not-found; `FAILED_PRECONDITION` → attempt-mismatch.
+- [ ] `Nack` with `default | delay | dead_letter` directive; returns dead-lettered flag.
+- [ ] `Extend` returning new `lease_expires_at`.
+- [ ] Worker loop: reserve → process → ack/nack → repeat; pre-emptive lease extension; shutdown with grace period.
+- [ ] Trace context: optional, best-effort. On enqueue: stamp `traceparent` from current span onto jobs without one. On process: create CONSUMER span with link from job's trace context. Also set `traceparent`/`tracestate` as gRPC metadata.
+- [ ] `GetServerInfo` method that returns a typed response with all advertised limits and feature flags.
+- [ ] `DrainDeadLetters` method with an optional queue name filter.
+- [ ] Job rejections returned as values (discriminated union), not thrown as exceptions.
+
+## See also
+
+- [Protocol reference](/docs/reference/grpc-protocol) — the full gRPC service definition and message catalogue
+- [Server capabilities](/docs/reference/server-capabilities) — every `GetServerInfo` field in detail
+- [Rejection catalogue](/docs/reference/rejections) — every rejection reason and its governing limit
+- [Workers](/docs/workers) — how the worker loop and lease management work from the application side
+- [sepp-rs](https://github.com/sepp-org/sepp-rs) — official Rust client (reference for `prost`/`tonic` approach)
+- [sepp-py](https://github.com/sepp-org/sepp-py) — official Python client (reference for `grpcio` approach)
+- [sepp-js](https://github.com/sepp-org/sepp-js) — official TypeScript client (reference for `@grpc/grpc-js` approach)

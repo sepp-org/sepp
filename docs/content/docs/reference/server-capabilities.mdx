@@ -1,18 +1,112 @@
 ---
 title: "Server capabilities"
-description: "The GetServerInfo response: version, protocol versions, limits, and feature flags clients use to self-validate."
+description: "The GetServerInfo response: version, protocol versions, limits and feature flags clients use to self-validate."
 ---
 
-{/* SCAFFOLD — layout only, no prose written yet. */}
-{/* TODO(content): GetServerInfoResponse reference. Include server_time_ms (clock-skew), supported_protocol_versions, restricts_encodings/allowed_encodings, and the advertised maxima (payload, custom-map, name bytes, schedule horizon, enqueue batch, reserve batch/queues, wait timeout, lease duration). NOTE max_message_bytes is NOT advertised. Map each advertised limit -> its JobRejection -> its config key. */}
+Clients call `GetServerInfo` to discover a server's version, its advertised limits and its feature flags. Use the response to validate jobs locally before enqueuing them, or to size producers and workers for the server they're connecting to.
 
-## Calling GetServerInfo
+The RPC takes an empty request and returns a `GetServerInfoResponse`. Every field is always populated; the server never returns optional values. Storage failures produce an `INTERNAL` gRPC error. The response cannot fail otherwise.
 
 ## Version and protocol fields
 
+| Field | Type | Source | Description |
+| --- | --- | --- | --- |
+| `server_version` (1) | string | `CARGO_PKG_VERSION` | Semver server version. |
+| `supported_protocol_versions` (2) | repeated string | hardcoded | Protocol versions the server supports. Currently `["v1"]`. |
+| `server_time` (3) | Timestamp | request-time wall clock | Server's current time. Compare with your local clock to detect drift and validate `scheduled_at` offsets. |
+
+<Callout type="info" title="Clock-skew detection">
+Subtract your local monotonic time from `server_time` to estimate the skew. A negative difference means the server is ahead; `scheduled_at` expressed relative to your clock may overshoot `max_schedule_horizon`. Same-sign skew under a few seconds is normal NTP jitter.
+</Callout>
+
 ## Advertised limits
 
-## Feature flags: strict_queues, dead-letter retention
+Every advertised limit is drawn from the live configuration. When the config is hot-reloaded, the next `GetServerInfo` call reflects the new values. These are the global defaults — per-queue overrides set in a `[[queues]]` entry are not reflected here.
+
+### Request ceilings
+
+Limits that cap the size or scope of gRPC requests. Exceeding these produces a whole-request gRPC error, never a per-job `JobRejection`.
+
+| Field | Type | Config key | Default | gRPC error |
+| --- | --- | --- | --- | --- |
+| `max_enqueue_batch` (14) | uint32 | `limits.max_enqueue_batch` | `256` | `INVALID_ARGUMENT` |
+| `max_reserve_batch` (15) | uint32 | `limits.max_reserve_batch` | `256` | Clamped silently |
+| `max_reserve_queues` (16) | uint32 | `limits.max_reserve_queues` | `32` | `INVALID_ARGUMENT` |
+| `max_wait_timeout` (17) | Duration | `limits.max_wait_timeout_ms` | `300000` (5 min) | Clamped silently |
+| `max_lease_duration` (18) | Duration | `limits.max_lease_duration_ms` | `300000` (5 min) | Clamped silently |
+
+`max_reserve_batch`, `max_wait_timeout`, and `max_lease_duration` are clamped: the server silently caps the caller's request to the advertised maximum rather than rejecting it. `max_enqueue_batch` and `max_reserve_queues` are enforced — exceeding them produces an error.
+
+### Per-job limits
+
+Limits checked against each individual job. Exceeding these produces a deterministic `JobRejection` returned inside the response.
+
+| Field | Type | Config key | Default | Rejection reason |
+| --- | --- | --- | --- | --- |
+| `max_payload_bytes` (6) | uint64 | `limits.max_payload_bytes` | `1048576` (1 MiB) | `PayloadTooLarge` |
+| `max_custom_entries` (7) | uint32 | `limits.max_custom_entries` | `64` | `CustomEntriesTooMany` |
+| `max_custom_total_bytes` (8) | uint64 | `limits.max_custom_total_bytes` | `16384` (16 KiB) | `CustomMapTooLarge` |
+| `max_custom_key_bytes` (9) | uint32 | `limits.max_custom_key_bytes` | `256` | `CustomKeyTooLong` |
+| `max_queue_name_bytes` (10) | uint32 | `limits.max_queue_name_bytes` | `512` | `QueueNameTooLong` |
+| `max_job_type_bytes` (11) | uint32 | `limits.max_job_type_bytes` | `256` | `JobTypeNameTooLong` |
+| `max_idempotency_key_bytes` (12) | uint32 | `limits.max_idempotency_key_bytes` | `256` | `IdempotencyKeyTooLong` |
+| `max_schedule_horizon` (13) | Duration | `limits.max_schedule_horizon_ms` | 30 days | `ScheduledTooFar` |
+
+### Encoding allowlist
+
+| Field | Type | Config key | Default |
+| --- | --- | --- | --- |
+| `restricts_encodings` (4) | bool | `limits.allowed_encodings` | `false` |
+| `allowed_encodings` (5) | repeated string | `limits.allowed_encodings` | `[]` (empty list) |
+
+When `restricts_encodings` is `false`, the server accepts any encoding — `allowed_encodings` is irrelevant. When `true`, only the encodings listed in `allowed_encodings` are accepted; anything else triggers `EncodingNotAllowed`. A non-empty `allowed_encodings` list always means `restricts_encodings` is `true`, even if the list contains every encoding a client might send.
+
+### Limits not advertised
+
+Several config limits are deliberately excluded from `GetServerInfoResponse` because they are server-internal, non-actionable for clients, or per-queue only.
+
+| Config key | Default | Omitted because |
+| --- | --- | --- |
+| `limits.max_message_bytes` | 16 MiB | gRPC frame size ceiling. The client's transport handles this at the protocol level. |
+| `limits.default_max_attempts` | `3` | Clients supply their own `max_attempts`; the server's default is an internal fallback. |
+| `limits.max_attempts_ceiling` | `100` | The server silently clamps the client's `max_attempts` to this ceiling. |
+| `limits.default_priority` | `0` | Clients supply their own priority; the server's default is an internal fallback. |
+| `limits.max_queue_depth` | `None` (unlimited) | Per-queue cap. A depth limit is transient (`QueueFull`), not a validation ceiling. |
+| `storage.dedup_window_ms` | 24 h | Idempotency deduplication window. Determines whether a retry is deduplicated, not whether a job is accepted. |
+| `limits.allowed_job_types` | `None` (unrestricted) | Queue-only field; there is no global `allowed_job_types`. |
+
+## Feature flags
+
+Two boolean flags describe server-wide behaviour modes.
+
+| Field | Type | Config key | Default | Hot-reload |
+| --- | --- | --- | --- | --- |
+| `strict_queues` (19) | bool | `server.strict_queues` | `false` | Yes |
+| `dead_letter_retention_enabled` (20) | bool | `storage.dead_letter_retention_ms` | `false` | No (restart-only) |
+
+When `strict_queues` is `true`, enqueuing to an undeclared queue is rejected with `UnknownQueue`. When `false`, queues are created on first use. The server reads this from the live config, so a hot-reload takes effect immediately.
+
+`dead_letter_retention_enabled` is `true` when `storage.dead_letter_retention_ms > 0`. When `false`, jobs that exhaust their `max_attempts` are deleted immediately and `DrainDeadLetters` always returns an empty list. This value is captured at startup and does not change until the server restarts.
 
 ## Using capabilities for local validation
 
+Clients can validate jobs locally before sending them, catching rejections early and avoiding wasted round trips.
+
+**Size checks.** Compare `payload.data.len()` against `max_payload_bytes`, custom entry counts and byte totals against `max_custom_*`, and queue name, job type, and idempotency key string lengths against their respective `max_*_bytes` fields. These limits are deterministic — if the client and the server see the same values, the outcome is the same.
+
+**Schedule horizon.** Convert your intended `scheduled_at` to milliseconds-since-epoch, subtract `server_time` (also in epoch millis), and compare the delta to `max_schedule_horizon`. Use `server_time`, not your local clock, because the server checks the horizon against its own wall clock.
+
+**Encoding validation.** Check `restricts_encodings` first. If `true`, your payload's `encoding` must appear in `allowed_encodings`.
+
+**Strict mode.** When `strict_queues` is `true`, the client should consult its own registry of known queues. Queues not in that list will be rejected with `UnknownQueue`. When `false`, any valid queue name is accepted.
+
+<Callout type="info" title="Re-fetch after configuration changes">
+The server's limits reflect the live config and may change at any time due to a hot-reload. Cache the `GetServerInfoResponse` but re-fetch it after receiving an unexpected deterministic rejection — the limit may have been tightened since your last call.
+</Callout>
+
+## See also
+
+- [Rejection catalogue](/docs/reference/rejections) — every rejection reason and which advertised limit triggers it
+- [Configuration reference](/docs/reference/configuration) — exhaustive key tables for every config field that governs these capabilities
+- [Protocol reference](/docs/reference/grpc-protocol) — the full gRPC service definition, request and response messages
+- [Queues](/docs/concepts/queues) — how `strict_queues` and per-queue overrides interact with global limits
