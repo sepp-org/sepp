@@ -1,6 +1,7 @@
 use std::process::ExitCode;
 use std::time::Duration;
 
+use clap::{Parser, Subcommand};
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
@@ -18,57 +19,46 @@ use tracing::{debug, info, warn};
 
 const EXAMPLE_CONFIG: &str = include_str!("../sepp.example.toml");
 
-fn config_path_arg() -> Option<String> {
-    let mut args = std::env::args();
+#[derive(Parser)]
+#[command(
+    name = "sepp",
+    version,
+    about = "A language-agnostic durable job queue"
+)]
+struct Cli {
+    #[arg(long, env = "SEPP_CONFIG", value_name = "PATH")]
+    config: Option<String>,
 
-    while let Some(arg) = args.next() {
-        if arg == "--config" {
-            return args.next();
-        }
-        if let Some(path) = arg.strip_prefix("--config=") {
-            return Some(path.to_string());
-        }
-    }
-
-    std::env::var("SEPP_CONFIG").ok()
+    #[command(subcommand)]
+    command: Option<Commands>,
 }
 
-fn handle_subcommand() -> Option<ExitCode> {
-    let mut args = std::env::args().skip(1);
-    match args.next().as_deref() {
-        Some("config") => match args.next().as_deref() {
-            Some("example") => {
-                print!("{EXAMPLE_CONFIG}");
-                Some(ExitCode::SUCCESS)
-            }
-            Some(other) => {
-                eprintln!(
-                    "sepp config: unknown subcommand '{other}'\n\nusage: sepp config example"
-                );
-                Some(ExitCode::FAILURE)
-            }
-            None => {
-                eprintln!("sepp config: missing subcommand\n\nusage: sepp config example");
-                Some(ExitCode::FAILURE)
-            }
-        },
-        Some(arg) if !arg.starts_with('-') => {
-            eprintln!(
-                "sepp: unknown subcommand '{arg}'\n\nusage: sepp [config example] [--config <path>]"
-            );
-            Some(ExitCode::FAILURE)
-        }
-        _ => None,
-    }
+#[derive(Subcommand)]
+enum Commands {
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigAction {
+    Example,
 }
 
 #[tokio::main]
 async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
-    if let Some(code) = handle_subcommand() {
-        return Ok(code);
+    let cli = Cli::parse();
+
+    if let Some(Commands::Config {
+        action: ConfigAction::Example,
+    }) = &cli.command
+    {
+        print!("{EXAMPLE_CONFIG}");
+        return Ok(ExitCode::SUCCESS);
     }
 
-    let config_path = config_path_arg();
+    let config_path = cli.config;
     let config = Config::load(config_path.as_deref())?;
     let _telemetry = telemetry::init(&config.logging, &config.tracing)?;
 

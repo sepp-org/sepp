@@ -1,16 +1,83 @@
 ---
 title: "CLI"
-description: "The sepp command, its config subcommand, and the flags and environment variables it reads."
+description: "The sepp command, its config subcommand and the flags and environment variables it reads."
 ---
-
-{/* SCAFFOLD — layout only, no prose written yet. */}
-{/* TODO(content): CLI reference. Default run mode; `sepp config example`; --config / SEPP_CONFIG resolution (defaults to ./sepp.toml); SIGTERM/Ctrl-C; exit codes. */}
 
 ## sepp (run the server)
 
-## sepp config example
+```
+sepp [--config <PATH>]
+```
+
+Invoking `sepp` with no arguments starts the queue server. It reads its
+configuration from a TOML file (see [Configuration](../configuration)) and
+serves the gRPC API, the admin web UI, and optional metrics and tracing
+endpoints.
+
+The server runs until it receives **SIGTERM** (Unix) or **Ctrl-C**, at which
+point it drains in-flight work and shuts down gracefully.
+
+Exit codes:
+
+| Code | Meaning |
+|------|---------|
+| `0`  | Normal shutdown (SIGTERM / Ctrl-C, or `sepp config example` completed). |
+| `1`  | Startup error (e.g. missing config file, invalid TLS material, port in use). |
 
 ## --config and SEPP_CONFIG
 
-## Signals and exit codes
+```
+--config <PATH>
+SEPP_CONFIG=<PATH>
+```
 
+Overrides the path to the TOML configuration file. The `--config` flag takes
+precedence; if it is not passed, `sepp` checks the `SEPP_CONFIG` environment
+variable. When neither is set, the server looks for `./sepp.toml` in the
+working directory.
+
+When a path is **explicitly** given (via `--config` or `SEPP_CONFIG`) and the
+file does not exist, `sepp` exits with an error. When the default
+`./sepp.toml` is used implicitly, a missing file is not an error — the server
+starts with only compiled-in defaults and `SEPP_` environment overrides.
+
+Every configuration field can also be set via environment variables with the
+prefix `SEPP_`, using `__` (double underscore) as the section separator:
+
+```
+SEPP_SERVER__LISTEN_ADDR=0.0.0.0:6000
+SEPP_ADMIN__ENABLED=false
+SEPP_LOGGING__LEVEL=debug
+```
+
+Env-var overrides always take precedence over the TOML file. See
+[Configuration](../configuration) for the full list of fields.
+
+## sepp config example
+
+```
+sepp config example
+```
+
+Prints the example configuration file (`sepp.example.toml`) to stdout and
+exits. This is a convenient way to bootstrap a configuration:
+
+```
+sepp config example > sepp.toml
+```
+
+## sepp --help
+
+```
+sepp --help
+```
+
+Prints a usage summary listing every subcommand, flag, and option.
+
+## sepp --version
+
+```
+sepp --version
+```
+
+Prints the server version and exits.
