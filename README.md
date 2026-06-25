@@ -40,20 +40,30 @@
 ## Operational
 
 - Single static Rust binary, embedded storage.
-- Durable by default. If using the `sync_all` persist mode, all operations are guaranteed to be `fsync`-ed.
+- Durable by default. If using the `sync_all` persist mode, all successful operations are guaranteed to be `fsync`-ed.
 - End-to-end distributed OpenTelemetry tracing across clients and server. The client SDKs inject trace context automatically.
-- OpenTelemetry metrics.
+- OpenTelemetry/Prometheus metrics.
 - Clients and server talk gRPC. Bring your own client if you wish.
 
----
+## Install
 
-## Building
-
+Via Cargo:
 ```sh
-cargo build
-cargo test
+cargo install sepp --locked
 ```
 
-Request validation rules are documented as comments in
-[`proto/sepp/v1/queue.proto`](proto/sepp/v1/queue.proto) and enforced by the
-server in [`src/validate.rs`](src/validate.rs).
+Build from source:
+```sh
+git clone https://github.com/sepp-org/sepp.git
+cd sepp
+cargo build --release
+```
+
+or grab a binary from the [releases page](https://github.com/sepp-org/sepp/releases).
+
+### Docker
+
+Start sepp with:
+```sh
+docker pull ghcr.io/sepp-org/sepp:latest
+```
