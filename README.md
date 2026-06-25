@@ -14,6 +14,8 @@
 
   <p>
     <a href="https://github.com/sepp-org/sepp/actions"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/sepp-org/sepp/ci.yml?branch=master&labelColor=181512"></a>
+    <a href="https://crates.io/crates/sepp"><img alt="crates.io" src="https://img.shields.io/crates/v/sepp?labelColor=181512"></a>
+    <a href="https://crates.io/crates/sepp"><img alt="downloads" src="https://img.shields.io/crates/d/sepp?labelColor=181512"></a>
     <a href="LICENSE"><img alt="license" src="https://img.shields.io/github/license/sepp-org/sepp?color=ec6a2e&labelColor=181512"></a>
     <a href="https://github.com/sepp-org/sepp/stargazers"><img alt="stars" src="https://img.shields.io/github/stars/sepp-org/sepp?style=flat&color=ec6a2e&labelColor=181512"></a>
   </p>
@@ -27,6 +29,9 @@
     ·
     <a href="https://github.com/sepp-org/sepp/issues">Issues</a>
   </p>
+
+  > [!WARNING]
+  > As sepp is pre 1.0, expect bugs and other teething issues when running it in production. Please submit an issue if you encounter any problems.
 </div>
 
 ## Functionality
@@ -80,6 +85,10 @@ The admin UI is accessible at [http://localhost:9465](http://localhost:9465) wit
 ### Client SDKs
 
 sepp has official clients for [Rust](TODO), [Python](TODO) and [Node.js](TODO). See your preferred language's client SDK for usage instructions.
+
+## Docs
+
+sepp has in-depth documentation on its [docs site](https://sepp-org.github.io/sepp/docs/). The docs include guides for running sepp in production, configuring it and even building your own client.
 
 ## License
 
