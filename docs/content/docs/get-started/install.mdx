@@ -58,9 +58,19 @@ docker run --rm \
 
 sepp listens for gRPC on port `50051` and writes its database to
 `/sepp/sepp-data` inside the container. The [admin UI](/docs/get-started/admin-ui)
-is on by default too but bound to loopback inside the container where you cannot reach
-it for security reasons. Publishing its port is not enough, so follow the
-[admin UI Docker setup](/docs/get-started/admin-ui#in-docker) to expose it.
+is on by default, bound to `0.0.0.0:9465` with a demo admin key. Publish the
+port to reach it:
+
+```bash
+docker run --rm \
+  -p 50051:50051 -p 9465:9465 \
+  -v sepp-data:/sepp/sepp-data \
+  ghcr.io/sepp-org/sepp:latest
+```
+
+Log in with name `admin` and key `admin`.
+**Replace the demo key before exposing the port on a network.**
+See the [admin UI guide](/docs/get-started/admin-ui#in-docker) for details.
 
 <Callout type="warn" title="Mount a volume for the data directory">
 Everything sepp persists lives under `/sepp/sepp-data`. If you do not mount a

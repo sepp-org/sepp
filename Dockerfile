@@ -15,13 +15,23 @@ COPY . .
 RUN cargo build --release --bin sepp \
     && mkdir -p /app/empty-data
 
+# Transform the example config for Docker: bind admin UI to all interfaces
+# with a demo key so it is reachable without mounting a custom config.
+RUN cp /app/sepp.example.toml /app/sepp.docker.toml \
+    && sed -i \
+        -e 's/listen_addr = "127\.0\.0\.1:9465"/listen_addr = "0.0.0.0:9465"/' \
+        -e 's/^#keys = \[/keys = [/' \
+        -e 's/^#  { name = "alice".*$/  { name = "admin", key = "admin", role = "admin" },/' \
+        -e '/^#  { name = "dashboard"/d' \
+        -e 's/^#\]/]/' \
+        /app/sepp.docker.toml
+
 FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
 WORKDIR /sepp
 COPY --from=builder /app/target/release/sepp /usr/local/bin/sepp
-COPY --from=builder /app/sepp.example.toml /etc/sepp/sepp.toml
+COPY --from=builder /app/sepp.docker.toml /etc/sepp/sepp.toml
 COPY --from=builder --chown=65532:65532 /app/empty-data/ /sepp/sepp-data/
-# 50051 gRPC, 9464 Prometheus (off by default), 9465 admin UI (loopback-bound
-# by default; reaching it from outside needs a listen_addr + keys override)
+# 50051 gRPC, 9464 Prometheus (off by default), 9465 admin UI
 EXPOSE 50051 9464 9465
 VOLUME ["/sepp/sepp-data"]
 ENV SEPP_CONFIG=/etc/sepp/sepp.toml

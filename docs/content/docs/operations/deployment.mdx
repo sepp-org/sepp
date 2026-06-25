@@ -25,7 +25,7 @@ The multi-architecture image is published to the GitHub Container Registry at `g
 
 - **Pin a version tag** (`ghcr.io/sepp-org/sepp:1.2.3`) rather than `latest` or `master`, so each redeploy is deliberate.
 - **Persist the data volume.** Mount a named volume or host directory at `/sepp/sepp-data`, the image's `db_path`. Without it every job is lost when the container is removed. The directory is owned by uid `65532` (the image runs as non-root), so a bind mount must be writable by that user.
-- **The admin UI is loopback-bound inside the container**, so publishing its port is not enough. To reach it, bind `0.0.0.0` and set `[admin] keys`; see [admin UI in Docker](/docs/get-started/admin-ui#in-docker).
+- **The admin UI** is reachable by publishing port 9465. The default config includes a demo admin key; replace it before exposing the port on a network. See [admin UI in Docker](/docs/get-started/admin-ui#in-docker).
 
 ## systemd unit
 

@@ -23,15 +23,17 @@ enabled = false
 
 ### In Docker
 
-Inside a container the default loopback bind is unreachable from the host, so publishing the port alone is not enough: the UI has to bind `0.0.0.0` and a non-loopback bind requires keys. Write a config:
+The image transforms the default config at build time to bind `0.0.0.0:9465` with a demo admin key, so publishing the port is enough:
 
-```toml
-[admin]
-listen_addr = "0.0.0.0:9465"
-keys = [{ name = "me", key = "generate-a-long-random-secret" }]
+```bash
+docker run --rm \
+  -p 50051:50051 -p 9465:9465 \
+  -v sepp-data:/sepp/sepp-data \
+  ghcr.io/sepp-org/sepp:latest
 ```
 
-mount it over the image's config path and publish the port:
+Open [http://localhost:9465](http://localhost:9465) and log in with name `admin` and key `admin`. **Change this before exposing the port on a production network.**
+To change keys, generate a config with `docker run --rm ghcr.io/sepp-org/sepp:latest config example`, edit the `[admin]` section and mount it:
 
 ```bash
 docker run --rm \
