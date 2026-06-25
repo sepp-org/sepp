@@ -65,5 +65,22 @@ or grab a binary from the [releases page](https://github.com/sepp-org/sepp/relea
 
 Start sepp with:
 ```sh
-docker pull ghcr.io/sepp-org/sepp:latest
+docker run --rm \
+  -p 50051:50051 -p 9465:9465 \
+  -v sepp-data:/sepp/sepp-data \
+  ghcr.io/sepp-org/sepp:latest
 ```
+
+## Quickstart
+
+By default, sepp listens on `localhost:50051` and persists data to a `sepp-data` directory in the current working directory. You can generate a config file to edit with `sepp config example > sepp.toml`. Sepp will pick it up automatically as long as it is named `sepp.toml` and in the same directory as the binary or you can specify a custom path with the `SEPP_CONFIG` environment variable. Specifying a custom path is also possible via the `--config` CLI flag.
+
+The admin UI is accessible at [http://localhost:9465](http://localhost:9465) with the default login `admin` and key `admin`. Change this before exposing the port on a production network.
+
+### Client SDKs
+
+sepp has official clients for [Rust](TODO), [Python](TODO) and [Node.js](TODO). See your preferred language's client SDK for usage instructions.
+
+## License
+
+sepp is licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for details.

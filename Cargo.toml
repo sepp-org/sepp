@@ -2,6 +2,13 @@
 name = "sepp"
 version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0"
+readme = "README.md"
+description = "A small, language-agnostic durable job queue."
+documentation = "https://sepp-org.github.io/sepp/docs/"
+repository = "https://github.com/sepp-org/sepp"
+keywords = ["job-queue", "task-queue", "worker", "background-jobs", "grpc", "durable", "message-queue"]
+categories = ["asynchronous", "network-programming"]
 
 [dependencies]
 tonic = { version = "0.14", features = ["tls-ring"] }
@@ -36,8 +43,6 @@ axum = "0.8"
 # with no unambiguous process-level provider (runtime panic).
 axum-server = { version = "0.8", default-features = false, features = ["tls-rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
-# 1.10 is the first release with the PemObject loaders; std enables the
-# from_pem_file variants.
 rustls-pki-types = { version = "1.14", features = ["std"] }
 clap = { version = "4", features = ["derive", "env"] }
 serde_json = "1"
