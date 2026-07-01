@@ -117,7 +117,9 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
         warn!("API-key auth is enabled without TLS; keys are sent in plaintext");
     }
 
-    let incoming = TcpIncoming::bind(addr).map_err(|e| format!("binding {addr}: {e}"))?;
+    let incoming = TcpIncoming::bind(addr)
+        .map_err(|e| format!("binding {addr}: {e}"))?
+        .with_nodelay(Some(true)); // Disable Nagle
     let local_addr = incoming
         .local_addr()
         .map_err(|e| format!("resolving bound address: {e}"))?;
