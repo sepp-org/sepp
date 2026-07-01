@@ -29,10 +29,10 @@
     ·
     <a href="https://github.com/sepp-org/sepp/issues">Issues</a>
   </p>
-
-  > [!WARNING]
-  > As sepp is pre 1.0, expect bugs and other teething issues when running it in production. Please submit an issue if you encounter any problems.
 </div>
+
+> [!WARNING]
+> As sepp is pre 1.0, expect bugs and other teething issues when running it in production. Please submit an issue if you encounter any problems.
 
 ## Functionality
 
