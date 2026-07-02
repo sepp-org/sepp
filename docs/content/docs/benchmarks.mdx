@@ -1,0 +1,148 @@
+---
+title: "Benchmarks"
+description: "Throughput, latency and concurrency scaling for sepp against beanstalkd, Faktory and NATS JetStream."
+---
+
+sepp is benchmarked against beanstalkd, Faktory and NATS JetStream with an identical workload. Brokers run one at a time in Docker under identical resource caps and each is driven by its native client over its native protocol.
+
+## Methodology
+
+Three phases run in order against each broker:
+
+1. **Enqueue.** N producer connections enqueue 256 byte jobs one RPC at a time until 200,000 are stored. Reported as jobs/s.
+2. **Drain.** N worker connections reserve and acknowledge one job at a time until the queue is empty, so a drained job costs two RPCs. The timer stops at the last ack; idle reserve polls after the queue empties don't inflate the number.
+3. **Latency.** One connection runs sequential enqueue, reserve, ack round trips. Reported as p50/p99/p999 of the full round trip.
+
+Each connection keeps exactly one job in flight. These are closed-loop numbers: they measure sustainable throughput, not behavior under overload. The headline tables use 50 producers and 50 workers.
+
+## Durability modes
+
+A fair comparison requires equal durability guarantees, so the suite runs twice:
+
+| broker | durable | buffered |
+| --- | --- | --- |
+| sepp | `persist_mode = "sync_data"` | `persist_mode = "buffer"` |
+| beanstalkd | binlog, `-f 0` (fsync every write) | binlog, `-f 86400000` |
+| Faktory | none available | defaults (Redis RDB snapshots) |
+| NATS JetStream | file storage, `sync_interval: always` | file storage, default flushing |
+
+In durable mode an operation is fsync-ed before the broker acknowledges it. Faktory persists only via periodic RDB snapshots (`save 120 1`, `save 30 5`, hardcoded in its storage layer), so it appears only in the buffered table.
+
+## Durable results
+
+| broker | enqueue jobs/s | drain jobs/s | p50 ms | p99 ms | p999 ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| sepp | 15,325 | 6,980 | 4.820 | 9.784 | 12.755 |
+| beanstalkd | 1,494 | 1,431 | 1.421 | 6.261 | 7.057 |
+| Faktory | - | - | - | - | - |
+| NATS JetStream | 716 | 724 | 3.202 | 23.750 | 34.420 |
+
+## Buffered results
+
+<Callout type="info" title="Not the recommended use case">
+    sepp is designed for durability. Although it can run in buffered mode, some architectural design decisions made to make durable mode fast (like a single committer thread) make buffered mode slower than the other brokers. It is still plenty fast enough for most applications.
+</Callout>
+
+| broker | enqueue jobs/s | drain jobs/s | p50 ms | p99 ms | p999 ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| sepp | 52,325 | 25,124 | 1.077 | 1.305 | 1.728 |
+| beanstalkd | 44,324 | 30,530 | 0.275 | 0.462 | 0.545 |
+| Faktory | 77,643 | 23,315 | 0.855 | 1.052 | 1.178 |
+| NATS JetStream | 97,857 | 29,205 | 0.664 | 0.822 | 1.132 |
+
+With durability off the field compresses to within roughly 2x and the ordering follows protocol overhead. The gap between the two tables is what durability costs: sepp keeps 29% of its buffered enqueue rate, beanstalkd keeps 3% and NATS keeps under 1%.
+
+## Throughput vs concurrency
+
+Durable mode with equal producer and worker counts.
+
+<style>{`
+.bench-sweep .s1{stroke:#eb6834}.bench-sweep .s2{stroke:#2a78d6}.bench-sweep .s3{stroke:#1baf7a}
+.bench-sweep .f1{fill:#eb6834}.bench-sweep .f2{fill:#2a78d6}.bench-sweep .f3{fill:#1baf7a}
+.dark .bench-sweep .s1{stroke:#d95926}.dark .bench-sweep .s2{stroke:#3987e5}.dark .bench-sweep .s3{stroke:#199e70}
+.dark .bench-sweep .f1{fill:#d95926}.dark .bench-sweep .f2{fill:#3987e5}.dark .bench-sweep .f3{fill:#199e70}
+.bench-sweep .pt{stroke:var(--color-fd-background,#fff);stroke-width:1.5}
+`}</style>
+
+<figure className="bench-sweep">
+  <svg viewBox="0 0 640 384" role="img" style={{width:'100%',height:'auto'}} aria-label="Durable enqueue throughput versus concurrent connections on log scales. sepp grows from 708 jobs/s at one connection to 37,184 at 256. beanstalkd stays near 1,500 and NATS JetStream near 720.">
+    {/* legend */}
+    <circle className="f1 pt" cx="60" cy="15" r="4" />
+    <text x="70" y="15" fontSize="12.5" dominantBaseline="central" fill="currentColor" fillOpacity="0.85">sepp</text>
+    <circle className="f2 pt" cx="120" cy="15" r="4" />
+    <text x="130" y="15" fontSize="12.5" dominantBaseline="central" fill="currentColor" fillOpacity="0.85">beanstalkd</text>
+    <circle className="f3 pt" cx="220" cy="15" r="4" />
+    <text x="230" y="15" fontSize="12.5" dominantBaseline="central" fill="currentColor" fillOpacity="0.85">NATS JetStream</text>
+    {/* gridlines and y ticks (jobs/s, log) */}
+    <g stroke="currentColor" strokeOpacity="0.1">
+      <line x1="56" y1="36" x2="520" y2="36" />
+      <line x1="56" y1="95.7" x2="520" y2="95.7" />
+      <line x1="56" y1="140.8" x2="520" y2="140.8" />
+      <line x1="56" y1="186" x2="520" y2="186" />
+      <line x1="56" y1="245.7" x2="520" y2="245.7" />
+      <line x1="56" y1="290.8" x2="520" y2="290.8" />
+    </g>
+    <line x1="56" y1="336" x2="520" y2="336" stroke="currentColor" strokeOpacity="0.25" />
+    <g fontSize="11" fill="currentColor" fillOpacity="0.55" textAnchor="end">
+      <text x="48" y="39">50k</text>
+      <text x="48" y="98.7">20k</text>
+      <text x="48" y="143.8">10k</text>
+      <text x="48" y="189">5k</text>
+      <text x="48" y="248.7">2k</text>
+      <text x="48" y="293.8">1k</text>
+      <text x="48" y="339">500</text>
+    </g>
+    {/* x ticks (connections, log) */}
+    <g fontSize="11" fill="currentColor" fillOpacity="0.55" textAnchor="middle">
+      <text x="56" y="356">1</text>
+      <text x="230" y="356">8</text>
+      <text x="404" y="356">64</text>
+      <text x="520" y="356">256</text>
+    </g>
+    {/* axis titles */}
+    <text x="288" y="376" fontSize="11" fill="currentColor" fillOpacity="0.55" textAnchor="middle">connections</text>
+    <text transform="rotate(-90)" x="-186" y="14" fontSize="11" fill="currentColor" fillOpacity="0.55" textAnchor="middle">jobs/s</text>
+    {/* series */}
+    <polyline className="s1" points="56,313.3 230,216.6 404,99 520,55.3" fill="none" strokeWidth="2" strokeLinejoin="round" strokeLinecap="round" />
+    <polyline className="s2" points="56,306.6 230,263.7 404,264.5 520,266.2" fill="none" strokeWidth="2" strokeLinejoin="round" strokeLinecap="round" />
+    <polyline className="s3" points="56,329.7 230,313.3 404,312.2 520,311.9" fill="none" strokeWidth="2" strokeLinejoin="round" strokeLinecap="round" />
+    <g className="f1"><circle className="pt" cx="56" cy="313.3" r="4" /><circle className="pt" cx="230" cy="216.6" r="4" /><circle className="pt" cx="404" cy="99" r="4" /><circle className="pt" cx="520" cy="55.3" r="4" /></g>
+    <g className="f2"><circle className="pt" cx="56" cy="306.6" r="4" /><circle className="pt" cx="230" cy="263.7" r="4" /><circle className="pt" cx="404" cy="264.5" r="4" /><circle className="pt" cx="520" cy="266.2" r="4" /></g>
+    <g className="f3"><circle className="pt" cx="56" cy="329.7" r="4" /><circle className="pt" cx="230" cy="313.3" r="4" /><circle className="pt" cx="404" cy="312.2" r="4" /><circle className="pt" cx="520" cy="311.9" r="4" /></g>
+    {/* direct labels at line ends */}
+    <g fontSize="12.5" dominantBaseline="central" fill="currentColor">
+      <text x="528" y="55.3" fontWeight="600" fillOpacity="0.85">sepp <tspan fontWeight="400" fillOpacity="0.6">37,184</tspan></text>
+      <text x="528" y="266.2" fontWeight="600" fillOpacity="0.85">beanstalkd <tspan fontWeight="400" fillOpacity="0.6">1,460</tspan></text>
+      <text x="528" y="311.9" fontWeight="600" fillOpacity="0.85">NATS <tspan fontWeight="400" fillOpacity="0.6">724</tspan></text>
+    </g>
+  </svg>
+  <figcaption>Durable enqueue throughput (jobs/s) by concurrent connections. Both axes are logarithmic.</figcaption>
+</figure>
+
+<details>
+<summary>Chart data, including drain</summary>
+
+Cells are enqueue / drain jobs/s.
+
+| connections | sepp | beanstalkd | NATS JetStream |
+| ---: | ---: | ---: | ---: |
+| 1 | 708 / 543 | 785 / 1,166 | 551 / 576 |
+| 8 | 3,127 / 2,405 | 1,516 / 1,459 | 708 / 704 |
+| 64 | 19,011 / 8,289 | 1,498 / 1,446 | 720 / 718 |
+| 256 | 37,184 / 18,596 | 1,460 / 1,445 | 724 / 721 |
+
+</details>
+
+At one connection every broker pays a full fsync per job and all three land within 1.4x of each other. sepp's committer batches every operation waiting in line into a single fsync (group commit), so throughput grows with the number of concurrent connections. beanstalkd and NATS fsync serially and plateau by eight connections. At 256 connections durable sepp reaches 71% of its own buffered enqueue rate.
+
+Job counts scale with concurrency in these runs (5,000 at one connection, 40,000 at eight, 200,000 above) to keep wall times comparable. Throughput is a rate, so rows remain comparable.
+
+## Environment
+
+- AMD Ryzen 5 7600X (6 cores, 12 threads), 32 GB RAM
+- Kingston Fury Renegade NVMe (7,300 MB/s read, 6,000 MB/s write)
+- Docker Desktop on WSL2, Windows 11
+
+Each broker container is capped at 8 CPUs and 8 GB of memory; drivers run unconstrained so the broker is always the bottleneck under test. Versions: sepp 0.1.0, beanstalkd 1.13, Faktory 1.9.4, NATS 2.10.
+
+Durable throughput tracks the disk's fsync latency above all else. Absolute numbers will differ on enterprise drives with power-loss protection or on cloud block storage, so rerun the suite on your own hardware before drawing fine-grained conclusions.

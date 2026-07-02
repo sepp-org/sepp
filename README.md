@@ -50,6 +50,19 @@
 - OpenTelemetry/Prometheus metrics.
 - Clients and server talk gRPC. Bring your own client if you wish.
 
+## Benchmarks
+
+With every operation fsync-ed before it is acknowledged, sepp sustains roughly 10x the throughput of beanstalkd and 20x NATS JetStream (200,000 jobs, 256 byte payloads, 50 producers and 50 workers, no batching). Sepp also support batch enqueue and drain operation, which can dramatically increase throughput even further.
+
+| broker | enqueue jobs/s | drain jobs/s |
+|---|---:|---:|
+| sepp | 15,325 | 6,980 |
+| beanstalkd | 1,494 | 1,431 |
+| Faktory | - | - |
+| NATS JetStream | 716 | 724 |
+
+Faktory has no fully durable mode. Buffered-mode results, concurrency scaling, methodology and hardware are in the [benchmark docs](https://sepp-org.github.io/sepp/docs/benchmarks/).
+
 ## Install
 
 Via Cargo:
