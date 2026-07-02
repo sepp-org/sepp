@@ -52,7 +52,7 @@
 
 ## Benchmarks
 
-With every operation fsync-ed before it is acknowledged, sepp sustains roughly 10x the throughput of beanstalkd and 20x NATS JetStream (200,000 jobs, 256 byte payloads, 50 producers and 50 workers, no batching). Sepp also support batch enqueue and drain operation, which can dramatically increase throughput even further.
+With every operation fsync-ed before it is acknowledged, sepp sustains roughly 10x the throughput of beanstalkd and 20x NATS JetStream (200,000 jobs, 256 byte payloads, 50 producers and 50 workers, no batching). Sepp also supports batch enqueue and drain operation, which can dramatically increase throughput even further.
 
 | broker | enqueue jobs/s | drain jobs/s |
 |---|---:|---:|
