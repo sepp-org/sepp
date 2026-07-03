@@ -1,4 +1,8 @@
 @import "tailwindcss";
+/* dist is committed (the server embeds it), so keep it out of Tailwind's class
+   scan — otherwise the previous build's output leaks classes into the next
+   build and the result is nondeterministic. */
+@source not "../dist";
 
 @theme {
   --color-accent: #ec6a2e;
