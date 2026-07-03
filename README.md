@@ -1,7 +1,7 @@
 <div align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/logo/sepp-avatar-light-200.png">
-    <img alt="sepp" src="docs/logo/sepp-avatar-dark-200.png" width="128" height="128">
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sepp-org/sepp/HEAD/docs/logo/sepp-avatar-light-200.png">
+    <img alt="sepp" src="https://raw.githubusercontent.com/sepp-org/sepp/HEAD/docs/logo/sepp-avatar-dark-200.png" width="128" height="128">
   </picture>
 
   <h1>sepp</h1>
