@@ -1,0 +1,4 @@
+# LF everywhere: CI's admin-ui-fresh job diffs a Linux rebuild against the
+# committed dist, and vite passes source line endings through to dist/index.html,
+# so a CRLF checkout can never reproduce what CI builds.
+* text=auto eol=lf
