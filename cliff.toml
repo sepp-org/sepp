@@ -27,7 +27,9 @@ conventional_commits = true
 # Drop commits that don't follow the convention so the changelog stays clean.
 filter_unconventional = true
 split_commits = false
-# Map commit prefixes to changelog sections. Order here is the rendered order.
+# Map commit prefixes to changelog sections. Note: the body template's
+# group_by sorts groups alphabetically ("Bug Fixes" < "Features" <
+# "Performance"), so the order below has no effect on the rendered output.
 commit_parsers = [
     { message = "^feat",     group = "Features" },
     { message = "^fix",      group = "Bug Fixes" },

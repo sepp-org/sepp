@@ -148,7 +148,11 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
             Err(e) => warn!(error = %e, "could not start config watcher; hot reload disabled"),
         }
     } else {
-        debug!(path = %watch_path, "no config file on disk; hot reload disabled");
+        info!(
+            path = %watch_path,
+            "no config file on disk; hot reload is disabled — config edits (including \
+             those made through the admin UI) only apply after a restart"
+        );
     }
 
     if config.admin.enabled {

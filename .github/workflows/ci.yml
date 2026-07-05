@@ -3,7 +3,7 @@ name: CI
 on:
   push:
     branches: [master]
-    tags: ['v*']
+    tags: ["v*"]
   pull_request:
 
 env:
@@ -136,6 +136,28 @@ jobs:
           mkdir -p ${{ runner.temp }}/digests
           digest="${{ steps.build.outputs.digest }}"
           touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - name: Smoke test image
+        if: matrix.platform == 'linux/amd64'
+        run: |
+          docker run -d --name smoke ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+          for i in $(seq 1 30); do
+            if docker logs smoke 2>&1 | grep -q "queue server listening"; then
+              docker rm -f smoke
+              exit 0
+            fi
+            if [ "$(docker inspect -f '{{.State.Running}}' smoke)" != "true" ]; then
+              echo "::error::container exited during startup"
+              docker logs smoke
+              docker rm -f smoke
+              exit 1
+            fi
+            sleep 1
+          done
+          echo "::error::server did not report listening within 30s"
+          docker logs smoke
+          docker rm -f smoke
+          exit 1
 
       # Run Trivy only on amd64 — both arches share the same code
       - name: Scan image with Trivy

@@ -1431,6 +1431,7 @@ fn apply_reserve(
             let job_id: String = match ReadyKey::decode(&ready_k) {
                 Some(rk) => rk.job_id.to_owned(),
                 None => {
+                    error!(queue = %queue, "corrupt ready-index entry; removing it");
                     tx.remove(&store.ready, ready_k);
                     cycle.dirty = true;
                     continue;
@@ -1456,7 +1457,12 @@ fn apply_reserve(
             let (job_queue, mut job) = match JobValue::decode(&stored) {
                 Ok(decoded) => decoded,
                 Err(e) => {
-                    warn!(error = %e, "reserve dropping corrupt job");
+                    error!(
+                        job_id = %job_id,
+                        queue = %queue,
+                        error = %e,
+                        "corrupt job record encountered during reserve; deleting it PERMANENTLY",
+                    );
                     tx.remove(&store.ready, ready_k);
                     tx.remove(&store.jobs, job_id.as_bytes().to_vec());
                     tx.remove(&store.payloads, job_id.as_bytes().to_vec());
@@ -1470,7 +1476,12 @@ fn apply_reserve(
                 Ok(Some(bytes)) => match Payload::decode(&*bytes) {
                     Ok(payload) => job.payload = Some(payload),
                     Err(e) => {
-                        warn!(error = %e, "reserve dropping job with corrupt payload");
+                        error!(
+                            job_id = %job_id,
+                            queue = %job_queue,
+                            error = %e,
+                            "corrupt payload encountered during reserve; deleting the job PERMANENTLY",
+                        );
                         tx.remove(&store.ready, ready_k);
                         tx.remove(&store.jobs, job_id.as_bytes().to_vec());
                         tx.remove(&store.payloads, job_id.as_bytes().to_vec());
@@ -2923,14 +2934,20 @@ impl Storage {
                 let notifiers = notifiers.clone();
                 let admin_stats = Arc::clone(&admin_stats);
                 move || {
-                    run_committer(
-                        store,
-                        indexes,
-                        rx,
-                        notifiers,
-                        max_sweep_interval,
-                        admin_stats,
-                    )
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        run_committer(
+                            store,
+                            indexes,
+                            rx,
+                            notifiers,
+                            max_sweep_interval,
+                            admin_stats,
+                        )
+                    }));
+                    if result.is_err() {
+                        error!("committer thread panicked; aborting the process");
+                        std::process::abort();
+                    }
                 }
             })
             .expect("failed to spawn committer thread");

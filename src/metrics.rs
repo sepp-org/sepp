@@ -109,6 +109,7 @@ async fn spawn_prometheus_endpoint(
                 Ok((stream, _peer)) => stream,
                 Err(e) => {
                     warn!(error = %e, "prometheus endpoint accept failed");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
                 }
             };
