@@ -1,8 +1,8 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Proto files are vendored into `proto/` (committed to the repo). To refresh,
-    // bump the label/commit and re-run:
+    // Proto files are vendored into `proto/` (committed to the repo). To refresh
+    // to the latest published contract, re-run:
     //
-    //     buf export buf.build/sepp-org/sepp-proto:v1.1.2 -o proto
+    //     buf export buf.build/sepp-org/sepp-proto -o proto
     let includes = &["proto"];
     let protos = &["proto/sepp/v1/queue.proto"];
 
