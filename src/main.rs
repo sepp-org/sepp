@@ -152,6 +152,15 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     }
 
     if config.admin.enabled {
+        if let Some(keys) = &config.admin.keys
+            && keys.iter().any(|k| k.key == "admin")
+        {
+            warn!(
+                "an [admin] key is the literal string \"admin\" (the default) \
+                 Change it before \
+                 exposing the port beyond this machine"
+            );
+        }
         let storage = admin_storage.expect("storage captured when admin is enabled");
         let state = AdminState::new(
             storage,

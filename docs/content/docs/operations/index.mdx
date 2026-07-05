@@ -39,7 +39,7 @@ Work through these before taking real traffic.
 **Data & durability**
 
 - Persist the data directory (`db_path`) on a volume that survives restarts. [Deployment](/docs/operations/deployment#docker-image-and-data-volume)
-- Confirm the persist mode matches your loss tolerance; it is `SyncAll` by default. [Durability](/docs/operations/configuration#durability--persist-modes)
+- Confirm the persist mode matches your loss tolerance; it is `sync_all` by default. [Durability](/docs/operations/configuration#durability--persist-modes)
 - Have a backup plan: stop-and-copy or an atomic volume snapshot. Never copy a live `db_path`. [Backups](/docs/operations/deployment#backing-up-the-data-directory)
 
 **Limits & resource bounds**

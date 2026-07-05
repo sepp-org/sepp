@@ -11,6 +11,8 @@ This is the source of truth for the server configuration. Every edit you make th
 
 Please note that some fields are restart-only and require a full server restart to apply. These fields are clearly marked in the admin UI.
 
+Hot reload watches the config file the server found at startup. If the server started without a config file, edits (including those made through the admin UI editor) are written to disk but only apply after a restart — run `sepp config example > sepp.toml` before starting the server if you want to configure it on the fly.
+
 ## Config sections overview
 
 A `sepp.toml` is split into a handful of tables. Each maps to a part of this documentation; the [configuration reference](/docs/reference/configuration) has the exhaustive key tables with every type and default.
@@ -91,7 +93,7 @@ In `buffer` mode an acknowledged enqueue lives only in the OS page cache, not on
 
 Two more knobs shape write behaviour, both restart-only:
 
-- **The sweeper** runs the periodic maintenance pass that promotes due scheduled jobs and reclaims expired leases. `sweep_limit` (default 10000) caps how many jobs it touches per cycle. There is also `sweep_internval_ms` (default 1000) that caps the maximum time between two sweep cycles but this is only included as a safety feature against clock jumps. Under normal operation the sweeper cycle is scheduled to run exactly when the next job is due.
+- **The sweeper** runs the periodic maintenance pass that promotes due scheduled jobs and reclaims expired leases. `sweep_limit` (default 10000) caps how many jobs it touches per cycle. There is also `sweep_interval_ms` (default 1000) that caps the maximum time between two sweep cycles but this is only included as a safety feature against clock jumps. Under normal operation the sweeper cycle is scheduled to run exactly when the next job is due.
 - **`command_queue_capacity`** (default 4096) bounds how many writes can be queued to the single committer thread. If it fills under a burst, new writes get a transient, retryable rejection rather than growing memory without limit.
 
 ## Storage tuning

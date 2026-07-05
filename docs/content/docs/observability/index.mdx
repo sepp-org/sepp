@@ -14,7 +14,7 @@ Sepp gives you four signals:
 | **Admin UI dashboard** | SSE over HTTP | Yes — on by default at `127.0.0.1:9465` | Live queue depths, per-second rates and a 60-second sparkline |
 | **Metrics** | OTLP push **and/or** Prometheus scrape | Off by default; enable `metrics.enabled` or `metrics.prometheus_enabled` | Per-queue counters and gauges, request latency histograms, commit duration |
 | **Tracing** | OTLP (gRPC) | Off by default; enable `tracing.enabled` | End-to-end spans from producer through server to worker, with W3C trace context propagation across hops |
-| **Logs** | `stderr` | Yes, duh | Standard application state monitoring. Supports both text and JSON. |
+| **Logs** | `stdout` | Yes, duh | Standard application state monitoring. Supports both text and JSON. |
 
 The admin UI dashboard is the zero-setup way to look at the server *right now*. It streams queue depths and per-second rates over [SSE](/docs/get-started/admin-ui#what-you-can-do) once a second.
 
@@ -30,7 +30,7 @@ flowchart LR
     direction LR
     OTLP("OTLP exporter")
     PM("GET /metrics")
-    LOG("stderr")
+    LOG("stdout")
     AD("admin UI")
   end
 
@@ -58,8 +58,8 @@ flowchart LR
 
 - **Collector** — run an [OpenTelemetry Collector](https://opentelemetry.io/docs/collector/) as a sidecar or daemon. Give it an OTLP receiver on `0.0.0.0:4317` and exporters for your backend. Both `tracing.otlp_endpoint` and `metrics.otlp_endpoint` default to `http://localhost:4317`, matching the collector's gRPC receiver out of the box.
 - **Prometheus** — scrape `metrics.prometheus_listen_addr` (default `0.0.0.0:9464`) at `GET /metrics`. The endpoint serves the standard Prometheus exposition format and requires no authentication. Bind it to a private interface when the host is multi-homed.
-- **Grafana** — point it at Prometheus and visualize the counters and gauges sepp publishes. The [metrics catalogue](/docs/observability/metrics#job-and-request-metrics) lists every metric with its labels.
-- **Log aggregation** — switch `logging.format` to `"json"` and ship stderr to Loki, Elasticsearch or your aggregator of choice.
+- **Grafana** — point it at Prometheus and visualize the counters and gauges sepp publishes. The [metrics catalogue](/docs/observability/metrics#metric-catalogue) lists every metric with its labels.
+- **Log aggregation** — switch `logging.format` to `"json"` and ship stdout to Loki, Elasticsearch or your aggregator of choice.
 
 ## Logging
 

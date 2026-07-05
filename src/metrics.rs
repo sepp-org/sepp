@@ -328,6 +328,11 @@ impl Metrics {
 
     pub fn record_rejected(&self, queue: &str, reason: &'static str) {
         if self.enabled {
+            // So we don't end up with a metric for every possible queue name
+            let queue = match reason {
+                "unknown_queue" | "queue_name_too_long" | "invalid_request" => "_rejected",
+                _ => queue,
+            };
             self.jobs_rejected.add(
                 1,
                 &[

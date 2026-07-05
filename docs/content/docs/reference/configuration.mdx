@@ -108,7 +108,7 @@ Durability, the background maintenance sweeper, deduplication, dead-letter reten
 | `sweep_interval_ms` | integer | `1000` | restart-only | Maximum time between maintenance sweeps (safety backstop). Range `>= 1`. |
 | `sweep_limit` | integer | `10000` | restart-only | Maximum jobs touched per sweep. Range `>= 1`. |
 | `dedup_window_ms` | integer | `86400000` (24 h) | restart-only | How long an idempotency key is remembered for deduplication. Range `>= 1`. |
-| `dead_letter_retention_ms` | integer | `0` (disabled) | restart-only | How long dead-lettered jobs are retained. `0` disables automatic cleanup. |
+| `dead_letter_retention_ms` | integer | `0` (disabled) | restart-only | How long dead-lettered jobs are retained. `0` (the default) disables the dead-letter store entirely: failed jobs are deleted on the spot. |
 | `command_queue_capacity` | integer | `4096` | restart-only | Capacity of the committer channel. Range `>= 1`. |
 | `cache_size_bytes` | optional integer | none (fjall default) | restart-only | Block cache size in bytes. Range `>= 1`. |
 | `max_journaling_size_bytes` | optional integer | none (fjall default: 512 MiB) | restart-only | Write-ahead log size ceiling. Minimum `67108864` (64 MiB). |

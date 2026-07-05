@@ -176,16 +176,19 @@ impl DedupKey<'_> {
     }
 }
 
-// Value in the `dedup` keyspace: `enqueued_at | job_id`.
+// Value in the `dedup` keyspace: `enqueued_at | deadline | job_id`.
 pub(crate) struct DedupValue<'a> {
     pub enqueued_at: i64,
+    pub deadline: i64,
     pub job_id: &'a str,
 }
 
 impl<'a> DedupValue<'a> {
     pub fn encode(&self) -> Vec<u8> {
-        let mut w = KeyWriter::with_capacity(8 + self.job_id.len());
-        w.i64(self.enqueued_at).tail(self.job_id.as_bytes());
+        let mut w = KeyWriter::with_capacity(16 + self.job_id.len());
+        w.i64(self.enqueued_at)
+            .i64(self.deadline)
+            .tail(self.job_id.as_bytes());
 
         w.into_vec()
     }
@@ -193,10 +196,12 @@ impl<'a> DedupValue<'a> {
     pub fn decode(bytes: &'a [u8]) -> Option<Self> {
         let mut r = KeyReader::new(bytes);
         let enqueued_at = r.i64()?;
+        let deadline = r.i64()?;
         let job_id = r.tail_str()?;
 
         Some(DedupValue {
             enqueued_at,
+            deadline,
             job_id,
         })
     }
@@ -474,11 +479,13 @@ mod tests {
     fn dedup_value_round_trips() {
         let bytes = DedupValue {
             enqueued_at: 42,
+            deadline: 99,
             job_id: "job-7",
         }
         .encode();
         let decoded = DedupValue::decode(&bytes).expect("decodes");
         assert_eq!(decoded.enqueued_at, 42);
+        assert_eq!(decoded.deadline, 99);
         assert_eq!(decoded.job_id, "job-7");
     }
 

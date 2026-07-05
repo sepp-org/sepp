@@ -2,5 +2,6 @@
 /sepp-data
 /dev
 /bench
+/observability
 sepp.toml
 admin-ui/node_modules

@@ -227,6 +227,7 @@ prometheus_listen_addr = "0.0.0.0:9464"
 #   default_priority
 #   max_payload_bytes
 #   allowed_encodings
+#   allowed_job_types
 #   max_schedule_horizon_ms
 #   max_custom_entries
 #   max_custom_total_bytes

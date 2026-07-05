@@ -1123,7 +1123,6 @@ fn check_dedup(
     cycle: &mut Cycle,
     req: &EnqueueRequest,
     now: i64,
-    limits: &EffectiveLimits,
 ) -> Result<DedupCheck, Status> {
     let mut stale_timer = None;
 
@@ -1136,7 +1135,7 @@ fn check_dedup(
 
         if let Some(existing) = tx.get(&store.dedup, &dkey).map_err(stg_err)? {
             match DedupValue::decode(&existing) {
-                Some(dv) if now - dv.enqueued_at < limits.dedup_window_ms => {
+                Some(dv) if now < dv.deadline => {
                     cycle.deduplicated(&req.queue);
                     return Ok(DedupCheck::Hit(EnqueueResponse {
                         job_id: dv.job_id.to_owned(),
@@ -1146,7 +1145,7 @@ fn check_dedup(
                 Some(dv) => {
                     stale_timer = Some(
                         DedupTimerKey {
-                            deadline: dv.enqueued_at + limits.dedup_window_ms,
+                            deadline: dv.deadline,
                             dedup_key: &dkey,
                         }
                         .encode(),
@@ -1187,7 +1186,7 @@ fn apply_enqueue(
         // Restart-only; see Store::boot_registry.
         limits.dedup_window_ms = store.boot_registry.dedup_window_ms(&req.queue);
 
-        match check_dedup(store, tx, cycle, &req, now, &limits)? {
+        match check_dedup(store, tx, cycle, &req, now)? {
             DedupCheck::Hit(resp) => results.push(Ok(resp)),
             DedupCheck::Miss { stale_timer } => {
                 // live_depth is read from the in-memory indexes, which
@@ -1272,7 +1271,7 @@ fn apply_enqueue_atomic(
         let mut limits = registry.effective(&req.queue);
         // Restart-only; see Store::boot_registry.
         limits.dedup_window_ms = store.boot_registry.dedup_window_ms(&req.queue);
-        responses.push(match check_dedup(store, tx, cycle, &req, now, &limits)? {
+        responses.push(match check_dedup(store, tx, cycle, &req, now)? {
             DedupCheck::Hit(resp) => resp,
             DedupCheck::Miss { stale_timer } => {
                 insert_job(store, indexes, tx, cycle, req, now, &limits, stale_timer)
@@ -1376,8 +1375,9 @@ fn insert_job(
             indexes.dedup_timers.remove(&old_timer);
         }
 
+        let deadline = now.saturating_add(limits.dedup_window_ms);
         let dtk = DedupTimerKey {
-            deadline: now + limits.dedup_window_ms,
+            deadline,
             dedup_key: &dkey,
         }
         .encode();
@@ -1388,6 +1388,7 @@ fn insert_job(
             dkey,
             DedupValue {
                 enqueued_at: now,
+                deadline,
                 job_id: &id,
             }
             .encode(),
@@ -2482,7 +2483,13 @@ fn apply_sweep(
         budget -= 1;
         processed += 1;
         if let Some(dedup_k) = DedupTimerKey::dedup_key(&timer_k) {
-            tx.remove(&store.dedup, dedup_k.to_vec());
+            let record_deadline = tx
+                .get(&store.dedup, dedup_k)
+                .map_err(stg_err)?
+                .and_then(|v| DedupValue::decode(&v).map(|dv| dv.deadline));
+            if record_deadline.is_some_and(|d| d <= now) {
+                tx.remove(&store.dedup, dedup_k.to_vec());
+            }
         }
 
         tx.remove(&store.dedup_timers, timer_k.clone());
@@ -2787,7 +2794,7 @@ impl Storage {
         config: &Config,
         registry: SharedRegistry,
         metrics: Metrics,
-    ) -> Result<Self, fjall::Error> {
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let mut builder = TxDatabase::builder(config.server.db_path.as_str());
 
         if let Some(bytes) = config.storage.cache_size_bytes {
@@ -2806,7 +2813,38 @@ impl Storage {
             builder = builder.worker_threads(n);
         }
 
+        info!(db_path = %config.server.db_path, "opening storage...");
+        let started = std::time::Instant::now();
         let db = builder.open()?;
+
+        const FORMAT_VERSION: u64 = 1;
+        const FORMAT_VERSION_KEY: &[u8] = b"format_version";
+        let meta = db.keyspace("meta", KeyspaceCreateOptions::default)?;
+        match db.read_tx().get(&meta, FORMAT_VERSION_KEY)? {
+            Some(v) if v.as_ref() == FORMAT_VERSION.to_be_bytes().as_slice() => {}
+            Some(v) => {
+                let found = <[u8; 8]>::try_from(v.as_ref())
+                    .map(|b| u64::from_be_bytes(b).to_string())
+                    .unwrap_or_else(|_| format!("unrecognized bytes {:?}", v.as_ref()));
+                return Err(format!(
+                    "refusing to open database at {:?}: its on-disk format version is {found}, \
+                     this binary supports version {FORMAT_VERSION}",
+                    config.server.db_path,
+                )
+                .into());
+            }
+            None => {
+                let mut tx = db.write_tx();
+                tx.insert(
+                    &meta,
+                    FORMAT_VERSION_KEY.to_vec(),
+                    FORMAT_VERSION.to_be_bytes().to_vec(),
+                );
+                tx.commit()?;
+                db.persist(PersistMode::SyncAll)?;
+            }
+        }
+
         let params = StorageParams {
             persist_mode: match config.storage.persist_mode {
                 crate::config::PersistMode::SyncAll => PersistMode::SyncAll,
@@ -2863,6 +2901,14 @@ impl Storage {
         };
         let admin_stats = Arc::new(ArcSwap::from_pointee(AdminSnapshot::default()));
         let indexes = rebuild_indexes(&store)?;
+        info!(
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            ready = indexes.ready.by_queue.values().sum::<u64>(),
+            scheduled = indexes.scheduled.by_queue.values().sum::<u64>(),
+            inflight = indexes.leases.by_queue.values().sum::<u64>(),
+            dead_letter = indexes.dead_letter.by_queue.values().sum::<u64>(),
+            "storage ready",
+        );
 
         if config.server.strict_queues {
             warn_on_undeclared_persisted_queues(&store);
@@ -3426,6 +3472,39 @@ mod tests {
             "sweep counters do not feed totals"
         );
         assert!(last_active.contains_key("qa") && last_active.contains_key("qb"));
+    }
+
+    #[test]
+    fn open_refuses_unknown_format_version() {
+        let path = std::env::temp_dir().join(format!("sepp-storage-test-{}", Uuid::new_v4()));
+        // Pre-stamp the database with a format version this binary doesn't know.
+        {
+            let db = TxDatabase::builder(&path).open().expect("open db");
+            let meta = db
+                .keyspace("meta", KeyspaceCreateOptions::default)
+                .expect("create meta keyspace");
+            let mut tx = db.write_tx();
+            tx.insert(
+                &meta,
+                b"format_version".to_vec(),
+                2u64.to_be_bytes().to_vec(),
+            );
+            tx.commit().expect("commit version stamp");
+            db.persist(PersistMode::SyncAll).expect("persist");
+        }
+
+        let mut config = Config::default();
+        config.server.db_path = path.to_str().expect("utf-8 temp path").to_string();
+        let registry = crate::queues::QueueRegistry::from_config(&config).into_shared();
+        let err = Storage::open(&config, registry, Metrics::new(false))
+            .err()
+            .expect("open must refuse an unknown format version");
+        assert!(
+            err.to_string().contains("format version"),
+            "unexpected error: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&path);
     }
 
     fn open_test_store() -> Store {

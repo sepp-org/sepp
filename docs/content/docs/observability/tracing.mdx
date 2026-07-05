@@ -17,7 +17,7 @@ sample_ratio = 1.0
 
 ## Enabling tracing
 
-Set `enabled = true`. Sepp spins up an OTLP gRPC span exporter pointed at `otlp_endpoint`, registers the W3C `TraceContextPropagator` globally for context extraction and injection and layers an `opentelemetry-tracing` subscriber over the normal logging subscriber. Both layers run together — logs go to stderr as before, spans go to the collector.
+Set `enabled = true`. Sepp spins up an OTLP gRPC span exporter pointed at `otlp_endpoint`, registers the W3C `TraceContextPropagator` globally for context extraction and injection and layers an `opentelemetry-tracing` subscriber over the normal logging subscriber. Both layers run together — logs go to stdout as before, spans go to the collector.
 
 The span exporter batches asynchronously, so tracing overhead on the request path is a small allocation for the span's structured fields plus the eventual gRPC push.
 
@@ -95,18 +95,18 @@ tracing::subscriber::set_global_default(subscriber)?;
 // Enqueue — the active span's context is injected automatically
 #[tracing::instrument(skip(client, payload), fields(otel.kind = "producer"))]
 async fn publish(
-    client: &Client,
+    client: &SeppClient,
     payload: Payload,
-) -> Result<EnqueueAck, sepp_client::EnqueueError> {
+) -> Result<EnqueueAck, sepp_rs::EnqueueError> {
     let request = EnqueueRequest::new("emails", "welcome")?.with_payload(payload);
     client.enqueue(request).await
 }
 ```
 
-On the worker side, the `sepp-rs` worker creates a `sepp-rs.process` span for every job with a span link back to the server's delivery context:
+On the worker side, the `sepp-rs` worker creates a `sepp.process` span for every job with a span link back to the server's delivery context:
 
 ```rust
-use sepp_client::worker::Worker;
+use sepp_rs::worker::Worker;
 use tracing::instrument;
 
 let worker = Worker::new(client.clone(), ["emails"], Duration::from_secs(30))?
@@ -118,8 +118,8 @@ let worker = Worker::new(client.clone(), ["emails"], Duration::from_secs(30))?
 async fn handle_welcome(
     payload: Payload,
     ctx: JobContext,
-) -> Result<(), sepp_client::Error> {
-    // The surrounding sepp-rs.process span is already active —
+) -> Result<(), sepp_rs::Error> {
+    // The surrounding sepp.process span is already active —
     // it links back to the producer's trace.
     send_email(&payload).await?;
     Ok(())
@@ -142,7 +142,7 @@ provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
 trace.set_tracer_provider(provider)
 tracer = trace.get_tracer("my-producer")
 
-client = sepp.Client("http://localhost:50051")
+client = await SeppClient.connect("http://localhost:50051")
 
 # Enqueue — trace context is injected into both gRPC metadata and the job body
 with tracer.start_as_current_span("my-producer.publish"):
@@ -166,9 +166,9 @@ Add `@opentelemetry/api` as a dependency (the SDK loads it lazily — no import 
 
 ```typescript
 import { trace, context, SpanKind } from "@opentelemetry/api";
-import { Client, EnqueueRequest, Payload, Worker } from "@sepp/sh";
+import { SeppClient, EnqueueRequest, Payload, Worker } from "sepp";
 
-const client = new Client("http://localhost:50051");
+const client = await SeppClient.connect("http://localhost:50051");
 
 // Enqueue inside a span
 const tracer = trace.getTracer("my-producer");

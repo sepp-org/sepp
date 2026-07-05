@@ -29,7 +29,9 @@ RUN cp /app/sepp.example.toml /app/sepp.docker.toml \
 FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
 WORKDIR /sepp
 COPY --from=builder /app/target/release/sepp /usr/local/bin/sepp
-COPY --from=builder /app/sepp.docker.toml /etc/sepp/sepp.toml
+# --chown: the server (uid 65532) rewrites this file for admin-UI config edits,
+# and write_atomic() needs to create a .tmp sibling in the directory.
+COPY --from=builder --chown=65532:65532 /app/sepp.docker.toml /etc/sepp/sepp.toml
 COPY --from=builder --chown=65532:65532 /app/empty-data/ /sepp/sepp-data/
 # 50051 gRPC, 9464 Prometheus (off by default), 9465 admin UI
 EXPOSE 50051 9464 9465

@@ -2739,6 +2739,86 @@ async fn scheduled_job_survives_restart() {
     ack(&client, &job).await;
 }
 
+// Dedup deadlines are pinned when the record is written. A shrunk window on
+// the next boot must not re-admit a key whose pinned deadline is still in the
+// future — the old floating-window check did exactly that, and the resulting
+// re-insert left an orphaned timer that could later delete the fresh record.
+#[tokio::test]
+async fn dedup_deadline_survives_window_shrink_across_restart() {
+    let db_path = temp_db("dedup-shrink");
+    let dedup_req = || EnqueueRequest {
+        idempotency_key: Some("pinned".to_string()),
+        ..enqueue_req("smoke-dedup-shrink")
+    };
+
+    let first_id = {
+        let (child, client) =
+            spawn_server_with_env(&db_path, &[("SEPP_STORAGE__DEDUP_WINDOW_MS", "60000")]).await;
+        let _server = ServerGuard {
+            child,
+            db_path: None,
+            cfg_path: None,
+        };
+        enqueue(&client, dedup_req()).await.job_id
+    };
+
+    let (child, client) =
+        spawn_server_with_env(&db_path, &[("SEPP_STORAGE__DEDUP_WINDOW_MS", "1")]).await;
+    let _server = ServerGuard {
+        child,
+        db_path: Some(db_path),
+        cfg_path: None,
+    };
+
+    let second = enqueue(&client, dedup_req()).await;
+    assert!(
+        second.deduplicated,
+        "a key inside its pinned 60s deadline deduplicates even after the window shrinks to 1ms"
+    );
+    assert_eq!(second.job_id, first_id);
+}
+
+// The reverse direction: growing the window across a restart must not
+// retroactively resurrect a record that already expired at its pinned
+// deadline.
+#[tokio::test]
+async fn dedup_expiry_is_pinned_at_enqueue_across_restart() {
+    let db_path = temp_db("dedup-grow");
+    let dedup_req = || EnqueueRequest {
+        idempotency_key: Some("pinned".to_string()),
+        ..enqueue_req("smoke-dedup-grow")
+    };
+
+    let first_id = {
+        let (child, client) =
+            spawn_server_with_env(&db_path, &[("SEPP_STORAGE__DEDUP_WINDOW_MS", "50")]).await;
+        let _server = ServerGuard {
+            child,
+            db_path: None,
+            cfg_path: None,
+        };
+        enqueue(&client, dedup_req()).await.job_id
+    };
+
+    // Wait out the pinned 50ms deadline before the second boot.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let (child, client) =
+        spawn_server_with_env(&db_path, &[("SEPP_STORAGE__DEDUP_WINDOW_MS", "60000")]).await;
+    let _server = ServerGuard {
+        child,
+        db_path: Some(db_path),
+        cfg_path: None,
+    };
+
+    let second = enqueue(&client, dedup_req()).await;
+    assert!(
+        !second.deduplicated,
+        "a key whose pinned deadline has passed is re-admitted even after the window grows"
+    );
+    assert_ne!(second.job_id, first_id, "the re-admitted job is a new job");
+}
+
 #[tokio::test]
 async fn reserve_polls_queues_in_listed_order() {
     let (_guard, client) = start_server("order").await;

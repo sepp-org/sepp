@@ -52,7 +52,7 @@
 
 ## Benchmarks
 
-With every operation fsync-ed before it is acknowledged, sepp sustains roughly 10x the throughput of beanstalkd and 20x NATS JetStream (200,000 jobs, 256 byte payloads, 50 producers and 50 workers, no batching). Sepp also supports batch enqueue and drain operation, which can dramatically increase throughput even further.
+With every operation fsync-ed before it is acknowledged, sepp sustains roughly 10x the enqueue throughput of beanstalkd and 20x NATS JetStream (drain: 4.9x and 9.6x) (200,000 jobs, 256 byte payloads, 50 producers and 50 workers, no batching). Sepp also supports batch enqueue and drain operation, which can dramatically increase throughput even further.
 
 | broker | enqueue jobs/s | drain jobs/s |
 |---|---:|---:|
@@ -91,13 +91,13 @@ docker run --rm \
 
 ## Quickstart
 
-By default, sepp listens on `localhost:50051` and persists data to a `sepp-data` directory in the current working directory. You can generate a config file to edit with `sepp config example > sepp.toml`. Sepp will pick it up automatically as long as it is named `sepp.toml` and in the same directory as the binary or you can specify a custom path with the `SEPP_CONFIG` environment variable. Specifying a custom path is also possible via the `--config` CLI flag.
+By default, sepp listens on `0.0.0.0:50051` with API-key authentication disabled, and persists data to a `sepp-data` directory in the current working directory. Restrict `listen_addr` or configure `auth` before exposing the port beyond your machine. You can generate a config file to edit with `sepp config example > sepp.toml`. Sepp will pick it up automatically as long as it is named `sepp.toml` and in the working directory the server is started from, or you can specify a custom path with the `SEPP_CONFIG` environment variable. Specifying a custom path is also possible via the `--config` CLI flag.
 
-The admin UI is accessible at [http://localhost:9465](http://localhost:9465) with the default login `admin` and key `admin`. Change this before exposing the port on a production network.
+The admin UI is accessible at [http://localhost:9465](http://localhost:9465). Run locally it binds to loopback and requires no login; the Docker image ships a demo login (`admin`/`admin`) instead. Change both before exposing the port on a production network.
 
 ### Client SDKs
 
-sepp has official clients for [Rust](TODO), [Python](TODO) and [Node.js](TODO). See your preferred language's client SDK for usage instructions.
+sepp has official clients for [Rust](https://github.com/sepp-org/sepp-rs), [Python](https://github.com/sepp-org/sepp-py) and [Node.js](https://github.com/sepp-org/sepp-js). See your preferred language's client SDK for usage instructions.
 
 ## Docs
 

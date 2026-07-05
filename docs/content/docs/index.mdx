@@ -12,6 +12,22 @@ programming languages. For example, a Rust backend service might schedule a job 
 that has access to a SMTP server. Durable job queues like sepp persist these jobs onto disk so that they are not lost in the event of a 
 server crash or restart.
 
+## Reasons to use sepp
+
+- Easy to set up, manage and run. Sepp is a single binary with embedded storage, so there is no database or message broker to install alongside it.
+- Excellent performance whilst being fully durable. Every operation is persisted before it is acknowledged, and enqueue throughput is still roughly 10x beanstalkd and 20x NATS JetStream. See the [benchmarks](/docs/benchmarks).
+- Works from any language. Producers and workers talk gRPC and don't need to share a language, and you can [build your own client](/docs/clients/build-your-own) from the published protocol.
+- The hard parts of a queue come out of the box: leases, retries, dead-lettering, scheduling, priorities and idempotent enqueue. Building these correctly on top of a general-purpose datastore is harder than it looks.
+- Ready for production debugging, with OpenTelemetry tracing and metrics and a built-in admin UI for inspecting jobs and server state.
+
+## Reasons not to use sepp
+
+- Sepp is not distributed. It runs on a single node with no replication or failover, so if the machine goes down, the queue is unavailable until it is back.
+- Delivery is at-least-once, not exactly-once. Workers must be able to tolerate the occasional duplicate.
+- Jobs cannot be enqueued atomically with your own database writes. If a job must commit in the same transaction as your data, a queue inside your database is a better fit.
+- Sepp is a job queue, not an event stream. There is no pub/sub fan-out, replay or consumer groups; Kafka or NATS are better tools for that.
+- Sepp is pre-1.0 and hasn't had years of production hardening yet. Expect some rough edges and breaking changes.
+
 ## Start here
 
 <Cards>

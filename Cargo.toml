@@ -7,8 +7,18 @@ readme = "README.md"
 description = "A small, language-agnostic durable job queue."
 documentation = "https://sepp-org.github.io/sepp/docs/"
 repository = "https://github.com/sepp-org/sepp"
-keywords = ["job-queue", "task-queue", "worker", "background-jobs", "grpc", "durable", "message-queue"]
+keywords = ["job-queue", "task-queue", "background-jobs", "grpc", "durable"]
 categories = ["asynchronous", "network-programming"]
+include = [
+    "/src/**",
+    "/tests/**",
+    "/proto/**",
+    "/admin-ui/dist/**",
+    "/build.rs",
+    "/README.md",
+    "/LICENSE",
+    "/sepp.example.toml",
+]
 
 [dependencies]
 tonic = { version = "0.14", features = ["tls-ring"] }
