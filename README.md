@@ -52,7 +52,7 @@
 
 ## Benchmarks
 
-With every operation fsync-ed before it is acknowledged, sepp sustains roughly 10x the enqueue throughput of beanstalkd and 20x NATS JetStream (drain: 4.9x and 9.6x) (200,000 jobs, 256 byte payloads, 50 producers and 50 workers, no batching). Sepp also supports batch enqueue and drain operation, which can dramatically increase throughput even further.
+With every operation fsync-ed before it is acknowledged, sepp sustains 1.4x the throughput of BullMQ, roughly 10x beanstalkd and 20x NATS JetStream (200,000 jobs, 256 byte payloads, 50 producers and 50 workers, no batching). Sepp also supports batch enqueue and drain operation, which can dramatically increase throughput even further.
 
 | broker | enqueue jobs/s | drain jobs/s |
 |---|---:|---:|
@@ -60,6 +60,7 @@ With every operation fsync-ed before it is acknowledged, sepp sustains roughly 1
 | beanstalkd | 1,494 | 1,431 |
 | Faktory | - | - |
 | NATS JetStream | 716 | 724 |
+| BullMQ | 10,939 | 5,566 |
 
 Faktory has no fully durable mode. Buffered-mode results, concurrency scaling, methodology and hardware are in the [benchmark docs](https://sepp-org.github.io/sepp/docs/benchmarks/).
 
