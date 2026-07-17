@@ -1,9 +1,12 @@
 use std::collections::BTreeMap;
 
+use prost::Message;
+
 use super::*;
 use crate::config::QueueConfig;
 use crate::op::{Op, PreparedJob};
 use crate::pb::millis_to_duration;
+use crate::pb::sepp::storage::v1 as op_proto;
 use crate::pb::sepp::v1::{NackRetry, Payload, nack_retry};
 use uuid::Uuid;
 
@@ -175,8 +178,20 @@ fn assert_indexes_match_rebuild(harness: &Harness, label: &str) {
 // Applies a stream to a source store and to two fresh stores, then asserts
 // the determinism contract on all three.
 fn assert_stream_replays(cfg: &Config, source: &Harness, ops: &[Op], outcomes: &[String]) {
+    // One replay runs the ops through their serialized form, so what's proven
+    // deterministic is the recorded artifact itself, not just the in-memory
+    // clones.
+    let roundtripped: Vec<Op> = ops
+        .iter()
+        .map(|op| {
+            let bytes = op.to_proto().encode_to_vec();
+            let decoded = op_proto::Op::decode(bytes.as_slice()).expect("op decodes");
+            Op::from_proto(decoded).expect("op converts")
+        })
+        .collect();
+
     let (replay_a, outcomes_a) = Harness::replay(cfg, ops);
-    let (replay_b, outcomes_b) = Harness::replay(cfg, ops);
+    let (replay_b, outcomes_b) = Harness::replay(cfg, &roundtripped);
 
     for (i, (src, rep)) in outcomes.iter().zip(&outcomes_a).enumerate() {
         assert_eq!(
@@ -340,6 +355,7 @@ fn recorded_stream_replays_identically() {
         Op::CloseQueue {
             queue: "alpha".into(),
             now_ms: t + 6_500,
+            grace_ms: 30_000,
         },
         // Rejected: the queue is closing.
         Op::Enqueue {
@@ -353,12 +369,58 @@ fn recorded_stream_replays_identically() {
         Op::OpenQueue {
             queue: "alpha".into(),
         },
+        // Fresh jobs whose ready and scheduled keys are constructible, so the
+        // key-addressed admin ops below actually mutate.
+        Op::Enqueue {
+            jobs: vec![
+                job(
+                    "j09",
+                    EnqueueRequest {
+                        priority: Some(4),
+                        ..req("beta")
+                    },
+                ),
+                job(
+                    "j10",
+                    EnqueueRequest {
+                        scheduled_at: Some(millis_to_timestamp(t + 30_000)),
+                        ..req("beta")
+                    },
+                ),
+            ],
+            now_ms: t + 6_800,
+        },
         Op::DeadLetterJobs {
             queue: "beta".into(),
             state: PeekState::Ready,
-            keys: vec![],
+            keys: vec![
+                ReadyKey {
+                    queue: "beta",
+                    priority: 4,
+                    enqueued_at: t + 6_800,
+                    job_id: "j09",
+                }
+                .encode(),
+            ],
             reason: Some("manual".into()),
             now_ms: t + 7_000,
+        },
+        Op::DeadLetterJobs {
+            queue: "beta".into(),
+            state: PeekState::Scheduled,
+            keys: vec![
+                TimerKey {
+                    deadline: t + 30_000,
+                    job_id: "j10",
+                }
+                .encode(),
+            ],
+            reason: None,
+            now_ms: t + 7_100,
+        },
+        Op::DeleteDeadLetters {
+            queue: "beta".into(),
+            keys: vec![dl_key(t + 7_000, "beta", "j09")],
         },
         Op::RequeueDeadLetters {
             queue: "gamma".into(),
@@ -370,6 +432,7 @@ fn recorded_stream_replays_identically() {
             max: 10,
             scan_cap: 100,
         },
+        // Already requeued and drained away: the missing branch.
         Op::DeleteDeadLetters {
             queue: "gamma".into(),
             keys: vec![dl_key(t + 4_000, "gamma", "j07")],
@@ -383,6 +446,15 @@ fn recorded_stream_replays_identically() {
     ];
 
     let outcomes: Vec<String> = ops.iter().map(|op| dbg_outcome(source.apply(op))).collect();
+
+    let all = outcomes.join("\n");
+    for marker in ["dead_lettered: 1", "deleted: 1", "requeued: 1"] {
+        assert!(
+            all.contains(marker),
+            "scenario no longer exercises {marker:?}: {all}"
+        );
+    }
+
     assert_stream_replays(&cfg, &source, &ops, &outcomes);
 }
 
@@ -505,6 +577,7 @@ fn random_op(rng: &mut Rng, next_id: &mut u32, leases: &mut Vec<(String, u32)>, 
         93..=94 => Op::CloseQueue {
             queue: rng.queue(),
             now_ms: now,
+            grace_ms: 30_000,
         },
         95 => Op::OpenQueue { queue: rng.queue() },
         96..=97 => Op::PurgeQueueChunk {

@@ -877,8 +877,12 @@ fn apply_op(
         } => OpOutcome::DrainDeadLetters(apply_drain(
             store, indexes, tx, cycle, queue, max, scan_cap,
         )?),
-        Op::CloseQueue { queue, now_ms } => {
-            apply_close_queue(store, indexes, tx, cycle, queue, now_ms);
+        Op::CloseQueue {
+            queue,
+            now_ms,
+            grace_ms,
+        } => {
+            apply_close_queue(store, indexes, tx, cycle, queue, now_ms, grace_ms);
             OpOutcome::CloseQueue
         }
         Op::OpenQueue { queue } => {
@@ -1379,13 +1383,10 @@ fn apply_reserve(
                     cycle.dirty = true;
                     continue;
                 }
-                Err(e) => {
-                    indexes.ready.insert(ready_k, attempt);
-                    if jobs.is_empty() {
-                        return Err(stg_err(e));
-                    }
-                    return Ok(jobs);
-                }
+                // No partial batch on a read error: the op's committed effects
+                // must be a function of state and op, not of transient I/O
+                // failures. Poisoning the cycle rolls everything back.
+                Err(e) => return Err(stg_err(e)),
             };
 
             let (job_queue, mut job) = match JobValue::decode(&stored) {
@@ -1424,13 +1425,7 @@ fn apply_reserve(
                     }
                 },
                 Ok(None) => {}
-                Err(e) => {
-                    indexes.ready.insert(ready_k, attempt);
-                    if jobs.is_empty() {
-                        return Err(stg_err(e));
-                    }
-                    return Ok(jobs);
-                }
+                Err(e) => return Err(stg_err(e)),
             }
 
             let enqueued_at_ms = job
@@ -1962,8 +1957,9 @@ fn apply_close_queue(
     cycle: &mut Cycle,
     queue: String,
     now: i64,
+    grace_ms: i64,
 ) {
-    let deadline = now.saturating_add(CLOSE_GRACE_MS);
+    let deadline = now.saturating_add(grace_ms);
     tx.insert(
         &store.meta,
         closing_key(&queue),
@@ -2000,7 +1996,6 @@ fn apply_purge_queue_chunk(
         return Err(Status::failed_precondition("queue has in-flight jobs"));
     }
 
-    let max = max.clamp(1, PURGE_CHUNK_MAX);
     let mut purged = 0usize;
 
     let prefix = queue_prefix(queue);
@@ -3087,7 +3082,12 @@ impl Storage {
     // Durably tombstone a queue (refreshable) so enqueues to it are rejected
     // with QueueClosing while an admin delete drains it; open_queue clears it.
     pub async fn close_queue(&self, queue: String) -> Result<(), Status> {
-        match self.send_op(Op::CloseQueue { queue, now_ms: 0 }).await? {
+        let op = Op::CloseQueue {
+            queue,
+            now_ms: 0,
+            grace_ms: CLOSE_GRACE_MS,
+        };
+        match self.send_op(op).await? {
             OpOutcome::CloseQueue => Ok(()),
             _ => Err(Self::mismatched_outcome()),
         }
@@ -3152,6 +3152,7 @@ impl Storage {
         queue: String,
         max: usize,
     ) -> Result<PurgeOutcome, Status> {
+        let max = max.clamp(1, PURGE_CHUNK_MAX);
         match self.send_op(Op::PurgeQueueChunk { queue, max }).await? {
             OpOutcome::PurgeQueueChunk(outcome) => Ok(outcome),
             _ => Err(Self::mismatched_outcome()),
@@ -3713,6 +3714,7 @@ mod tests {
             &mut cycle,
             "active".into(),
             now_ms(),
+            CLOSE_GRACE_MS,
         );
         // An expired tombstone, as if its delete handler died a while ago.
         indexes.closing.insert("abandoned".into(), now_ms() - 1);
@@ -3785,6 +3787,7 @@ mod tests {
             &mut cycle,
             "q".into(),
             now_ms(),
+            CLOSE_GRACE_MS,
         );
         assert!(cycle.dirty, "a close writes its tombstone durably");
         tx.commit().expect("commit");

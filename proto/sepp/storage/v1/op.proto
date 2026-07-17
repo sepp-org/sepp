@@ -36,7 +36,7 @@ message EnqueueAtomicOp {
 message ReserveOp {
   repeated string queues = 1;
   uint64 lease_ms = 2;
-  uint32 max_jobs = 3;
+  uint64 max_jobs = 3;
   int64 now_ms = 4;
 }
 
@@ -57,13 +57,17 @@ message ExtendOp {
 
 message DrainDeadLettersOp {
   optional string queue = 1;
-  uint32 max = 2;
-  uint32 scan_cap = 3;
+  uint64 max = 2;
+  uint64 scan_cap = 3;
 }
 
 message CloseQueueOp {
   string queue = 1;
   int64 now_ms = 2;
+
+  // How long the tombstone outlives this close; the rejection deadline is
+  // now_ms + grace_ms.
+  int64 grace_ms = 3;
 }
 
 message OpenQueueOp {
@@ -100,12 +104,12 @@ message DeleteDeadLettersOp {
 
 message PurgeQueueChunkOp {
   string queue = 1;
-  uint32 max = 2;
+  uint64 max = 2;
 }
 
 message SweepOp {
   int64 now_ms = 1;
-  uint32 budget = 2;
+  uint64 budget = 2;
 
   // Dead letters that failed at or before this are deleted. Unset when
   // retention is disabled.

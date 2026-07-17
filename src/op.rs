@@ -45,6 +45,7 @@ pub enum Op {
     CloseQueue {
         queue: String,
         now_ms: i64,
+        grace_ms: i64,
     },
     OpenQueue {
         queue: String,
@@ -175,7 +176,7 @@ impl Op {
             } => P::Reserve(proto::ReserveOp {
                 queues: queues.clone(),
                 lease_ms: *lease_ms,
-                max_jobs: *max_jobs as u32,
+                max_jobs: *max_jobs as u64,
                 now_ms: *now_ms,
             }),
             Op::Ack { job_id, attempt } => P::Ack(proto::AckOp {
@@ -196,12 +197,17 @@ impl Op {
                 scan_cap,
             } => P::DrainDeadLetters(proto::DrainDeadLettersOp {
                 queue: queue.clone(),
-                max: *max as u32,
-                scan_cap: *scan_cap as u32,
+                max: *max as u64,
+                scan_cap: *scan_cap as u64,
             }),
-            Op::CloseQueue { queue, now_ms } => P::CloseQueue(proto::CloseQueueOp {
+            Op::CloseQueue {
+                queue,
+                now_ms,
+                grace_ms,
+            } => P::CloseQueue(proto::CloseQueueOp {
                 queue: queue.clone(),
                 now_ms: *now_ms,
+                grace_ms: *grace_ms,
             }),
             Op::OpenQueue { queue } => P::OpenQueue(proto::OpenQueueOp {
                 queue: queue.clone(),
@@ -236,7 +242,7 @@ impl Op {
             }
             Op::PurgeQueueChunk { queue, max } => P::PurgeQueueChunk(proto::PurgeQueueChunkOp {
                 queue: queue.clone(),
-                max: *max as u32,
+                max: *max as u64,
             }),
             Op::Sweep {
                 now_ms,
@@ -244,7 +250,7 @@ impl Op {
                 retention_cutoff_ms,
             } => P::Sweep(proto::SweepOp {
                 now_ms: *now_ms,
-                budget: *budget as u32,
+                budget: *budget as u64,
                 retention_cutoff_ms: *retention_cutoff_ms,
             }),
         };
@@ -295,6 +301,7 @@ impl Op {
             P::CloseQueue(o) => Op::CloseQueue {
                 queue: o.queue,
                 now_ms: o.now_ms,
+                grace_ms: o.grace_ms,
             },
             P::OpenQueue(o) => Op::OpenQueue { queue: o.queue },
             P::RequeueDeadLetters(o) => Op::RequeueDeadLetters {
@@ -430,6 +437,7 @@ mod tests {
             Op::CloseQueue {
                 queue: "orders".into(),
                 now_ms: NOW,
+                grace_ms: 30_000,
             },
             Op::OpenQueue {
                 queue: "orders".into(),
@@ -467,6 +475,7 @@ mod tests {
         let mut close = Op::CloseQueue {
             queue: "q".into(),
             now_ms: 0,
+            grace_ms: 30_000,
         };
         close.stamp(NOW);
         assert_eq!(
@@ -474,6 +483,7 @@ mod tests {
             Op::CloseQueue {
                 queue: "q".into(),
                 now_ms: NOW,
+                grace_ms: 30_000,
             }
         );
 
@@ -495,7 +505,7 @@ mod tests {
             "2a230a1a0a056a6f622d3110021a04626f6f6d2204120208052a03772d311080d095ffbc31",
             "321b0a120a056a6f622d3110021a02081e2203772d311080d095ffbc31",
             "3a0d0a066f7264657273100a18f403",
-            "420f0a066f72646572731080d095ffbc31",
+            "42130a066f72646572731080d095ffbc3118b0ea01",
             "4a080a066f7264657273",
             "52170a066f726465727312026b3112026b321880d095ffbc31",
             "5a1d0a066f726465727310031a026b3122066d616e75616c2880d095ffbc31",
