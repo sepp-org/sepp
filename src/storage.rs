@@ -17,7 +17,6 @@ use prost::Message;
 use tokio::sync::{Notify, futures::Notified, oneshot};
 use tonic::Status;
 use tracing::{debug, error, info, warn};
-use uuid::Uuid;
 
 use crate::config::{Config, EffectiveLimits};
 use crate::keys::{
@@ -25,6 +24,7 @@ use crate::keys::{
     ReadyKey, TimerKey, closing_key, closing_queue, deadline_of, queue_prefix, read_queue,
 };
 use crate::metrics::{CycleMetrics, Metrics, QueueDepthSnapshot};
+use crate::op::{Op, PreparedJob};
 use crate::pb::sepp::v1::{
     DeadLetterCause, DeadLetterRecord, EnqueueRequest, EnqueueResponse, ExtendRequest, Job,
     JobRejection, NackRequest, Payload, QueueClosing, QueueFull, TraceContext, job_rejection,
@@ -333,7 +333,7 @@ pub struct ExtendOutcome {
     pub trace_context: Option<TraceContext>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PeekState {
     Ready,
     Scheduled,
@@ -418,38 +418,12 @@ pub enum AtomicEnqueueOutcome {
 }
 
 enum Command {
-    Enqueue {
-        jobs: Vec<EnqueueRequest>,
-        resp: oneshot::Sender<Result<Vec<EnqueueResult>, Status>>,
+    // A mutating operation
+    Op {
+        op: Op,
+        resp: oneshot::Sender<Result<OpOutcome, Status>>,
     },
-    EnqueueAtomic {
-        jobs: Vec<EnqueueRequest>,
-        resp: oneshot::Sender<Result<AtomicEnqueueOutcome, Status>>,
-    },
-    Reserve {
-        queues: Vec<String>,
-        lease_ms: u64,
-        max_jobs: usize,
-        resp: oneshot::Sender<Result<Vec<Job>, Status>>,
-    },
-    Ack {
-        job_id: String,
-        attempt: u32,
-        resp: oneshot::Sender<Result<AckOutcome, Status>>,
-    },
-    Nack {
-        req: NackRequest,
-        resp: oneshot::Sender<Result<NackOutcome, Status>>,
-    },
-    Extend {
-        req: ExtendRequest,
-        resp: oneshot::Sender<Result<ExtendOutcome, Status>>,
-    },
-    DrainDeadLetters {
-        queue: Option<String>,
-        max: usize,
-        resp: oneshot::Sender<Result<Vec<DeadLetterRecord>, Status>>,
-    },
+    // Read-only
     PeekKeys {
         state: PeekState,
         queue: String,
@@ -461,118 +435,37 @@ enum Command {
         queue: String,
         resp: oneshot::Sender<Result<QueueDepthCounts, Status>>,
     },
-    CloseQueue {
-        queue: String,
-        resp: oneshot::Sender<Result<(), Status>>,
-    },
-    OpenQueue {
-        queue: String,
-        resp: oneshot::Sender<Result<(), Status>>,
-    },
-    RequeueDeadLetters {
-        queue: String,
-        keys: Vec<Vec<u8>>,
-        resp: oneshot::Sender<Result<RequeueOutcome, Status>>,
-    },
-    DeadLetterJobs {
-        queue: String,
-        state: PeekState,
-        keys: Vec<Vec<u8>>,
-        reason: Option<String>,
-        resp: oneshot::Sender<Result<DeadLetterJobsOutcome, Status>>,
-    },
-    DeleteDeadLetters {
-        queue: String,
-        keys: Vec<Vec<u8>>,
-        resp: oneshot::Sender<Result<DeleteOutcome, Status>>,
-    },
-    PurgeQueueChunk {
-        queue: String,
-        max: usize,
-        resp: oneshot::Sender<Result<PurgeOutcome, Status>>,
-    },
 }
 
-enum Responder {
-    Enqueue(
-        oneshot::Sender<Result<Vec<EnqueueResult>, Status>>,
-        Vec<EnqueueResult>,
-    ),
-    EnqueueAtomic(
-        oneshot::Sender<Result<AtomicEnqueueOutcome, Status>>,
-        AtomicEnqueueOutcome,
-    ),
-    Reserve(oneshot::Sender<Result<Vec<Job>, Status>>, Vec<Job>),
-    Ack(oneshot::Sender<Result<AckOutcome, Status>>, AckOutcome),
-    Nack(oneshot::Sender<Result<NackOutcome, Status>>, NackOutcome),
-    Extend(
-        oneshot::Sender<Result<ExtendOutcome, Status>>,
-        ExtendOutcome,
-    ),
-    Drain(
-        oneshot::Sender<Result<Vec<DeadLetterRecord>, Status>>,
-        Vec<DeadLetterRecord>,
-    ),
-    CloseQueue(oneshot::Sender<Result<(), Status>>),
-    OpenQueue(oneshot::Sender<Result<(), Status>>),
-    Requeue(
-        oneshot::Sender<Result<RequeueOutcome, Status>>,
-        RequeueOutcome,
-    ),
-    DeadLetterJobs(
-        oneshot::Sender<Result<DeadLetterJobsOutcome, Status>>,
-        DeadLetterJobsOutcome,
-    ),
-    DeleteDeadLetters(
-        oneshot::Sender<Result<DeleteOutcome, Status>>,
-        DeleteOutcome,
-    ),
-    Purge(oneshot::Sender<Result<PurgeOutcome, Status>>, PurgeOutcome),
+enum OpOutcome {
+    Enqueue(Vec<EnqueueResult>),
+    EnqueueAtomic(AtomicEnqueueOutcome),
+    Reserve(Vec<Job>),
+    Ack(AckOutcome),
+    Nack(NackOutcome),
+    Extend(ExtendOutcome),
+    DrainDeadLetters(Vec<DeadLetterRecord>),
+    CloseQueue,
+    OpenQueue,
+    RequeueDeadLetters(RequeueOutcome),
+    DeadLetterJobs(DeadLetterJobsOutcome),
+    DeleteDeadLetters(DeleteOutcome),
+    PurgeQueueChunk(PurgeOutcome),
 }
 
-impl Responder {
+// An applied op's outcome parked until the cycle's commit decides whether the
+// caller sees it or the commit error.
+struct PendingReply {
+    resp: oneshot::Sender<Result<OpOutcome, Status>>,
+    outcome: OpOutcome,
+}
+
+impl PendingReply {
     fn respond(self, outcome: &Result<(), Status>) {
-        match self {
-            Responder::Enqueue(resp, payload) => {
-                let _ = resp.send(outcome.clone().map(|()| payload));
-            }
-            Responder::EnqueueAtomic(resp, payload) => {
-                let _ = resp.send(outcome.clone().map(|()| payload));
-            }
-            Responder::Reserve(resp, payload) => {
-                let _ = resp.send(outcome.clone().map(|()| payload));
-            }
-            Responder::Ack(resp, payload) => {
-                let _ = resp.send(outcome.clone().map(|()| payload));
-            }
-            Responder::Nack(resp, payload) => {
-                let _ = resp.send(outcome.clone().map(|()| payload));
-            }
-            Responder::Extend(resp, payload) => {
-                let _ = resp.send(outcome.clone().map(|()| payload));
-            }
-            Responder::Drain(resp, payload) => {
-                let _ = resp.send(outcome.clone().map(|()| payload));
-            }
-            Responder::CloseQueue(resp) => {
-                let _ = resp.send(outcome.clone());
-            }
-            Responder::OpenQueue(resp) => {
-                let _ = resp.send(outcome.clone());
-            }
-            Responder::Requeue(resp, payload) => {
-                let _ = resp.send(outcome.clone().map(|()| payload));
-            }
-            Responder::DeadLetterJobs(resp, payload) => {
-                let _ = resp.send(outcome.clone().map(|()| payload));
-            }
-            Responder::DeleteDeadLetters(resp, payload) => {
-                let _ = resp.send(outcome.clone().map(|()| payload));
-            }
-            Responder::Purge(resp, payload) => {
-                let _ = resp.send(outcome.clone().map(|()| payload));
-            }
-        }
+        let _ = self.resp.send(match outcome {
+            Ok(()) => Ok(self.outcome),
+            Err(e) => Err(e.clone()),
+        });
     }
 }
 
@@ -825,7 +718,7 @@ fn run_rpc_cycle(
 ) -> Option<CycleMetrics> {
     let mut tx = store.db.write_tx();
     let mut cycle = Cycle::new(store.metrics.is_enabled() || store.params.admin_enabled);
-    let mut responders: Vec<Responder> = Vec::with_capacity(rpcs.len());
+    let mut responders: Vec<PendingReply> = Vec::with_capacity(rpcs.len());
 
     let mut rpcs = rpcs.into_iter();
     let fatal = rpcs.by_ref().find_map(|cmd| {
@@ -887,50 +780,13 @@ fn apply_command(
     tx: &mut WriteTransaction<'_>,
     cycle: &mut Cycle,
     cmd: Command,
-    responders: &mut Vec<Responder>,
+    responders: &mut Vec<PendingReply>,
 ) -> Result<(), Status> {
     match cmd {
-        Command::Enqueue { jobs, resp } => match apply_enqueue(store, indexes, tx, cycle, jobs) {
-            Ok(results) => responders.push(Responder::Enqueue(resp, results)),
+        Command::Op { op, resp } => match apply_op(store, indexes, tx, cycle, op) {
+            Ok(outcome) => responders.push(PendingReply { resp, outcome }),
             Err(e) => return reject(resp, e),
         },
-        Command::EnqueueAtomic { jobs, resp } => {
-            match apply_enqueue_atomic(store, indexes, tx, cycle, jobs) {
-                Ok(outcome) => responders.push(Responder::EnqueueAtomic(resp, outcome)),
-                Err(e) => return reject(resp, e),
-            }
-        }
-        Command::Reserve {
-            queues,
-            lease_ms,
-            max_jobs,
-            resp,
-        } => match apply_reserve(store, indexes, tx, cycle, &queues, lease_ms, max_jobs) {
-            Ok(jobs) => responders.push(Responder::Reserve(resp, jobs)),
-            Err(e) => return reject(resp, e),
-        },
-        Command::Ack {
-            job_id,
-            attempt,
-            resp,
-        } => match apply_ack(store, indexes, tx, cycle, &job_id, attempt) {
-            Ok(outcome) => responders.push(Responder::Ack(resp, outcome)),
-            Err(e) => return reject(resp, e),
-        },
-        Command::Nack { req, resp } => match apply_nack(store, indexes, tx, cycle, req) {
-            Ok(outcome) => responders.push(Responder::Nack(resp, outcome)),
-            Err(e) => return reject(resp, e),
-        },
-        Command::Extend { req, resp } => match apply_extend(store, indexes, tx, cycle, req) {
-            Ok(outcome) => responders.push(Responder::Extend(resp, outcome)),
-            Err(e) => return reject(resp, e),
-        },
-        Command::DrainDeadLetters { queue, max, resp } => {
-            match apply_drain(store, indexes, tx, cycle, queue, max) {
-                Ok(records) => responders.push(Responder::Drain(resp, records)),
-                Err(e) => return reject(resp, e),
-            }
-        }
         // Read-only against the in-memory indexes: answered inline so it
         // neither waits on the cycle's commit nor marks it dirty.
         Command::PeekKeys {
@@ -946,43 +802,64 @@ fn apply_command(
         Command::QueueDepths { queue, resp } => {
             let _ = resp.send(Ok(indexes.depth_counts(&queue)));
         }
-        Command::CloseQueue { queue, resp } => {
+    }
+
+    Ok(())
+}
+
+fn apply_op(
+    store: &Store,
+    indexes: &mut Indexes,
+    tx: &mut WriteTransaction<'_>,
+    cycle: &mut Cycle,
+    op: Op,
+) -> Result<OpOutcome, Status> {
+    Ok(match op {
+        Op::Enqueue { jobs } => OpOutcome::Enqueue(apply_enqueue(store, indexes, tx, cycle, jobs)?),
+        Op::EnqueueAtomic { jobs } => {
+            OpOutcome::EnqueueAtomic(apply_enqueue_atomic(store, indexes, tx, cycle, jobs)?)
+        }
+        Op::Reserve {
+            queues,
+            lease_ms,
+            max_jobs,
+        } => OpOutcome::Reserve(apply_reserve(
+            store, indexes, tx, cycle, &queues, lease_ms, max_jobs,
+        )?),
+        Op::Ack { job_id, attempt } => {
+            OpOutcome::Ack(apply_ack(store, indexes, tx, cycle, &job_id, attempt)?)
+        }
+        Op::Nack { req } => OpOutcome::Nack(apply_nack(store, indexes, tx, cycle, req)?),
+        Op::Extend { req } => OpOutcome::Extend(apply_extend(store, indexes, tx, cycle, req)?),
+        Op::DrainDeadLetters { queue, max } => {
+            OpOutcome::DrainDeadLetters(apply_drain(store, indexes, tx, cycle, queue, max)?)
+        }
+        Op::CloseQueue { queue } => {
             apply_close_queue(store, indexes, tx, cycle, queue);
-            responders.push(Responder::CloseQueue(resp));
+            OpOutcome::CloseQueue
         }
-        Command::OpenQueue { queue, resp } => {
+        Op::OpenQueue { queue } => {
             apply_open_queue(store, indexes, tx, cycle, &queue);
-            responders.push(Responder::OpenQueue(resp));
+            OpOutcome::OpenQueue
         }
-        Command::RequeueDeadLetters { queue, keys, resp } => {
-            match apply_requeue_dead_letters(store, indexes, tx, cycle, &queue, keys) {
-                Ok(outcome) => responders.push(Responder::Requeue(resp, outcome)),
-                Err(e) => return reject(resp, e),
-            }
-        }
-        Command::DeadLetterJobs {
+        Op::RequeueDeadLetters { queue, keys } => OpOutcome::RequeueDeadLetters(
+            apply_requeue_dead_letters(store, indexes, tx, cycle, &queue, keys)?,
+        ),
+        Op::DeadLetterJobs {
             queue,
             state,
             keys,
             reason,
-            resp,
-        } => match apply_dead_letter_jobs(store, indexes, tx, cycle, &queue, state, keys, reason) {
-            Ok(outcome) => responders.push(Responder::DeadLetterJobs(resp, outcome)),
-            Err(e) => return reject(resp, e),
-        },
-        Command::DeleteDeadLetters { queue, keys, resp } => {
-            let outcome = apply_delete_dead_letters(store, indexes, tx, cycle, &queue, keys);
-            responders.push(Responder::DeleteDeadLetters(resp, outcome));
-        }
-        Command::PurgeQueueChunk { queue, max, resp } => {
-            match apply_purge_queue_chunk(store, indexes, tx, cycle, &queue, max) {
-                Ok(outcome) => responders.push(Responder::Purge(resp, outcome)),
-                Err(e) => return reject(resp, e),
-            }
-        }
-    }
-
-    Ok(())
+        } => OpOutcome::DeadLetterJobs(apply_dead_letter_jobs(
+            store, indexes, tx, cycle, &queue, state, keys, reason,
+        )?),
+        Op::DeleteDeadLetters { queue, keys } => OpOutcome::DeleteDeadLetters(
+            apply_delete_dead_letters(store, indexes, tx, cycle, &queue, keys),
+        ),
+        Op::PurgeQueueChunk { queue, max } => OpOutcome::PurgeQueueChunk(apply_purge_queue_chunk(
+            store, indexes, tx, cycle, &queue, max,
+        )?),
+    })
 }
 
 // Storage failures are always Status::internal; business rejections (NotFound,
@@ -999,49 +876,13 @@ fn reject<T>(resp: oneshot::Sender<Result<T, Status>>, e: Status) -> Result<(), 
 
 fn fail_command(cmd: Command, status: &Status) {
     match cmd {
-        Command::Enqueue { resp, .. } => {
-            let _ = resp.send(Err(status.clone()));
-        }
-        Command::EnqueueAtomic { resp, .. } => {
-            let _ = resp.send(Err(status.clone()));
-        }
-        Command::Reserve { resp, .. } => {
-            let _ = resp.send(Err(status.clone()));
-        }
-        Command::Ack { resp, .. } => {
-            let _ = resp.send(Err(status.clone()));
-        }
-        Command::Nack { resp, .. } => {
-            let _ = resp.send(Err(status.clone()));
-        }
-        Command::Extend { resp, .. } => {
-            let _ = resp.send(Err(status.clone()));
-        }
-        Command::DrainDeadLetters { resp, .. } => {
+        Command::Op { resp, .. } => {
             let _ = resp.send(Err(status.clone()));
         }
         Command::PeekKeys { resp, .. } => {
             let _ = resp.send(Err(status.clone()));
         }
         Command::QueueDepths { resp, .. } => {
-            let _ = resp.send(Err(status.clone()));
-        }
-        Command::CloseQueue { resp, .. } => {
-            let _ = resp.send(Err(status.clone()));
-        }
-        Command::OpenQueue { resp, .. } => {
-            let _ = resp.send(Err(status.clone()));
-        }
-        Command::RequeueDeadLetters { resp, .. } => {
-            let _ = resp.send(Err(status.clone()));
-        }
-        Command::DeadLetterJobs { resp, .. } => {
-            let _ = resp.send(Err(status.clone()));
-        }
-        Command::DeleteDeadLetters { resp, .. } => {
-            let _ = resp.send(Err(status.clone()));
-        }
-        Command::PurgeQueueChunk { resp, .. } => {
             let _ = resp.send(Err(status.clone()));
         }
     }
@@ -1180,29 +1021,30 @@ fn apply_enqueue(
     indexes: &mut Indexes,
     tx: &mut WriteTransaction<'_>,
     cycle: &mut Cycle,
-    jobs: Vec<EnqueueRequest>,
+    jobs: Vec<PreparedJob>,
 ) -> Result<Vec<EnqueueResult>, Status> {
     let now = now_ms();
     let registry = store.registry.load();
     let mut results = Vec::with_capacity(jobs.len());
 
-    for req in jobs {
+    for job in jobs {
+        let queue = &job.req.queue;
         // Checked before dedup so a hit can't hand back a job_id that is about
         // to be purged.
         if indexes
             .closing
-            .get(&req.queue)
+            .get(queue)
             .is_some_and(|&deadline| deadline > now)
         {
-            results.push(Err(queue_closing(&req.queue)));
+            results.push(Err(queue_closing(queue)));
             continue;
         }
 
-        let mut limits = registry.effective(&req.queue);
+        let mut limits = registry.effective(queue);
         // Restart-only; see Store::boot_registry.
-        limits.dedup_window_ms = store.boot_registry.dedup_window_ms(&req.queue);
+        limits.dedup_window_ms = store.boot_registry.dedup_window_ms(queue);
 
-        match check_dedup(store, tx, cycle, &req, now)? {
+        match check_dedup(store, tx, cycle, &job.req, now)? {
             DedupCheck::Hit(resp) => results.push(Ok(resp)),
             DedupCheck::Miss { stale_timer } => {
                 // live_depth is read from the in-memory indexes, which
@@ -1210,9 +1052,9 @@ fn apply_enqueue(
                 // this batch already count against the cap. Dedup hits never
                 // get here and so never count.
                 if let Some(cap) = limits.max_queue_depth
-                    && indexes.live_depth(&req.queue) >= cap
+                    && indexes.live_depth(queue) >= cap
                 {
-                    results.push(Err(queue_full(&req.queue, cap)));
+                    results.push(Err(queue_full(queue, cap)));
                     continue;
                 }
                 results.push(Ok(insert_job(
@@ -1220,7 +1062,7 @@ fn apply_enqueue(
                     indexes,
                     tx,
                     cycle,
-                    req,
+                    job,
                     now,
                     &limits,
                     stale_timer,
@@ -1237,7 +1079,7 @@ fn apply_enqueue_atomic(
     indexes: &mut Indexes,
     tx: &mut WriteTransaction<'_>,
     cycle: &mut Cycle,
-    jobs: Vec<EnqueueRequest>,
+    jobs: Vec<PreparedJob>,
 ) -> Result<AtomicEnqueueOutcome, Status> {
     let now = now_ms();
     let registry = store.registry.load();
@@ -1247,8 +1089,13 @@ fn apply_enqueue_atomic(
     let closing: Vec<(u32, JobRejection)> = jobs
         .iter()
         .enumerate()
-        .filter(|(_, req)| indexes.closing.get(&req.queue).is_some_and(|&d| d > now))
-        .map(|(index, req)| (index as u32, queue_closing(&req.queue)))
+        .filter(|(_, job)| {
+            indexes
+                .closing
+                .get(&job.req.queue)
+                .is_some_and(|&d| d > now)
+        })
+        .map(|(index, job)| (index as u32, queue_closing(&job.req.queue)))
         .collect();
     if !closing.is_empty() {
         return Ok(AtomicEnqueueOutcome::Rejected(closing));
@@ -1257,8 +1104,8 @@ fn apply_enqueue_atomic(
     // Capacity is checked for the whole batch up front so a full queue commits
     // nothing. Dedup hits are conservatively counted as new jobs here.
     let mut wanted: HashMap<&str, u64> = HashMap::new();
-    for req in &jobs {
-        *wanted.entry(req.queue.as_str()).or_default() += 1;
+    for job in &jobs {
+        *wanted.entry(job.req.queue.as_str()).or_default() += 1;
     }
 
     let mut full: HashMap<&str, u64> = HashMap::new();
@@ -1274,23 +1121,23 @@ fn apply_enqueue_atomic(
         let errors = jobs
             .iter()
             .enumerate()
-            .filter_map(|(index, req)| {
-                full.get(req.queue.as_str())
-                    .map(|cap| (index as u32, queue_full(&req.queue, *cap)))
+            .filter_map(|(index, job)| {
+                full.get(job.req.queue.as_str())
+                    .map(|cap| (index as u32, queue_full(&job.req.queue, *cap)))
             })
             .collect();
         return Ok(AtomicEnqueueOutcome::Rejected(errors));
     }
 
     let mut responses = Vec::with_capacity(jobs.len());
-    for req in jobs {
-        let mut limits = registry.effective(&req.queue);
+    for job in jobs {
+        let mut limits = registry.effective(&job.req.queue);
         // Restart-only; see Store::boot_registry.
-        limits.dedup_window_ms = store.boot_registry.dedup_window_ms(&req.queue);
-        responses.push(match check_dedup(store, tx, cycle, &req, now)? {
+        limits.dedup_window_ms = store.boot_registry.dedup_window_ms(&job.req.queue);
+        responses.push(match check_dedup(store, tx, cycle, &job.req, now)? {
             DedupCheck::Hit(resp) => resp,
             DedupCheck::Miss { stale_timer } => {
-                insert_job(store, indexes, tx, cycle, req, now, &limits, stale_timer)
+                insert_job(store, indexes, tx, cycle, job, now, &limits, stale_timer)
             }
         });
     }
@@ -1304,12 +1151,12 @@ fn insert_job(
     indexes: &mut Indexes,
     tx: &mut WriteTransaction<'_>,
     cycle: &mut Cycle,
-    req: EnqueueRequest,
+    job: PreparedJob,
     now: i64,
     limits: &EffectiveLimits,
     stale_dedup_timer: Option<Vec<u8>>,
 ) -> EnqueueResponse {
-    let id = Uuid::new_v4().to_string();
+    let PreparedJob { id, req } = job;
     let queue = req.queue;
     let payload = req.payload;
 
@@ -3055,16 +2902,34 @@ impl Storage {
             .map_err(|_| Status::internal("storage unavailable"))
     }
 
+    async fn send_op(&self, op: Op) -> Result<OpOutcome, Status> {
+        self.send(|resp| Command::Op { op, resp }).await?
+    }
+
+    // Each op kind produces exactly the outcome variant its handle method
+    // unwraps; the pairing is fixed in apply_op. Reaching the fallback arm in
+    // any method below is a bug.
+    fn mismatched_outcome() -> Status {
+        Status::internal("storage returned a mismatched op outcome")
+    }
+
     pub async fn enqueue(&self, jobs: Vec<EnqueueRequest>) -> Result<Vec<EnqueueResult>, Status> {
-        self.send(|resp| Command::Enqueue { jobs, resp }).await?
+        let jobs = jobs.into_iter().map(PreparedJob::new).collect();
+        match self.send_op(Op::Enqueue { jobs }).await? {
+            OpOutcome::Enqueue(results) => Ok(results),
+            _ => Err(Self::mismatched_outcome()),
+        }
     }
 
     pub async fn enqueue_atomic(
         &self,
         jobs: Vec<EnqueueRequest>,
     ) -> Result<AtomicEnqueueOutcome, Status> {
-        self.send(|resp| Command::EnqueueAtomic { jobs, resp })
-            .await?
+        let jobs = jobs.into_iter().map(PreparedJob::new).collect();
+        match self.send_op(Op::EnqueueAtomic { jobs }).await? {
+            OpOutcome::EnqueueAtomic(outcome) => Ok(outcome),
+            _ => Err(Self::mismatched_outcome()),
+        }
     }
 
     pub async fn reserve_once(
@@ -3073,30 +2938,36 @@ impl Storage {
         lease_ms: u64,
         max_jobs: usize,
     ) -> Result<Vec<Job>, Status> {
-        self.send(|resp| Command::Reserve {
+        let op = Op::Reserve {
             queues,
             lease_ms,
             max_jobs,
-            resp,
-        })
-        .await?
+        };
+        match self.send_op(op).await? {
+            OpOutcome::Reserve(jobs) => Ok(jobs),
+            _ => Err(Self::mismatched_outcome()),
+        }
     }
 
     pub async fn ack(&self, job_id: String, attempt: u32) -> Result<AckOutcome, Status> {
-        self.send(|resp| Command::Ack {
-            job_id,
-            attempt,
-            resp,
-        })
-        .await?
+        match self.send_op(Op::Ack { job_id, attempt }).await? {
+            OpOutcome::Ack(outcome) => Ok(outcome),
+            _ => Err(Self::mismatched_outcome()),
+        }
     }
 
     pub async fn nack(&self, req: NackRequest) -> Result<NackOutcome, Status> {
-        self.send(|resp| Command::Nack { req, resp }).await?
+        match self.send_op(Op::Nack { req }).await? {
+            OpOutcome::Nack(outcome) => Ok(outcome),
+            _ => Err(Self::mismatched_outcome()),
+        }
     }
 
     pub async fn extend(&self, req: ExtendRequest) -> Result<ExtendOutcome, Status> {
-        self.send(|resp| Command::Extend { req, resp }).await?
+        match self.send_op(Op::Extend { req }).await? {
+            OpOutcome::Extend(outcome) => Ok(outcome),
+            _ => Err(Self::mismatched_outcome()),
+        }
     }
 
     pub async fn drain_dead_letters(
@@ -3104,8 +2975,10 @@ impl Storage {
         queue: Option<String>,
         max: usize,
     ) -> Result<Vec<DeadLetterRecord>, Status> {
-        self.send(|resp| Command::DrainDeadLetters { queue, max, resp })
-            .await?
+        match self.send_op(Op::DrainDeadLetters { queue, max }).await? {
+            OpOutcome::DrainDeadLetters(records) => Ok(records),
+            _ => Err(Self::mismatched_outcome()),
+        }
     }
 
     pub async fn peek_keys(
@@ -3133,12 +3006,17 @@ impl Storage {
     // Durably tombstone a queue (refreshable) so enqueues to it are rejected
     // with QueueClosing while an admin delete drains it; open_queue clears it.
     pub async fn close_queue(&self, queue: String) -> Result<(), Status> {
-        self.send(|resp| Command::CloseQueue { queue, resp })
-            .await?
+        match self.send_op(Op::CloseQueue { queue }).await? {
+            OpOutcome::CloseQueue => Ok(()),
+            _ => Err(Self::mismatched_outcome()),
+        }
     }
 
     pub async fn open_queue(&self, queue: String) -> Result<(), Status> {
-        self.send(|resp| Command::OpenQueue { queue, resp }).await?
+        match self.send_op(Op::OpenQueue { queue }).await? {
+            OpOutcome::OpenQueue => Ok(()),
+            _ => Err(Self::mismatched_outcome()),
+        }
     }
 
     pub async fn requeue_dead_letters(
@@ -3146,8 +3024,10 @@ impl Storage {
         queue: String,
         keys: Vec<Vec<u8>>,
     ) -> Result<RequeueOutcome, Status> {
-        self.send(|resp| Command::RequeueDeadLetters { queue, keys, resp })
-            .await?
+        match self.send_op(Op::RequeueDeadLetters { queue, keys }).await? {
+            OpOutcome::RequeueDeadLetters(outcome) => Ok(outcome),
+            _ => Err(Self::mismatched_outcome()),
+        }
     }
 
     pub async fn dead_letter_jobs(
@@ -3157,14 +3037,16 @@ impl Storage {
         keys: Vec<Vec<u8>>,
         reason: Option<String>,
     ) -> Result<DeadLetterJobsOutcome, Status> {
-        self.send(|resp| Command::DeadLetterJobs {
+        let op = Op::DeadLetterJobs {
             queue,
             state,
             keys,
             reason,
-            resp,
-        })
-        .await?
+        };
+        match self.send_op(op).await? {
+            OpOutcome::DeadLetterJobs(outcome) => Ok(outcome),
+            _ => Err(Self::mismatched_outcome()),
+        }
     }
 
     pub async fn delete_dead_letters(
@@ -3172,8 +3054,10 @@ impl Storage {
         queue: String,
         keys: Vec<Vec<u8>>,
     ) -> Result<DeleteOutcome, Status> {
-        self.send(|resp| Command::DeleteDeadLetters { queue, keys, resp })
-            .await?
+        match self.send_op(Op::DeleteDeadLetters { queue, keys }).await? {
+            OpOutcome::DeleteDeadLetters(outcome) => Ok(outcome),
+            _ => Err(Self::mismatched_outcome()),
+        }
     }
 
     pub async fn purge_queue_chunk(
@@ -3181,14 +3065,17 @@ impl Storage {
         queue: String,
         max: usize,
     ) -> Result<PurgeOutcome, Status> {
-        self.send(|resp| Command::PurgeQueueChunk { queue, max, resp })
-            .await?
+        match self.send_op(Op::PurgeQueueChunk { queue, max }).await? {
+            OpOutcome::PurgeQueueChunk(outcome) => Ok(outcome),
+            _ => Err(Self::mismatched_outcome()),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uuid::Uuid;
 
     // So that each test doesnt have to spell out the entire struct
     fn ready_key(queue: &str, priority: u32, enqueued_at: i64, job_id: &str) -> Vec<u8> {
@@ -3640,6 +3527,10 @@ mod tests {
         }
     }
 
+    fn test_job(queue: &str) -> PreparedJob {
+        PreparedJob::new(test_req(queue))
+    }
+
     #[test]
     fn enqueue_rejects_jobs_for_a_closing_queue() {
         let store = open_test_store();
@@ -3653,7 +3544,7 @@ mod tests {
             &mut indexes,
             &mut tx,
             &mut cycle,
-            vec![test_req("q"), test_req("other")],
+            vec![test_job("q"), test_job("other")],
         )
         .expect("enqueue applies");
 
@@ -3672,7 +3563,7 @@ mod tests {
             &mut indexes,
             &mut tx,
             &mut cycle,
-            vec![test_req("q")],
+            vec![test_job("q")],
         )
         .expect("enqueue applies");
         assert!(results[0].is_ok());
@@ -3691,7 +3582,7 @@ mod tests {
             &mut indexes,
             &mut tx,
             &mut cycle,
-            vec![test_req("other"), test_req("q")],
+            vec![test_job("other"), test_job("q")],
         )
         .expect("atomic enqueue applies");
 
@@ -3797,18 +3688,30 @@ mod tests {
             idempotency_key: Some("k".to_string()),
             ..test_req("q")
         };
-        let first = apply_enqueue(&store, &mut indexes, &mut tx, &mut cycle, vec![req.clone()])
-            .expect("enqueue applies")
-            .remove(0)
-            .expect("the first enqueue is accepted");
+        let first = apply_enqueue(
+            &store,
+            &mut indexes,
+            &mut tx,
+            &mut cycle,
+            vec![PreparedJob::new(req.clone())],
+        )
+        .expect("enqueue applies")
+        .remove(0)
+        .expect("the first enqueue is accepted");
 
         // Outlive the 1ms boot window. The dedup record itself is still there
         // (no sweep has run), so a check against the live window would hit.
         std::thread::sleep(std::time::Duration::from_millis(10));
-        let second = apply_enqueue(&store, &mut indexes, &mut tx, &mut cycle, vec![req])
-            .expect("enqueue applies")
-            .remove(0)
-            .expect("the second enqueue is accepted");
+        let second = apply_enqueue(
+            &store,
+            &mut indexes,
+            &mut tx,
+            &mut cycle,
+            vec![PreparedJob::new(req)],
+        )
+        .expect("enqueue applies")
+        .remove(0)
+        .expect("the second enqueue is accepted");
 
         assert!(
             !second.deduplicated,

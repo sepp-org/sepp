@@ -1,0 +1,109 @@
+syntax = "proto3";
+
+package sepp.storage.v1;
+
+import "sepp/v1/queue.proto";
+
+// Internal serialization format for the committer's mutating operations: the
+// future replicated-log entry, pinned by a golden test before anything writes
+// it to a log. Repo-local: unlike sepp/v1/queue.proto this file is NOT part of
+// the published contract on buf.build/sepp-org/sepp-proto and is never exposed
+// to clients.
+
+// An EnqueueRequest plus its pre-assigned job ID. IDs are generated before an
+// op is built so applying the op is deterministic.
+message PreparedJob {
+  sepp.v1.EnqueueRequest request = 1;
+
+  string job_id = 2;
+}
+
+message EnqueueOp {
+  repeated PreparedJob jobs = 1;
+}
+
+message EnqueueAtomicOp {
+  repeated PreparedJob jobs = 1;
+}
+
+message ReserveOp {
+  repeated string queues = 1;
+  uint64 lease_ms = 2;
+  uint32 max_jobs = 3;
+}
+
+message AckOp {
+  string job_id = 1;
+  uint32 attempt = 2;
+}
+
+message NackOp {
+  sepp.v1.NackRequest request = 1;
+}
+
+message ExtendOp {
+  sepp.v1.ExtendRequest request = 1;
+}
+
+message DrainDeadLettersOp {
+  optional string queue = 1;
+  uint32 max = 2;
+}
+
+message CloseQueueOp {
+  string queue = 1;
+}
+
+message OpenQueueOp {
+  string queue = 1;
+}
+
+message RequeueDeadLettersOp {
+  string queue = 1;
+  repeated bytes keys = 2;
+}
+
+// The job state an admin dead-letter operation drains from.
+enum JobState {
+  JOB_STATE_UNSPECIFIED = 0;
+  JOB_STATE_READY = 1;
+  JOB_STATE_SCHEDULED = 2;
+  JOB_STATE_INFLIGHT = 3;
+  JOB_STATE_DEAD_LETTER = 4;
+}
+
+message DeadLetterJobsOp {
+  string queue = 1;
+  JobState state = 2;
+  repeated bytes keys = 3;
+  optional string reason = 4;
+}
+
+message DeleteDeadLettersOp {
+  string queue = 1;
+  repeated bytes keys = 2;
+}
+
+message PurgeQueueChunkOp {
+  string queue = 1;
+  uint32 max = 2;
+}
+
+// One mutating committer operation. Exactly one field is set.
+message Op {
+  oneof op {
+    EnqueueOp enqueue = 1;
+    EnqueueAtomicOp enqueue_atomic = 2;
+    ReserveOp reserve = 3;
+    AckOp ack = 4;
+    NackOp nack = 5;
+    ExtendOp extend = 6;
+    DrainDeadLettersOp drain_dead_letters = 7;
+    CloseQueueOp close_queue = 8;
+    OpenQueueOp open_queue = 9;
+    RequeueDeadLettersOp requeue_dead_letters = 10;
+    DeadLetterJobsOp dead_letter_jobs = 11;
+    DeleteDeadLettersOp delete_dead_letters = 12;
+    PurgeQueueChunkOp purge_queue_chunk = 13;
+  }
+}

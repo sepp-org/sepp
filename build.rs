@@ -4,7 +4,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     //
     //     buf export buf.build/sepp-org/sepp-proto -o proto
     let includes = &["proto"];
-    let protos = &["proto/sepp/v1/queue.proto"];
+    let protos = &[
+        "proto/sepp/v1/queue.proto",
+        // Repo-local, not in the published contract; see its header comment.
+        "proto/sepp/storage/v1/op.proto",
+    ];
 
     for proto in protos {
         println!("cargo:rerun-if-changed={proto}");

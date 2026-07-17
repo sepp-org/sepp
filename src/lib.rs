@@ -4,6 +4,7 @@ pub mod config;
 pub mod config_watch;
 pub mod keys;
 pub mod metrics;
+pub mod op;
 pub mod pb;
 pub mod queue_server;
 pub mod queues;
