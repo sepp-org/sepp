@@ -1013,18 +1013,23 @@ fn run_sweep_cycle(
 
 fn commit_and_persist(store: &Store, tx: WriteTransaction<'_>) -> Result<(), Status> {
     let started = std::time::Instant::now();
-    let result = tx
-        .commit()
-        .and_then(|()| store.db.persist(store.params.persist_mode));
-
-    store.metrics.record_commit(started.elapsed());
-    match result {
-        Ok(()) => Ok(()),
+    let outcome = match tx.commit() {
+        Ok(()) => match store.db.persist(store.params.persist_mode) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                error!(error = %e, "storage persist failed; aborting");
+                panic!("storage persist failed: {e}");
+            }
+        },
+        // No need to panic here, commit is recoverable by design
         Err(e) => {
             error!(error = %e, "storage commit failed");
             Err(Status::internal("storage commit failed"))
         }
-    }
+    };
+
+    store.metrics.record_commit(started.elapsed());
+    outcome
 }
 
 fn queue_full(queue: &str, cap: u64) -> JobRejection {
