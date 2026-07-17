@@ -160,6 +160,18 @@ impl TimerKey<'_> {
     }
 }
 
+// Key in the `meta` keyspace marking a queue as closing: `"closing/" | queue`.
+// The value is the grace deadline (i64 BE).
+pub(crate) const CLOSING_PREFIX: &[u8] = b"closing/";
+
+pub(crate) fn closing_key(queue: &str) -> Vec<u8> {
+    [CLOSING_PREFIX, queue.as_bytes()].concat()
+}
+
+pub(crate) fn closing_queue(key: &[u8]) -> Option<&str> {
+    std::str::from_utf8(key.strip_prefix(CLOSING_PREFIX)?).ok()
+}
+
 // Key into the `dedup` keyspace: `queue | idempotency_key`.
 pub(crate) struct DedupKey<'a> {
     pub queue: &'a str,
@@ -433,6 +445,12 @@ mod tests {
         assert_eq!(deadline_of(&zero), 0);
         // deadline leads, so ascending key order is earliest-first.
         assert!(zero < k);
+    }
+
+    #[test]
+    fn closing_key_round_trips_queue() {
+        assert_eq!(closing_queue(&closing_key("orders")), Some("orders"));
+        assert_eq!(closing_queue(b"format_version"), None);
     }
 
     #[test]

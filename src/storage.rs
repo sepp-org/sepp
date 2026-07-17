@@ -21,8 +21,8 @@ use uuid::Uuid;
 
 use crate::config::{Config, EffectiveLimits};
 use crate::keys::{
-    DeadLetterKey, DedupKey, DedupTimerKey, DedupValue, Inflight, JobValue, ReadyKey, TimerKey,
-    deadline_of, queue_prefix, read_queue,
+    CLOSING_PREFIX, DeadLetterKey, DedupKey, DedupTimerKey, DedupValue, Inflight, JobValue,
+    ReadyKey, TimerKey, closing_key, closing_queue, deadline_of, queue_prefix, read_queue,
 };
 use crate::metrics::{CycleMetrics, Metrics, QueueDepthSnapshot};
 use crate::pb::sepp::v1::{
@@ -59,6 +59,7 @@ struct Store {
     scheduled: TxKeyspace,
     leases: TxKeyspace,
     dead_letter: TxKeyspace,
+    meta: TxKeyspace,
     params: StorageParams,
     registry: SharedRegistry,
     // Boot snapshot of the registry. dedup_window_ms is read from here instead
@@ -192,6 +193,7 @@ struct Indexes {
     // delete's purge loop is guaranteed to drain rather than livelock against a
     // concurrent producer. The deadline auto-clears the tombstone if the delete
     // handler dies; the handler refreshes it each chunk and clears it on finish.
+    // Mirrors the `closing/<queue>` rows in `meta`.
     closing: HashMap<String, i64>,
 }
 
@@ -289,17 +291,26 @@ fn rebuild_indexes(store: &Store) -> Result<Indexes, fjall::Error> {
         indexes.dead_letter.insert(key.to_vec(), &queue);
     }
 
+    // Because sweep works based on the in-memory indexes, we must load them all at boot.
+    // Otherwise the expired tombstones would be orphaned.
+    for guard in snap.prefix(&store.meta, CLOSING_PREFIX) {
+        let (key, value) = guard.into_inner()?;
+        let Some(queue) = closing_queue(&key) else {
+            continue;
+        };
+        let deadline = value
+            .first_chunk::<8>()
+            .map(|b| i64::from_be_bytes(*b))
+            .unwrap_or(0);
+        indexes.closing.insert(queue.to_string(), deadline);
+    }
+
     Ok(indexes)
 }
 
 fn resync(store: &Store, indexes: &mut Indexes) {
     match rebuild_indexes(store) {
-        Ok(mut fresh) => {
-            // `closing` is transient committer state, not derived from the DB;
-            // an in-progress delete must keep rejecting enqueues across a rebuild.
-            fresh.closing = std::mem::take(&mut indexes.closing);
-            *indexes = fresh;
-        }
+        Ok(fresh) => *indexes = fresh,
         Err(e) => error!(error = %e, "could not re-sync the in-memory indexes"),
     }
 }
@@ -502,6 +513,8 @@ enum Responder {
         oneshot::Sender<Result<Vec<DeadLetterRecord>, Status>>,
         Vec<DeadLetterRecord>,
     ),
+    CloseQueue(oneshot::Sender<Result<(), Status>>),
+    OpenQueue(oneshot::Sender<Result<(), Status>>),
     Requeue(
         oneshot::Sender<Result<RequeueOutcome, Status>>,
         RequeueOutcome,
@@ -540,6 +553,12 @@ impl Responder {
             }
             Responder::Drain(resp, payload) => {
                 let _ = resp.send(outcome.clone().map(|()| payload));
+            }
+            Responder::CloseQueue(resp) => {
+                let _ = resp.send(outcome.clone());
+            }
+            Responder::OpenQueue(resp) => {
+                let _ = resp.send(outcome.clone());
             }
             Responder::Requeue(resp, payload) => {
                 let _ = resp.send(outcome.clone().map(|()| payload));
@@ -659,6 +678,7 @@ fn next_deadline(indexes: &Indexes, retention_ms: u64) -> Option<i64> {
         indexes.scheduled.earliest(),
         indexes.leases.earliest(),
         indexes.dedup_timers.earliest(),
+        indexes.closing.values().min().copied(),
         dead_letter,
     ]
     .into_iter()
@@ -926,17 +946,13 @@ fn apply_command(
         Command::QueueDepths { queue, resp } => {
             let _ = resp.send(Ok(indexes.depth_counts(&queue)));
         }
-        // In-memory only (no DB write): arm/refresh or clear a queue's close
-        // tombstone. Answered inline; does not mark the cycle dirty.
         Command::CloseQueue { queue, resp } => {
-            indexes
-                .closing
-                .insert(queue, now_ms().saturating_add(CLOSE_GRACE_MS));
-            let _ = resp.send(Ok(()));
+            apply_close_queue(store, indexes, tx, cycle, queue);
+            responders.push(Responder::CloseQueue(resp));
         }
         Command::OpenQueue { queue, resp } => {
-            indexes.closing.remove(&queue);
-            let _ = resp.send(Ok(()));
+            apply_open_queue(store, indexes, tx, cycle, &queue);
+            responders.push(Responder::OpenQueue(resp));
         }
         Command::RequeueDeadLetters { queue, keys, resp } => {
             match apply_requeue_dead_letters(store, indexes, tx, cycle, &queue, keys) {
@@ -2016,6 +2032,38 @@ fn apply_delete_dead_letters(
     DeleteOutcome { deleted, missing }
 }
 
+fn apply_close_queue(
+    store: &Store,
+    indexes: &mut Indexes,
+    tx: &mut WriteTransaction<'_>,
+    cycle: &mut Cycle,
+    queue: String,
+) {
+    let deadline = now_ms().saturating_add(CLOSE_GRACE_MS);
+    tx.insert(
+        &store.meta,
+        closing_key(&queue),
+        deadline.to_be_bytes().to_vec(),
+    );
+    indexes.closing.insert(queue, deadline);
+    cycle.dirty = true;
+}
+
+fn apply_open_queue(
+    store: &Store,
+    indexes: &mut Indexes,
+    tx: &mut WriteTransaction<'_>,
+    cycle: &mut Cycle,
+    queue: &str,
+) {
+    // `closing` mirrors the meta rows exactly, so a missing entry means there
+    // is no row to delete.
+    if indexes.closing.remove(queue).is_some() {
+        tx.remove(&store.meta, closing_key(queue));
+        cycle.dirty = true;
+    }
+}
+
 fn apply_purge_queue_chunk(
     store: &Store,
     indexes: &mut Indexes,
@@ -2299,7 +2347,14 @@ fn apply_sweep(
     let mut processed = 0usize;
 
     // Drop close tombstones whose delete handler died without clearing them.
-    indexes.closing.retain(|_, deadline| *deadline > now);
+    indexes.closing.retain(|queue, deadline| {
+        if *deadline > now {
+            return true;
+        }
+        tx.remove(&store.meta, closing_key(queue));
+        cycle.dirty = true;
+        false
+    });
 
     // Each phase gets its own budget so a backlog of one timer kind cannot
     // starve another — most importantly, scheduled promotions must not crowd
@@ -2895,6 +2950,7 @@ impl Storage {
             dead_letter: db.keyspace("dead_letter", || {
                 hits().with_kv_separation(Some(KvSeparationOptions::default()))
             })?,
+            meta,
             db,
             params,
             boot_registry: registry.load_full(),
@@ -3074,8 +3130,8 @@ impl Storage {
             .await?
     }
 
-    // Tombstone a queue (refreshable) so enqueues to it are rejected with
-    // QueueClosing while an admin delete drains it; open_queue clears it.
+    // Durably tombstone a queue (refreshable) so enqueues to it are rejected
+    // with QueueClosing while an admin delete drains it; open_queue clears it.
     pub async fn close_queue(&self, queue: String) -> Result<(), Status> {
         self.send(|resp| Command::CloseQueue { queue, resp })
             .await?
@@ -3542,6 +3598,7 @@ mod tests {
             scheduled: db.keyspace("scheduled", opts).unwrap(),
             leases: db.keyspace("leases", opts).unwrap(),
             dead_letter: db.keyspace("dead_letter", opts).unwrap(),
+            meta: db.keyspace("meta", opts).unwrap(),
             db,
             params: StorageParams {
                 persist_mode: PersistMode::Buffer,
@@ -3660,15 +3717,64 @@ mod tests {
     fn sweep_drops_only_expired_close_tombstones() {
         let store = open_test_store();
         let mut indexes = Indexes::default();
-        indexes.closing.insert("abandoned".into(), now_ms() - 1);
-        indexes.closing.insert("active".into(), now_ms() + 60_000);
-
         let mut tx = store.db.write_tx();
         let mut cycle = Cycle::new(false);
+        apply_close_queue(&store, &mut indexes, &mut tx, &mut cycle, "active".into());
+        // An expired tombstone, as if its delete handler died a while ago.
+        indexes.closing.insert("abandoned".into(), now_ms() - 1);
+        tx.insert(
+            &store.meta,
+            closing_key("abandoned"),
+            (now_ms() - 1).to_be_bytes().to_vec(),
+        );
+
         apply_sweep(&store, &mut indexes, &mut tx, &mut cycle).expect("sweep applies");
 
         assert!(!indexes.closing.contains_key("abandoned"));
         assert!(indexes.closing.contains_key("active"));
+        let row = |queue| tx.get(&store.meta, closing_key(queue)).expect("meta reads");
+        assert!(row("abandoned").is_none(), "the expired row is deleted");
+        assert!(row("active").is_some(), "the live row survives");
+    }
+
+    #[test]
+    fn close_tombstone_survives_a_rebuild() {
+        let store = open_test_store();
+        let mut indexes = Indexes::default();
+        let mut tx = store.db.write_tx();
+        let mut cycle = Cycle::new(false);
+        apply_close_queue(&store, &mut indexes, &mut tx, &mut cycle, "q".into());
+        assert!(cycle.dirty, "a close writes its tombstone durably");
+        tx.commit().expect("commit");
+
+        // As after a mid-purge restart: the rebuilt indexes still reject.
+        let rebuilt = rebuild_indexes(&store).expect("rebuild");
+        assert_eq!(rebuilt.closing.get("q"), indexes.closing.get("q"));
+
+        let mut tx = store.db.write_tx();
+        let mut cycle = Cycle::new(false);
+        apply_open_queue(&store, &mut indexes, &mut tx, &mut cycle, "q");
+        assert!(cycle.dirty);
+        tx.commit().expect("commit");
+
+        let rebuilt = rebuild_indexes(&store).expect("rebuild");
+        assert!(rebuilt.closing.is_empty(), "open deletes the tombstone row");
+
+        let mut tx = store.db.write_tx();
+        let mut cycle = Cycle::new(false);
+        apply_open_queue(&store, &mut indexes, &mut tx, &mut cycle, "q");
+        assert!(
+            !cycle.dirty,
+            "opening a queue that isn't closing is a no-op"
+        );
+    }
+
+    #[test]
+    fn next_deadline_considers_close_tombstones() {
+        let mut indexes = Indexes::default();
+        assert_eq!(next_deadline(&indexes, 0), None);
+        indexes.closing.insert("q".into(), 1234);
+        assert_eq!(next_deadline(&indexes, 0), Some(1234));
     }
 
     #[test]
