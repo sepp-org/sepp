@@ -61,6 +61,9 @@ struct Store {
     dead_letter: TxKeyspace,
     meta: TxKeyspace,
     params: StorageParams,
+    // Live (hot-reloadable) registry. The committer pins one snapshot per
+    // cycle in run_rpc_cycle and passes it into apply; never load this inside
+    // an apply_* function!!! The cycle is the reload boundary.
     registry: SharedRegistry,
     // Boot snapshot of the registry. dedup_window_ms is read from here instead
     // of the live (hot-reloadable) registry: dedup timer deadlines are fixed at
@@ -720,10 +723,11 @@ fn run_rpc_cycle(
     let mut cycle = Cycle::new(store.metrics.is_enabled() || store.params.admin_enabled);
     let mut responders: Vec<PendingReply> = Vec::with_capacity(rpcs.len());
 
-    // One clock read per cycle, stamped into every op right before apply, so
-    // stamp order can't invert against apply order and channel backlog can't
-    // shorten leases. Under a future replicated log this is proposal time.
+    // One clock read and one registry snapshot per cycle: every op applies
+    // under the same stamp and the same pinned config, making the cycle the
+    // reload boundary.
     let now = now_ms();
+    let registry = store.registry.load();
     let mut rpcs = rpcs.into_iter();
     let fatal = rpcs.by_ref().find_map(|cmd| {
         apply_command(
@@ -733,6 +737,7 @@ fn run_rpc_cycle(
             &mut cycle,
             cmd,
             now,
+            registry.as_ref(),
             &mut responders,
         )
         .err()
@@ -787,6 +792,7 @@ fn run_rpc_cycle(
 // Applies one command to the cycle's shared transaction, answering business
 // rejections immediately. Returns Err only for storage-level failures, which
 // poison the whole cycle (see run_rpc_cycle).
+#[allow(clippy::too_many_arguments)]
 fn apply_command(
     store: &Store,
     indexes: &mut Indexes,
@@ -794,12 +800,13 @@ fn apply_command(
     cycle: &mut Cycle,
     cmd: Command,
     now: i64,
+    registry: &QueueRegistry,
     responders: &mut Vec<PendingReply>,
 ) -> Result<(), Status> {
     match cmd {
         Command::Op { mut op, resp } => {
             op.stamp(now);
-            match apply_op(store, indexes, tx, cycle, op) {
+            match apply_op(store, indexes, tx, cycle, op, registry) {
                 Ok(outcome) => responders.push(PendingReply { resp, outcome }),
                 Err(e) => return reject(resp, e),
             }
@@ -830,13 +837,14 @@ fn apply_op(
     tx: &mut WriteTransaction<'_>,
     cycle: &mut Cycle,
     op: Op,
+    registry: &QueueRegistry,
 ) -> Result<OpOutcome, Status> {
     Ok(match op {
-        Op::Enqueue { jobs, now_ms } => {
-            OpOutcome::Enqueue(apply_enqueue(store, indexes, tx, cycle, jobs, now_ms)?)
-        }
+        Op::Enqueue { jobs, now_ms } => OpOutcome::Enqueue(apply_enqueue(
+            store, indexes, tx, cycle, jobs, now_ms, registry,
+        )?),
         Op::EnqueueAtomic { jobs, now_ms } => OpOutcome::EnqueueAtomic(apply_enqueue_atomic(
-            store, indexes, tx, cycle, jobs, now_ms,
+            store, indexes, tx, cycle, jobs, now_ms, registry,
         )?),
         Op::Reserve {
             queues,
@@ -849,12 +857,12 @@ fn apply_op(
         Op::Ack { job_id, attempt } => {
             OpOutcome::Ack(apply_ack(store, indexes, tx, cycle, &job_id, attempt)?)
         }
-        Op::Nack { req, now_ms } => {
-            OpOutcome::Nack(apply_nack(store, indexes, tx, cycle, req, now_ms)?)
-        }
-        Op::Extend { req, now_ms } => {
-            OpOutcome::Extend(apply_extend(store, indexes, tx, cycle, req, now_ms)?)
-        }
+        Op::Nack { req, now_ms } => OpOutcome::Nack(apply_nack(
+            store, indexes, tx, cycle, req, now_ms, registry,
+        )?),
+        Op::Extend { req, now_ms } => OpOutcome::Extend(apply_extend(
+            store, indexes, tx, cycle, req, now_ms, registry,
+        )?),
         Op::DrainDeadLetters { queue, max } => {
             OpOutcome::DrainDeadLetters(apply_drain(store, indexes, tx, cycle, queue, max)?)
         }
@@ -1052,8 +1060,8 @@ fn apply_enqueue(
     cycle: &mut Cycle,
     jobs: Vec<PreparedJob>,
     now: i64,
+    registry: &QueueRegistry,
 ) -> Result<Vec<EnqueueResult>, Status> {
-    let registry = store.registry.load();
     let mut results = Vec::with_capacity(jobs.len());
 
     for job in jobs {
@@ -1110,9 +1118,8 @@ fn apply_enqueue_atomic(
     cycle: &mut Cycle,
     jobs: Vec<PreparedJob>,
     now: i64,
+    registry: &QueueRegistry,
 ) -> Result<AtomicEnqueueOutcome, Status> {
-    let registry = store.registry.load();
-
     // Atomic = all-or-nothing: if any job targets a queue being deleted, reject
     // the whole batch (mirrors the per-job QueueClosing in best-effort enqueue).
     let closing: Vec<(u32, JobRejection)> = jobs
@@ -2044,6 +2051,7 @@ fn apply_nack(
     cycle: &mut Cycle,
     req: NackRequest,
     now: i64,
+    registry: &QueueRegistry,
 ) -> Result<NackOutcome, Status> {
     let stored = tx
         .get(&store.inflight, req.job_id.as_bytes())
@@ -2064,11 +2072,7 @@ fn apply_nack(
     let force_dead_letter = matches!(strategy, Some(nack_retry::Strategy::DeadLetter(_)));
     let retry_delay_ms = match strategy {
         Some(nack_retry::Strategy::Delay(delay)) => {
-            let max = store
-                .registry
-                .load()
-                .effective(&inflight.queue)
-                .max_schedule_horizon_ms;
+            let max = registry.effective(&inflight.queue).max_schedule_horizon_ms;
             duration_to_millis(delay).min(max)
         }
         _ => 0,
@@ -2158,6 +2162,7 @@ fn apply_extend(
     cycle: &mut Cycle,
     req: ExtendRequest,
     now: i64,
+    registry: &QueueRegistry,
 ) -> Result<ExtendOutcome, Status> {
     let stored = tx
         .get(&store.inflight, req.job_id.as_bytes())
@@ -2169,11 +2174,7 @@ fn apply_extend(
         return Err(Status::failed_precondition("attempt mismatch"));
     }
 
-    let max_lease = store
-        .registry
-        .load()
-        .effective(&inflight.queue)
-        .max_lease_duration_ms;
+    let max_lease = registry.effective(&inflight.queue).max_lease_duration_ms;
     let old_timer = TimerKey {
         deadline: inflight.lease_expires_at,
         job_id: &req.job_id,
@@ -3587,6 +3588,7 @@ mod tests {
             &mut cycle,
             vec![test_job("q"), test_job("other")],
             now_ms(),
+            store.registry.load().as_ref(),
         )
         .expect("enqueue applies");
 
@@ -3607,6 +3609,7 @@ mod tests {
             &mut cycle,
             vec![test_job("q")],
             now_ms(),
+            store.registry.load().as_ref(),
         )
         .expect("enqueue applies");
         assert!(results[0].is_ok());
@@ -3627,6 +3630,7 @@ mod tests {
             &mut cycle,
             vec![test_job("other"), test_job("q")],
             now_ms(),
+            store.registry.load().as_ref(),
         )
         .expect("atomic enqueue applies");
 
@@ -3735,9 +3739,8 @@ mod tests {
         // An hour-long hot-reloaded window must not stretch the boot window.
         let mut live_cfg = Config::default();
         live_cfg.storage.dedup_window_ms = 3_600_000;
-        store
-            .registry
-            .store(Arc::new(QueueRegistry::from_config(&live_cfg)));
+        crate::queues::publish(&store.registry, QueueRegistry::from_config(&live_cfg));
+        let registry = store.registry.load();
 
         let mut indexes = Indexes::default();
         let mut tx = store.db.write_tx();
@@ -3753,6 +3756,7 @@ mod tests {
             &mut cycle,
             vec![PreparedJob::new(req.clone())],
             now_ms(),
+            registry.as_ref(),
         )
         .expect("enqueue applies")
         .remove(0)
@@ -3768,6 +3772,7 @@ mod tests {
             &mut cycle,
             vec![PreparedJob::new(req)],
             now_ms(),
+            registry.as_ref(),
         )
         .expect("enqueue applies")
         .remove(0)
