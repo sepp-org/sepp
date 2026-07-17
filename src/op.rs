@@ -40,6 +40,7 @@ pub enum Op {
     DrainDeadLetters {
         queue: Option<String>,
         max: usize,
+        scan_cap: usize,
     },
     CloseQueue {
         queue: String,
@@ -68,6 +69,11 @@ pub enum Op {
         queue: String,
         max: usize,
     },
+    Sweep {
+        now_ms: i64,
+        budget: usize,
+        retention_cutoff_ms: Option<i64>,
+    },
 }
 
 impl Op {
@@ -84,7 +90,8 @@ impl Op {
             | Op::Extend { now_ms, .. }
             | Op::CloseQueue { now_ms, .. }
             | Op::RequeueDeadLetters { now_ms, .. }
-            | Op::DeadLetterJobs { now_ms, .. } => *now_ms = now,
+            | Op::DeadLetterJobs { now_ms, .. }
+            | Op::Sweep { now_ms, .. } => *now_ms = now,
             Op::Ack { .. }
             | Op::DrainDeadLetters { .. }
             | Op::OpenQueue { .. }
@@ -183,9 +190,14 @@ impl Op {
                 request: Some(req.clone()),
                 now_ms: *now_ms,
             }),
-            Op::DrainDeadLetters { queue, max } => P::DrainDeadLetters(proto::DrainDeadLettersOp {
+            Op::DrainDeadLetters {
+                queue,
+                max,
+                scan_cap,
+            } => P::DrainDeadLetters(proto::DrainDeadLettersOp {
                 queue: queue.clone(),
                 max: *max as u32,
+                scan_cap: *scan_cap as u32,
             }),
             Op::CloseQueue { queue, now_ms } => P::CloseQueue(proto::CloseQueueOp {
                 queue: queue.clone(),
@@ -225,6 +237,15 @@ impl Op {
             Op::PurgeQueueChunk { queue, max } => P::PurgeQueueChunk(proto::PurgeQueueChunkOp {
                 queue: queue.clone(),
                 max: *max as u32,
+            }),
+            Op::Sweep {
+                now_ms,
+                budget,
+                retention_cutoff_ms,
+            } => P::Sweep(proto::SweepOp {
+                now_ms: *now_ms,
+                budget: *budget as u32,
+                retention_cutoff_ms: *retention_cutoff_ms,
             }),
         };
 
@@ -269,6 +290,7 @@ impl Op {
             P::DrainDeadLetters(o) => Op::DrainDeadLetters {
                 queue: o.queue,
                 max: o.max as usize,
+                scan_cap: o.scan_cap as usize,
             },
             P::CloseQueue(o) => Op::CloseQueue {
                 queue: o.queue,
@@ -294,6 +316,11 @@ impl Op {
             P::PurgeQueueChunk(o) => Op::PurgeQueueChunk {
                 queue: o.queue,
                 max: o.max as usize,
+            },
+            P::Sweep(o) => Op::Sweep {
+                now_ms: o.now_ms,
+                budget: o.budget as usize,
+                retention_cutoff_ms: o.retention_cutoff_ms,
             },
         })
     }
@@ -398,6 +425,7 @@ mod tests {
             Op::DrainDeadLetters {
                 queue: Some("orders".into()),
                 max: 10,
+                scan_cap: 500,
             },
             Op::CloseQueue {
                 queue: "orders".into(),
@@ -425,6 +453,11 @@ mod tests {
             Op::PurgeQueueChunk {
                 queue: "orders".into(),
                 max: 1000,
+            },
+            Op::Sweep {
+                now_ms: NOW,
+                budget: 1000,
+                retention_cutoff_ms: Some(NOW - 86_400_000),
             },
         ]
     }
@@ -461,13 +494,14 @@ mod tests {
             "22090a056a6f622d311002",
             "2a230a1a0a056a6f622d3110021a04626f6f6d2204120208052a03772d311080d095ffbc31",
             "321b0a120a056a6f622d3110021a02081e2203772d311080d095ffbc31",
-            "3a0a0a066f7264657273100a",
+            "3a0d0a066f7264657273100a18f403",
             "420f0a066f72646572731080d095ffbc31",
             "4a080a066f7264657273",
             "52170a066f726465727312026b3112026b321880d095ffbc31",
             "5a1d0a066f726465727310031a026b3122066d616e75616c2880d095ffbc31",
             "620c0a066f726465727312026b31",
             "6a0b0a066f726465727310e807",
+            "72110880d095ffbc3110e807188098fcd5bc31",
         ];
 
         let ops = sample_ops();

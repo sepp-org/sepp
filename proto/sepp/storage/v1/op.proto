@@ -58,6 +58,7 @@ message ExtendOp {
 message DrainDeadLettersOp {
   optional string queue = 1;
   uint32 max = 2;
+  uint32 scan_cap = 3;
 }
 
 message CloseQueueOp {
@@ -102,6 +103,15 @@ message PurgeQueueChunkOp {
   uint32 max = 2;
 }
 
+message SweepOp {
+  int64 now_ms = 1;
+  uint32 budget = 2;
+
+  // Dead letters that failed at or before this are deleted. Unset when
+  // retention is disabled.
+  optional int64 retention_cutoff_ms = 3;
+}
+
 // One mutating committer operation. Exactly one field is set.
 message Op {
   oneof op {
@@ -118,5 +128,6 @@ message Op {
     DeadLetterJobsOp dead_letter_jobs = 11;
     DeleteDeadLettersOp delete_dead_letters = 12;
     PurgeQueueChunkOp purge_queue_chunk = 13;
+    SweepOp sweep = 14;
   }
 }

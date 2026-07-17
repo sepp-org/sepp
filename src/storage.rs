@@ -454,6 +454,7 @@ enum OpOutcome {
     DeadLetterJobs(DeadLetterJobsOutcome),
     DeleteDeadLetters(DeleteOutcome),
     PurgeQueueChunk(PurgeOutcome),
+    Sweep(usize),
 }
 
 // An applied op's outcome parked until the cycle's commit decides whether the
@@ -863,9 +864,13 @@ fn apply_op(
         Op::Extend { req, now_ms } => OpOutcome::Extend(apply_extend(
             store, indexes, tx, cycle, req, now_ms, registry,
         )?),
-        Op::DrainDeadLetters { queue, max } => {
-            OpOutcome::DrainDeadLetters(apply_drain(store, indexes, tx, cycle, queue, max)?)
-        }
+        Op::DrainDeadLetters {
+            queue,
+            max,
+            scan_cap,
+        } => OpOutcome::DrainDeadLetters(apply_drain(
+            store, indexes, tx, cycle, queue, max, scan_cap,
+        )?),
         Op::CloseQueue { queue, now_ms } => {
             apply_close_queue(store, indexes, tx, cycle, queue, now_ms);
             OpOutcome::CloseQueue
@@ -895,6 +900,19 @@ fn apply_op(
         ),
         Op::PurgeQueueChunk { queue, max } => OpOutcome::PurgeQueueChunk(apply_purge_queue_chunk(
             store, indexes, tx, cycle, &queue, max,
+        )?),
+        Op::Sweep {
+            now_ms,
+            budget,
+            retention_cutoff_ms,
+        } => OpOutcome::Sweep(apply_sweep(
+            store,
+            indexes,
+            tx,
+            cycle,
+            now_ms,
+            budget,
+            retention_cutoff_ms,
         )?),
     })
 }
@@ -934,8 +952,18 @@ fn run_sweep_cycle(
     let mut tx = store.db.write_tx();
     let mut cycle = Cycle::new(store.metrics.is_enabled() || store.params.admin_enabled);
 
-    let processed = match apply_sweep(store, indexes, &mut tx, &mut cycle, now_ms()) {
-        Ok(processed) => processed,
+    let now = now_ms();
+    let retention_ms = store.params.dead_letter_retention_ms;
+    let op = Op::Sweep {
+        now_ms: now,
+        budget: store.params.sweep_limit,
+        retention_cutoff_ms: (retention_ms > 0)
+            .then(|| now.saturating_sub(i64::try_from(retention_ms).unwrap_or(i64::MAX))),
+    };
+    let registry = store.registry.load();
+    let processed = match apply_op(store, indexes, &mut tx, &mut cycle, op, registry.as_ref()) {
+        Ok(OpOutcome::Sweep(processed)) => processed,
+        Ok(_) => 0,
         Err(e) => {
             warn!(error = %e, "timer sweep aborted");
             resync(store, indexes);
@@ -1520,6 +1548,9 @@ fn maybe_store_dead_letter(
     job_id: &[u8],
     meta: DeadLetterMeta,
 ) -> Result<(), Status> {
+    // Deliberately boot config rather than an op scalar: whether the DLQ
+    // exists at all is a cluster invariant, like the boot_registry dedup
+    // windows.
     if store.params.dead_letter_retention_ms == 0 {
         return Ok(());
     }
@@ -1549,6 +1580,7 @@ fn maybe_store_dead_letter(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_drain(
     store: &Store,
     indexes: &mut Indexes,
@@ -1556,10 +1588,11 @@ fn apply_drain(
     cycle: &mut Cycle,
     queue: Option<String>,
     max: usize,
+    scan_cap: usize,
 ) -> Result<Vec<DeadLetterRecord>, Status> {
     let mut chosen: Vec<Vec<u8>> = Vec::new();
     for (examined, (key, q)) in indexes.dead_letter.iter_oldest().enumerate() {
-        if chosen.len() >= max || examined >= store.params.sweep_limit {
+        if chosen.len() >= max || examined >= scan_cap {
             break;
         }
 
@@ -2223,6 +2256,8 @@ fn apply_sweep(
     tx: &mut WriteTransaction<'_>,
     cycle: &mut Cycle,
     now: i64,
+    budget: usize,
+    retention_cutoff_ms: Option<i64>,
 ) -> Result<usize, Status> {
     let mut processed = 0usize;
 
@@ -2239,13 +2274,13 @@ fn apply_sweep(
     // Each phase gets its own budget so a backlog of one timer kind cannot
     // starve another — most importantly, scheduled promotions must not crowd
     // out lease-expiry redelivery.
-    let mut budget = store.params.sweep_limit;
-    while budget > 0 {
+    let mut remaining = budget;
+    while remaining > 0 {
         let Some((timer_k, _)) = indexes.scheduled.pop_due(now) else {
             break;
         };
 
-        budget -= 1;
+        remaining -= 1;
         processed += 1;
         let attempt_hint = tx
             .get(&store.scheduled, &timer_k)
@@ -2313,13 +2348,13 @@ fn apply_sweep(
         cycle.new_ready.insert(queue);
     }
 
-    let mut budget = store.params.sweep_limit;
-    while budget > 0 {
+    let mut remaining = budget;
+    while remaining > 0 {
         let Some((timer_k, _)) = indexes.leases.pop_due(now) else {
             break;
         };
 
-        budget -= 1;
+        remaining -= 1;
         processed += 1;
         tx.remove(&store.leases, timer_k.clone());
         cycle.dirty = true;
@@ -2420,13 +2455,13 @@ fn apply_sweep(
         }
     }
 
-    let mut budget = store.params.sweep_limit;
-    while budget > 0 {
+    let mut remaining = budget;
+    while remaining > 0 {
         let Some((timer_k, queue)) = indexes.dedup_timers.pop_due(now) else {
             break;
         };
 
-        budget -= 1;
+        remaining -= 1;
         processed += 1;
         if let Some(dedup_k) = DedupTimerKey::dedup_key(&timer_k) {
             let record_deadline = tx
@@ -2443,18 +2478,15 @@ fn apply_sweep(
         cycle.dirty = true;
     }
 
-    if store.params.dead_letter_retention_ms > 0 {
-        let cutoff = now.saturating_sub(
-            i64::try_from(store.params.dead_letter_retention_ms).unwrap_or(i64::MAX),
-        );
-        let mut budget = store.params.sweep_limit;
+    if let Some(cutoff) = retention_cutoff_ms {
+        let mut remaining = budget;
         let mut expired = 0u64;
 
-        while budget > 0 {
+        while remaining > 0 {
             let Some((key, _queue)) = indexes.dead_letter.pop_due(cutoff) else {
                 break;
             };
-            budget -= 1;
+            remaining -= 1;
             processed += 1;
             expired += 1;
             tx.remove(&store.dead_letter, key);
@@ -2733,6 +2765,7 @@ pub struct Storage {
     notifiers: QueueNotifiers,
     read: ReadHandle,
     admin_stats: Arc<ArcSwap<AdminSnapshot>>,
+    drain_scan_cap: usize,
 }
 
 impl Storage {
@@ -2903,6 +2936,7 @@ impl Storage {
             notifiers,
             read,
             admin_stats,
+            drain_scan_cap: config.storage.sweep_limit,
         })
     }
 
@@ -3011,7 +3045,12 @@ impl Storage {
         queue: Option<String>,
         max: usize,
     ) -> Result<Vec<DeadLetterRecord>, Status> {
-        match self.send_op(Op::DrainDeadLetters { queue, max }).await? {
+        let op = Op::DrainDeadLetters {
+            queue,
+            max,
+            scan_cap: self.drain_scan_cap,
+        };
+        match self.send_op(op).await? {
             OpOutcome::DrainDeadLetters(records) => Ok(records),
             _ => Err(Self::mismatched_outcome()),
         }
@@ -3674,13 +3713,54 @@ mod tests {
             (now_ms() - 1).to_be_bytes().to_vec(),
         );
 
-        apply_sweep(&store, &mut indexes, &mut tx, &mut cycle, now_ms()).expect("sweep applies");
+        apply_sweep(
+            &store,
+            &mut indexes,
+            &mut tx,
+            &mut cycle,
+            now_ms(),
+            1000,
+            None,
+        )
+        .expect("sweep applies");
 
         assert!(!indexes.closing.contains_key("abandoned"));
         assert!(indexes.closing.contains_key("active"));
         let row = |queue| tx.get(&store.meta, closing_key(queue)).expect("meta reads");
         assert!(row("abandoned").is_none(), "the expired row is deleted");
         assert!(row("active").is_some(), "the live row survives");
+    }
+
+    #[test]
+    fn sweep_reads_the_retention_cutoff_from_the_op() {
+        // The test store has dead_letter_retention_ms = 0; a cutoff riding in
+        // the op must still expire dead letters, because a future follower
+        // applies with the leader's scalars, not its own config.
+        let store = open_test_store();
+        let mut indexes = Indexes::default();
+        let key = dead_letter_key(100, "q", b"j1");
+        indexes.dead_letter.insert(key.clone(), "q");
+
+        let mut tx = store.db.write_tx();
+        tx.insert(&store.dead_letter, key.clone(), Vec::new());
+        let mut cycle = Cycle::new(false);
+        let processed = apply_sweep(
+            &store,
+            &mut indexes,
+            &mut tx,
+            &mut cycle,
+            1_000,
+            1000,
+            Some(200),
+        )
+        .expect("sweep applies");
+
+        assert_eq!(processed, 1);
+        assert!(indexes.dead_letter.keys.is_empty());
+        assert!(
+            tx.get(&store.dead_letter, &key).expect("reads").is_none(),
+            "the expired dead letter is deleted"
+        );
     }
 
     #[test]
