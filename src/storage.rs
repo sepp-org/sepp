@@ -318,11 +318,13 @@ fn resync(store: &Store, indexes: &mut Indexes) {
     }
 }
 
+#[derive(Debug)]
 pub struct AckOutcome {
     pub queue: String,
     pub trace_context: Option<TraceContext>,
 }
 
+#[derive(Debug)]
 pub struct NackOutcome {
     pub queue: String,
     pub dead_lettered: bool,
@@ -330,6 +332,7 @@ pub struct NackOutcome {
     pub trace_context: Option<TraceContext>,
 }
 
+#[derive(Debug)]
 pub struct ExtendOutcome {
     pub queue: String,
     pub lease_expires_at: i64,
@@ -356,6 +359,7 @@ pub struct RequeueOutcome {
     pub missing: u64,
 }
 
+#[derive(Debug)]
 pub struct DeadLetterJobsOutcome {
     pub dead_lettered: u64,
     pub missing: u64,
@@ -415,6 +419,7 @@ pub type EnqueueResult = Result<EnqueueResponse, JobRejection>;
 
 // Outcome of an atomic enqueue: every job committed, or none were and the
 // offending jobs are reported by position in the submitted batch.
+#[derive(Debug)]
 pub enum AtomicEnqueueOutcome {
     Committed(Vec<EnqueueResponse>),
     Rejected(Vec<(u32, JobRejection)>),
@@ -440,6 +445,7 @@ enum Command {
     },
 }
 
+#[derive(Debug)]
 enum OpOutcome {
     Enqueue(Vec<EnqueueResult>),
     EnqueueAtomic(AtomicEnqueueOutcome),
@@ -3152,6 +3158,9 @@ impl Storage {
         }
     }
 }
+
+#[cfg(test)]
+mod replay_tests;
 
 #[cfg(test)]
 mod tests {
