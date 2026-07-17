@@ -13,8 +13,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let file_descriptors = protox::compile(protos, includes)?;
 
     tonic_prost_build::configure()
-        .build_client(true) // For the smoke test.
+        .build_client(true) // For the integration tests.
         .build_server(true)
+        .btree_map(".") // For deterministic encoding of all maps.
         .compile_fds(file_descriptors)?;
 
     Ok(())

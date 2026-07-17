@@ -524,6 +524,34 @@ mod tests {
     }
 
     #[test]
+    fn job_value_custom_map_encodes_canonically() {
+        // Guards the btree_map setting in build.rs: the same logical job must
+        // persist as the same bytes regardless of custom-map insertion order.
+        use crate::pb::sepp::v1::{PrimitiveValue, primitive_value::Value};
+
+        let entries: Vec<_> = (b'a'..=b'h')
+            .map(|k| {
+                let value = Some(Value::IntValue(k as i64));
+                ((k as char).to_string(), PrimitiveValue { value })
+            })
+            .collect();
+
+        let mut forward = sample_job("job-42");
+        forward.custom.extend(entries.iter().cloned());
+        let mut reverse = sample_job("job-42");
+        reverse.custom.extend(entries.iter().rev().cloned());
+
+        let encode = |job: &Job| {
+            JobValue {
+                queue: "orders",
+                job,
+            }
+            .encode()
+        };
+        assert_eq!(encode(&forward), encode(&reverse));
+    }
+
+    #[test]
     fn job_value_decode_rejects_corrupt_input() {
         assert!(JobValue::decode(&[]).is_err());
         assert!(JobValue::decode(&[0]).is_err());

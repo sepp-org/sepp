@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -385,7 +385,7 @@ pub(super) async fn delete_queue(
 // ---------------------------------------------------------------------------
 // Jobs
 
-fn custom_json(custom: &HashMap<String, PrimitiveValue>) -> Value {
+fn custom_json(custom: &BTreeMap<String, PrimitiveValue>) -> Value {
     use pb::primitive_value::Value as Pv;
     let map: serde_json::Map<String, Value> = custom
         .iter()
@@ -603,7 +603,7 @@ pub struct EnqueueBody {
 
 fn custom_from_json(
     custom: serde_json::Map<String, Value>,
-) -> Result<HashMap<String, PrimitiveValue>, ApiError> {
+) -> Result<BTreeMap<String, PrimitiveValue>, ApiError> {
     use pb::primitive_value::Value as Pv;
     custom
         .into_iter()

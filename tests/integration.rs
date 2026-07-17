@@ -9,7 +9,7 @@
 mod helpers;
 use helpers::*;
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::process::Child;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -959,7 +959,7 @@ async fn batch_reserve_returns_up_to_max_jobs() {
 async fn payload_and_custom_fields_roundtrip() {
     let (_guard, client) = start_server("custom").await;
 
-    let mut custom = HashMap::new();
+    let mut custom = BTreeMap::new();
     custom.insert("region".to_string(), prim_str("eu-west"));
     custom.insert("retries".to_string(), prim_int(7));
 
@@ -2454,7 +2454,7 @@ max_schedule_horizon_ms = 1000
     assert!(matches!(r, Reason::IdempotencyKeyTooLong(k) if k.limit == 8));
 
     // Too many custom entries (checked before any per-entry rule).
-    let mut many = HashMap::new();
+    let mut many = BTreeMap::new();
     many.insert("a".to_string(), prim_int(1));
     many.insert("b".to_string(), prim_int(2));
     many.insert("c".to_string(), prim_int(3));
@@ -2471,7 +2471,7 @@ max_schedule_horizon_ms = 1000
     assert!(matches!(r, Reason::CustomEntriesTooMany(c) if c.limit == 2 && c.actual == 3));
 
     // A single custom key longer than max_custom_key_bytes.
-    let mut long_key = HashMap::new();
+    let mut long_key = BTreeMap::new();
     long_key.insert("longkey".to_string(), prim_int(1));
     match rejection_reason(
         enqueue_one(
@@ -2492,7 +2492,7 @@ max_schedule_horizon_ms = 1000
     }
 
     // Aggregate custom bytes over the cap (key within limits; the value tips it).
-    let mut big = HashMap::new();
+    let mut big = BTreeMap::new();
     big.insert("k".to_string(), prim_str("0123456789abcdefghij")); // 1 + 20 = 21 bytes
     match rejection_reason(
         enqueue_one(
