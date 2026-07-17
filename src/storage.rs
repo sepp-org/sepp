@@ -720,9 +720,22 @@ fn run_rpc_cycle(
     let mut cycle = Cycle::new(store.metrics.is_enabled() || store.params.admin_enabled);
     let mut responders: Vec<PendingReply> = Vec::with_capacity(rpcs.len());
 
+    // One clock read per cycle, stamped into every op right before apply, so
+    // stamp order can't invert against apply order and channel backlog can't
+    // shorten leases. Under a future replicated log this is proposal time.
+    let now = now_ms();
     let mut rpcs = rpcs.into_iter();
     let fatal = rpcs.by_ref().find_map(|cmd| {
-        apply_command(store, indexes, &mut tx, &mut cycle, cmd, &mut responders).err()
+        apply_command(
+            store,
+            indexes,
+            &mut tx,
+            &mut cycle,
+            cmd,
+            now,
+            &mut responders,
+        )
+        .err()
     });
 
     // A storage-level failure can leave the shared transaction holding partial
@@ -780,13 +793,17 @@ fn apply_command(
     tx: &mut WriteTransaction<'_>,
     cycle: &mut Cycle,
     cmd: Command,
+    now: i64,
     responders: &mut Vec<PendingReply>,
 ) -> Result<(), Status> {
     match cmd {
-        Command::Op { op, resp } => match apply_op(store, indexes, tx, cycle, op) {
-            Ok(outcome) => responders.push(PendingReply { resp, outcome }),
-            Err(e) => return reject(resp, e),
-        },
+        Command::Op { mut op, resp } => {
+            op.stamp(now);
+            match apply_op(store, indexes, tx, cycle, op) {
+                Ok(outcome) => responders.push(PendingReply { resp, outcome }),
+                Err(e) => return reject(resp, e),
+            }
+        }
         // Read-only against the in-memory indexes: answered inline so it
         // neither waits on the cycle's commit nor marks it dirty.
         Command::PeekKeys {
@@ -815,43 +832,55 @@ fn apply_op(
     op: Op,
 ) -> Result<OpOutcome, Status> {
     Ok(match op {
-        Op::Enqueue { jobs } => OpOutcome::Enqueue(apply_enqueue(store, indexes, tx, cycle, jobs)?),
-        Op::EnqueueAtomic { jobs } => {
-            OpOutcome::EnqueueAtomic(apply_enqueue_atomic(store, indexes, tx, cycle, jobs)?)
+        Op::Enqueue { jobs, now_ms } => {
+            OpOutcome::Enqueue(apply_enqueue(store, indexes, tx, cycle, jobs, now_ms)?)
         }
+        Op::EnqueueAtomic { jobs, now_ms } => OpOutcome::EnqueueAtomic(apply_enqueue_atomic(
+            store, indexes, tx, cycle, jobs, now_ms,
+        )?),
         Op::Reserve {
             queues,
             lease_ms,
             max_jobs,
+            now_ms,
         } => OpOutcome::Reserve(apply_reserve(
-            store, indexes, tx, cycle, &queues, lease_ms, max_jobs,
+            store, indexes, tx, cycle, &queues, lease_ms, max_jobs, now_ms,
         )?),
         Op::Ack { job_id, attempt } => {
             OpOutcome::Ack(apply_ack(store, indexes, tx, cycle, &job_id, attempt)?)
         }
-        Op::Nack { req } => OpOutcome::Nack(apply_nack(store, indexes, tx, cycle, req)?),
-        Op::Extend { req } => OpOutcome::Extend(apply_extend(store, indexes, tx, cycle, req)?),
+        Op::Nack { req, now_ms } => {
+            OpOutcome::Nack(apply_nack(store, indexes, tx, cycle, req, now_ms)?)
+        }
+        Op::Extend { req, now_ms } => {
+            OpOutcome::Extend(apply_extend(store, indexes, tx, cycle, req, now_ms)?)
+        }
         Op::DrainDeadLetters { queue, max } => {
             OpOutcome::DrainDeadLetters(apply_drain(store, indexes, tx, cycle, queue, max)?)
         }
-        Op::CloseQueue { queue } => {
-            apply_close_queue(store, indexes, tx, cycle, queue);
+        Op::CloseQueue { queue, now_ms } => {
+            apply_close_queue(store, indexes, tx, cycle, queue, now_ms);
             OpOutcome::CloseQueue
         }
         Op::OpenQueue { queue } => {
             apply_open_queue(store, indexes, tx, cycle, &queue);
             OpOutcome::OpenQueue
         }
-        Op::RequeueDeadLetters { queue, keys } => OpOutcome::RequeueDeadLetters(
-            apply_requeue_dead_letters(store, indexes, tx, cycle, &queue, keys)?,
-        ),
+        Op::RequeueDeadLetters {
+            queue,
+            keys,
+            now_ms,
+        } => OpOutcome::RequeueDeadLetters(apply_requeue_dead_letters(
+            store, indexes, tx, cycle, &queue, keys, now_ms,
+        )?),
         Op::DeadLetterJobs {
             queue,
             state,
             keys,
             reason,
+            now_ms,
         } => OpOutcome::DeadLetterJobs(apply_dead_letter_jobs(
-            store, indexes, tx, cycle, &queue, state, keys, reason,
+            store, indexes, tx, cycle, &queue, state, keys, reason, now_ms,
         )?),
         Op::DeleteDeadLetters { queue, keys } => OpOutcome::DeleteDeadLetters(
             apply_delete_dead_letters(store, indexes, tx, cycle, &queue, keys),
@@ -897,7 +926,7 @@ fn run_sweep_cycle(
     let mut tx = store.db.write_tx();
     let mut cycle = Cycle::new(store.metrics.is_enabled() || store.params.admin_enabled);
 
-    let processed = match apply_sweep(store, indexes, &mut tx, &mut cycle) {
+    let processed = match apply_sweep(store, indexes, &mut tx, &mut cycle, now_ms()) {
         Ok(processed) => processed,
         Err(e) => {
             warn!(error = %e, "timer sweep aborted");
@@ -1022,8 +1051,8 @@ fn apply_enqueue(
     tx: &mut WriteTransaction<'_>,
     cycle: &mut Cycle,
     jobs: Vec<PreparedJob>,
+    now: i64,
 ) -> Result<Vec<EnqueueResult>, Status> {
-    let now = now_ms();
     let registry = store.registry.load();
     let mut results = Vec::with_capacity(jobs.len());
 
@@ -1080,8 +1109,8 @@ fn apply_enqueue_atomic(
     tx: &mut WriteTransaction<'_>,
     cycle: &mut Cycle,
     jobs: Vec<PreparedJob>,
+    now: i64,
 ) -> Result<AtomicEnqueueOutcome, Status> {
-    let now = now_ms();
     let registry = store.registry.load();
 
     // Atomic = all-or-nothing: if any job targets a queue being deleted, reject
@@ -1267,6 +1296,7 @@ fn insert_job(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_reserve(
     store: &Store,
     indexes: &mut Indexes,
@@ -1275,8 +1305,8 @@ fn apply_reserve(
     queues: &[String],
     lease_ms: u64,
     max_jobs: usize,
+    now: i64,
 ) -> Result<Vec<Job>, Status> {
-    let now = now_ms();
     let lease_expires_at = now.saturating_add(i64::try_from(lease_ms).unwrap_or(i64::MAX));
     let mut jobs = Vec::new();
 
@@ -1646,8 +1676,8 @@ fn apply_requeue_dead_letters(
     cycle: &mut Cycle,
     queue: &str,
     keys: Vec<Vec<u8>>,
+    now: i64,
 ) -> Result<RequeueOutcome, Status> {
-    let now = now_ms();
     let mut requeued = 0u64;
     let mut missing = 0u64;
 
@@ -1737,6 +1767,7 @@ fn apply_dead_letter_jobs(
     state: PeekState,
     keys: Vec<Vec<u8>>,
     reason: Option<String>,
+    now: i64,
 ) -> Result<DeadLetterJobsOutcome, Status> {
     if !matches!(state, PeekState::Ready | PeekState::Scheduled) {
         return Err(Status::invalid_argument(
@@ -1744,7 +1775,6 @@ fn apply_dead_letter_jobs(
         ));
     }
 
-    let now = now_ms();
     let mut dead_lettered = 0u64;
     let mut missing = 0u64;
 
@@ -1885,8 +1915,9 @@ fn apply_close_queue(
     tx: &mut WriteTransaction<'_>,
     cycle: &mut Cycle,
     queue: String,
+    now: i64,
 ) {
-    let deadline = now_ms().saturating_add(CLOSE_GRACE_MS);
+    let deadline = now.saturating_add(CLOSE_GRACE_MS);
     tx.insert(
         &store.meta,
         closing_key(&queue),
@@ -2012,8 +2043,8 @@ fn apply_nack(
     tx: &mut WriteTransaction<'_>,
     cycle: &mut Cycle,
     req: NackRequest,
+    now: i64,
 ) -> Result<NackOutcome, Status> {
-    let now = now_ms();
     let stored = tx
         .get(&store.inflight, req.job_id.as_bytes())
         .map_err(stg_err)?
@@ -2126,6 +2157,7 @@ fn apply_extend(
     tx: &mut WriteTransaction<'_>,
     cycle: &mut Cycle,
     req: ExtendRequest,
+    now: i64,
 ) -> Result<ExtendOutcome, Status> {
     let stored = tx
         .get(&store.inflight, req.job_id.as_bytes())
@@ -2156,7 +2188,7 @@ fn apply_extend(
         .unwrap_or(0)
         .min(max_lease)
         .max(1);
-    let lease_expires_at = now_ms().saturating_add(i64::try_from(lease_ms).unwrap_or(i64::MAX));
+    let lease_expires_at = now.saturating_add(i64::try_from(lease_ms).unwrap_or(i64::MAX));
     inflight.lease_expires_at = lease_expires_at;
 
     tx.insert(
@@ -2189,8 +2221,8 @@ fn apply_sweep(
     indexes: &mut Indexes,
     tx: &mut WriteTransaction<'_>,
     cycle: &mut Cycle,
+    now: i64,
 ) -> Result<usize, Status> {
-    let now = now_ms();
     let mut processed = 0usize;
 
     // Drop close tombstones whose delete handler died without clearing them.
@@ -2915,7 +2947,9 @@ impl Storage {
 
     pub async fn enqueue(&self, jobs: Vec<EnqueueRequest>) -> Result<Vec<EnqueueResult>, Status> {
         let jobs = jobs.into_iter().map(PreparedJob::new).collect();
-        match self.send_op(Op::Enqueue { jobs }).await? {
+        // now_ms: 0 on every op built here; the committer stamps the real
+        // drain time (see Op::stamp).
+        match self.send_op(Op::Enqueue { jobs, now_ms: 0 }).await? {
             OpOutcome::Enqueue(results) => Ok(results),
             _ => Err(Self::mismatched_outcome()),
         }
@@ -2926,7 +2960,7 @@ impl Storage {
         jobs: Vec<EnqueueRequest>,
     ) -> Result<AtomicEnqueueOutcome, Status> {
         let jobs = jobs.into_iter().map(PreparedJob::new).collect();
-        match self.send_op(Op::EnqueueAtomic { jobs }).await? {
+        match self.send_op(Op::EnqueueAtomic { jobs, now_ms: 0 }).await? {
             OpOutcome::EnqueueAtomic(outcome) => Ok(outcome),
             _ => Err(Self::mismatched_outcome()),
         }
@@ -2942,6 +2976,7 @@ impl Storage {
             queues,
             lease_ms,
             max_jobs,
+            now_ms: 0,
         };
         match self.send_op(op).await? {
             OpOutcome::Reserve(jobs) => Ok(jobs),
@@ -2957,14 +2992,14 @@ impl Storage {
     }
 
     pub async fn nack(&self, req: NackRequest) -> Result<NackOutcome, Status> {
-        match self.send_op(Op::Nack { req }).await? {
+        match self.send_op(Op::Nack { req, now_ms: 0 }).await? {
             OpOutcome::Nack(outcome) => Ok(outcome),
             _ => Err(Self::mismatched_outcome()),
         }
     }
 
     pub async fn extend(&self, req: ExtendRequest) -> Result<ExtendOutcome, Status> {
-        match self.send_op(Op::Extend { req }).await? {
+        match self.send_op(Op::Extend { req, now_ms: 0 }).await? {
             OpOutcome::Extend(outcome) => Ok(outcome),
             _ => Err(Self::mismatched_outcome()),
         }
@@ -3006,7 +3041,7 @@ impl Storage {
     // Durably tombstone a queue (refreshable) so enqueues to it are rejected
     // with QueueClosing while an admin delete drains it; open_queue clears it.
     pub async fn close_queue(&self, queue: String) -> Result<(), Status> {
-        match self.send_op(Op::CloseQueue { queue }).await? {
+        match self.send_op(Op::CloseQueue { queue, now_ms: 0 }).await? {
             OpOutcome::CloseQueue => Ok(()),
             _ => Err(Self::mismatched_outcome()),
         }
@@ -3024,7 +3059,12 @@ impl Storage {
         queue: String,
         keys: Vec<Vec<u8>>,
     ) -> Result<RequeueOutcome, Status> {
-        match self.send_op(Op::RequeueDeadLetters { queue, keys }).await? {
+        let op = Op::RequeueDeadLetters {
+            queue,
+            keys,
+            now_ms: 0,
+        };
+        match self.send_op(op).await? {
             OpOutcome::RequeueDeadLetters(outcome) => Ok(outcome),
             _ => Err(Self::mismatched_outcome()),
         }
@@ -3042,6 +3082,7 @@ impl Storage {
             state,
             keys,
             reason,
+            now_ms: 0,
         };
         match self.send_op(op).await? {
             OpOutcome::DeadLetterJobs(outcome) => Ok(outcome),
@@ -3545,6 +3586,7 @@ mod tests {
             &mut tx,
             &mut cycle,
             vec![test_job("q"), test_job("other")],
+            now_ms(),
         )
         .expect("enqueue applies");
 
@@ -3564,6 +3606,7 @@ mod tests {
             &mut tx,
             &mut cycle,
             vec![test_job("q")],
+            now_ms(),
         )
         .expect("enqueue applies");
         assert!(results[0].is_ok());
@@ -3583,6 +3626,7 @@ mod tests {
             &mut tx,
             &mut cycle,
             vec![test_job("other"), test_job("q")],
+            now_ms(),
         )
         .expect("atomic enqueue applies");
 
@@ -3610,7 +3654,14 @@ mod tests {
         let mut indexes = Indexes::default();
         let mut tx = store.db.write_tx();
         let mut cycle = Cycle::new(false);
-        apply_close_queue(&store, &mut indexes, &mut tx, &mut cycle, "active".into());
+        apply_close_queue(
+            &store,
+            &mut indexes,
+            &mut tx,
+            &mut cycle,
+            "active".into(),
+            now_ms(),
+        );
         // An expired tombstone, as if its delete handler died a while ago.
         indexes.closing.insert("abandoned".into(), now_ms() - 1);
         tx.insert(
@@ -3619,7 +3670,7 @@ mod tests {
             (now_ms() - 1).to_be_bytes().to_vec(),
         );
 
-        apply_sweep(&store, &mut indexes, &mut tx, &mut cycle).expect("sweep applies");
+        apply_sweep(&store, &mut indexes, &mut tx, &mut cycle, now_ms()).expect("sweep applies");
 
         assert!(!indexes.closing.contains_key("abandoned"));
         assert!(indexes.closing.contains_key("active"));
@@ -3634,7 +3685,14 @@ mod tests {
         let mut indexes = Indexes::default();
         let mut tx = store.db.write_tx();
         let mut cycle = Cycle::new(false);
-        apply_close_queue(&store, &mut indexes, &mut tx, &mut cycle, "q".into());
+        apply_close_queue(
+            &store,
+            &mut indexes,
+            &mut tx,
+            &mut cycle,
+            "q".into(),
+            now_ms(),
+        );
         assert!(cycle.dirty, "a close writes its tombstone durably");
         tx.commit().expect("commit");
 
@@ -3694,6 +3752,7 @@ mod tests {
             &mut tx,
             &mut cycle,
             vec![PreparedJob::new(req.clone())],
+            now_ms(),
         )
         .expect("enqueue applies")
         .remove(0)
@@ -3708,6 +3767,7 @@ mod tests {
             &mut tx,
             &mut cycle,
             vec![PreparedJob::new(req)],
+            now_ms(),
         )
         .expect("enqueue applies")
         .remove(0)

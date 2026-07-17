@@ -9,6 +9,11 @@ import "sepp/v1/queue.proto";
 // it to a log. Repo-local: unlike sepp/v1/queue.proto this file is NOT part of
 // the published contract on buf.build/sepp-org/sepp-proto and is never exposed
 // to clients.
+//
+// The now_ms fields carry the wall clock every time-dependent apply decision
+// reads. The committer stamps them at channel-drain time, one clock read
+// shared by every op in a cycle, so replaying an op stream reproduces
+// identical timestamps.
 
 // An EnqueueRequest plus its pre-assigned job ID. IDs are generated before an
 // op is built so applying the op is deterministic.
@@ -20,16 +25,19 @@ message PreparedJob {
 
 message EnqueueOp {
   repeated PreparedJob jobs = 1;
+  int64 now_ms = 2;
 }
 
 message EnqueueAtomicOp {
   repeated PreparedJob jobs = 1;
+  int64 now_ms = 2;
 }
 
 message ReserveOp {
   repeated string queues = 1;
   uint64 lease_ms = 2;
   uint32 max_jobs = 3;
+  int64 now_ms = 4;
 }
 
 message AckOp {
@@ -39,10 +47,12 @@ message AckOp {
 
 message NackOp {
   sepp.v1.NackRequest request = 1;
+  int64 now_ms = 2;
 }
 
 message ExtendOp {
   sepp.v1.ExtendRequest request = 1;
+  int64 now_ms = 2;
 }
 
 message DrainDeadLettersOp {
@@ -52,6 +62,7 @@ message DrainDeadLettersOp {
 
 message CloseQueueOp {
   string queue = 1;
+  int64 now_ms = 2;
 }
 
 message OpenQueueOp {
@@ -61,6 +72,7 @@ message OpenQueueOp {
 message RequeueDeadLettersOp {
   string queue = 1;
   repeated bytes keys = 2;
+  int64 now_ms = 3;
 }
 
 // The job state an admin dead-letter operation drains from.
@@ -77,6 +89,7 @@ message DeadLetterJobsOp {
   JobState state = 2;
   repeated bytes keys = 3;
   optional string reason = 4;
+  int64 now_ms = 5;
 }
 
 message DeleteDeadLettersOp {

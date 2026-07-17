@@ -13,14 +13,17 @@ use crate::storage::PeekState;
 pub enum Op {
     Enqueue {
         jobs: Vec<PreparedJob>,
+        now_ms: i64,
     },
     EnqueueAtomic {
         jobs: Vec<PreparedJob>,
+        now_ms: i64,
     },
     Reserve {
         queues: Vec<String>,
         lease_ms: u64,
         max_jobs: usize,
+        now_ms: i64,
     },
     Ack {
         job_id: String,
@@ -28,9 +31,11 @@ pub enum Op {
     },
     Nack {
         req: NackRequest,
+        now_ms: i64,
     },
     Extend {
         req: ExtendRequest,
+        now_ms: i64,
     },
     DrainDeadLetters {
         queue: Option<String>,
@@ -38,6 +43,7 @@ pub enum Op {
     },
     CloseQueue {
         queue: String,
+        now_ms: i64,
     },
     OpenQueue {
         queue: String,
@@ -45,12 +51,14 @@ pub enum Op {
     RequeueDeadLetters {
         queue: String,
         keys: Vec<Vec<u8>>,
+        now_ms: i64,
     },
     DeadLetterJobs {
         queue: String,
         state: PeekState,
         keys: Vec<Vec<u8>>,
         reason: Option<String>,
+        now_ms: i64,
     },
     DeleteDeadLetters {
         queue: String,
@@ -60,6 +68,30 @@ pub enum Op {
         queue: String,
         max: usize,
     },
+}
+
+impl Op {
+    // Every time-dependent apply decision reads the op's now_ms. The committer
+    // stamps it here with one drain-time clock read shared by the whole cycle,
+    // immediately before apply, so stamp ≈ apply time even under channel
+    // backlog. Handle methods build ops with now_ms = 0.
+    pub fn stamp(&mut self, now: i64) {
+        match self {
+            Op::Enqueue { now_ms, .. }
+            | Op::EnqueueAtomic { now_ms, .. }
+            | Op::Reserve { now_ms, .. }
+            | Op::Nack { now_ms, .. }
+            | Op::Extend { now_ms, .. }
+            | Op::CloseQueue { now_ms, .. }
+            | Op::RequeueDeadLetters { now_ms, .. }
+            | Op::DeadLetterJobs { now_ms, .. } => *now_ms = now,
+            Op::Ack { .. }
+            | Op::DrainDeadLetters { .. }
+            | Op::OpenQueue { .. }
+            | Op::DeleteDeadLetters { .. }
+            | Op::PurgeQueueChunk { .. } => {}
+        }
+    }
 }
 
 // An EnqueueRequest plus its pre-assigned job ID, generated before the op is
@@ -120,57 +152,69 @@ impl Op {
     pub fn to_proto(&self) -> proto::Op {
         use proto::op::Op as P;
         let op = match self {
-            Op::Enqueue { jobs } => P::Enqueue(proto::EnqueueOp {
+            Op::Enqueue { jobs, now_ms } => P::Enqueue(proto::EnqueueOp {
                 jobs: jobs.iter().map(PreparedJob::to_proto).collect(),
+                now_ms: *now_ms,
             }),
-            Op::EnqueueAtomic { jobs } => P::EnqueueAtomic(proto::EnqueueAtomicOp {
+            Op::EnqueueAtomic { jobs, now_ms } => P::EnqueueAtomic(proto::EnqueueAtomicOp {
                 jobs: jobs.iter().map(PreparedJob::to_proto).collect(),
+                now_ms: *now_ms,
             }),
             Op::Reserve {
                 queues,
                 lease_ms,
                 max_jobs,
+                now_ms,
             } => P::Reserve(proto::ReserveOp {
                 queues: queues.clone(),
                 lease_ms: *lease_ms,
                 max_jobs: *max_jobs as u32,
+                now_ms: *now_ms,
             }),
             Op::Ack { job_id, attempt } => P::Ack(proto::AckOp {
                 job_id: job_id.clone(),
                 attempt: *attempt,
             }),
-            Op::Nack { req } => P::Nack(proto::NackOp {
+            Op::Nack { req, now_ms } => P::Nack(proto::NackOp {
                 request: Some(req.clone()),
+                now_ms: *now_ms,
             }),
-            Op::Extend { req } => P::Extend(proto::ExtendOp {
+            Op::Extend { req, now_ms } => P::Extend(proto::ExtendOp {
                 request: Some(req.clone()),
+                now_ms: *now_ms,
             }),
             Op::DrainDeadLetters { queue, max } => P::DrainDeadLetters(proto::DrainDeadLettersOp {
                 queue: queue.clone(),
                 max: *max as u32,
             }),
-            Op::CloseQueue { queue } => P::CloseQueue(proto::CloseQueueOp {
+            Op::CloseQueue { queue, now_ms } => P::CloseQueue(proto::CloseQueueOp {
                 queue: queue.clone(),
+                now_ms: *now_ms,
             }),
             Op::OpenQueue { queue } => P::OpenQueue(proto::OpenQueueOp {
                 queue: queue.clone(),
             }),
-            Op::RequeueDeadLetters { queue, keys } => {
-                P::RequeueDeadLetters(proto::RequeueDeadLettersOp {
-                    queue: queue.clone(),
-                    keys: keys.clone(),
-                })
-            }
+            Op::RequeueDeadLetters {
+                queue,
+                keys,
+                now_ms,
+            } => P::RequeueDeadLetters(proto::RequeueDeadLettersOp {
+                queue: queue.clone(),
+                keys: keys.clone(),
+                now_ms: *now_ms,
+            }),
             Op::DeadLetterJobs {
                 queue,
                 state,
                 keys,
                 reason,
+                now_ms,
             } => P::DeadLetterJobs(proto::DeadLetterJobsOp {
                 queue: queue.clone(),
                 state: state_to_proto(*state) as i32,
                 keys: keys.clone(),
                 reason: reason.clone(),
+                now_ms: *now_ms,
             }),
             Op::DeleteDeadLetters { queue, keys } => {
                 P::DeleteDeadLetters(proto::DeleteDeadLettersOp {
@@ -198,14 +242,17 @@ impl Op {
         Ok(match msg.op.ok_or_else(|| corrupt("empty oneof"))? {
             P::Enqueue(o) => Op::Enqueue {
                 jobs: jobs(o.jobs)?,
+                now_ms: o.now_ms,
             },
             P::EnqueueAtomic(o) => Op::EnqueueAtomic {
                 jobs: jobs(o.jobs)?,
+                now_ms: o.now_ms,
             },
             P::Reserve(o) => Op::Reserve {
                 queues: o.queues,
                 lease_ms: o.lease_ms,
                 max_jobs: o.max_jobs as usize,
+                now_ms: o.now_ms,
             },
             P::Ack(o) => Op::Ack {
                 job_id: o.job_id,
@@ -213,25 +260,32 @@ impl Op {
             },
             P::Nack(o) => Op::Nack {
                 req: o.request.ok_or_else(|| corrupt("nack without request"))?,
+                now_ms: o.now_ms,
             },
             P::Extend(o) => Op::Extend {
                 req: o.request.ok_or_else(|| corrupt("extend without request"))?,
+                now_ms: o.now_ms,
             },
             P::DrainDeadLetters(o) => Op::DrainDeadLetters {
                 queue: o.queue,
                 max: o.max as usize,
             },
-            P::CloseQueue(o) => Op::CloseQueue { queue: o.queue },
+            P::CloseQueue(o) => Op::CloseQueue {
+                queue: o.queue,
+                now_ms: o.now_ms,
+            },
             P::OpenQueue(o) => Op::OpenQueue { queue: o.queue },
             P::RequeueDeadLetters(o) => Op::RequeueDeadLetters {
                 queue: o.queue,
                 keys: o.keys,
+                now_ms: o.now_ms,
             },
             P::DeadLetterJobs(o) => Op::DeadLetterJobs {
                 queue: o.queue,
                 state: state_from_proto(o.state)?,
                 keys: o.keys,
                 reason: o.reason,
+                now_ms: o.now_ms,
             },
             P::DeleteDeadLetters(o) => Op::DeleteDeadLetters {
                 queue: o.queue,
@@ -292,6 +346,8 @@ mod tests {
         }
     }
 
+    const NOW: i64 = 1_700_000_000_000;
+
     // One op per variant, every field populated, in oneof field order.
     fn sample_ops() -> Vec<Op> {
         let job = PreparedJob {
@@ -302,12 +358,17 @@ mod tests {
         vec![
             Op::Enqueue {
                 jobs: vec![job.clone()],
+                now_ms: NOW,
             },
-            Op::EnqueueAtomic { jobs: vec![job] },
+            Op::EnqueueAtomic {
+                jobs: vec![job],
+                now_ms: NOW,
+            },
             Op::Reserve {
                 queues: vec!["orders".into(), "emails".into()],
                 lease_ms: 30_000,
                 max_jobs: 5,
+                now_ms: NOW,
             },
             Op::Ack {
                 job_id: "job-1".into(),
@@ -323,6 +384,7 @@ mod tests {
                     }),
                     worker_id: Some("w-1".into()),
                 },
+                now_ms: NOW,
             },
             Op::Extend {
                 req: ExtendRequest {
@@ -331,6 +393,7 @@ mod tests {
                     lease_duration: Some(millis_to_duration(30_000)),
                     worker_id: Some("w-1".into()),
                 },
+                now_ms: NOW,
             },
             Op::DrainDeadLetters {
                 queue: Some("orders".into()),
@@ -338,6 +401,7 @@ mod tests {
             },
             Op::CloseQueue {
                 queue: "orders".into(),
+                now_ms: NOW,
             },
             Op::OpenQueue {
                 queue: "orders".into(),
@@ -345,12 +409,14 @@ mod tests {
             Op::RequeueDeadLetters {
                 queue: "orders".into(),
                 keys: vec![b"k1".to_vec(), b"k2".to_vec()],
+                now_ms: NOW,
             },
             Op::DeadLetterJobs {
                 queue: "orders".into(),
                 state: PeekState::Inflight,
                 keys: vec![b"k1".to_vec()],
                 reason: Some("manual".into()),
+                now_ms: NOW,
             },
             Op::DeleteDeadLetters {
                 queue: "orders".into(),
@@ -363,23 +429,43 @@ mod tests {
         ]
     }
 
+    #[test]
+    fn stamp_sets_the_drain_time_on_time_bearing_ops() {
+        let mut close = Op::CloseQueue {
+            queue: "q".into(),
+            now_ms: 0,
+        };
+        close.stamp(NOW);
+        assert_eq!(
+            close,
+            Op::CloseQueue {
+                queue: "q".into(),
+                now_ms: NOW,
+            }
+        );
+
+        let mut open = Op::OpenQueue { queue: "q".into() };
+        open.stamp(NOW);
+        assert_eq!(open, Op::OpenQueue { queue: "q".into() });
+    }
+
     // The serialized form is the future log entry: a byte change here breaks
     // every recorded op stream. Update the golden bytes only for a deliberate
     // format change, never to make the test pass after a refactor.
     #[test]
     fn golden_op_encoding_is_pinned() {
         const GOLDEN: &[&str] = &[
-            "0ac6010ac3010a9a010a066f7264657273120a73656e642d656d61696c1a160a027b7d12106170706c69636174696f6e2f6a736f6e22066964656d2d31280730033a390a3730302d30616637363531393136636434336464383434386562323131633830333139632d623761643662373136393230333333312d3031420e0a06726567696f6e12040a026575420d0a0772657472696573120218024a060880e2cfaa06122430313233343536372d383961622d636465662d303132332d343536373839616263646566",
-            "12c6010ac3010a9a010a066f7264657273120a73656e642d656d61696c1a160a027b7d12106170706c69636174696f6e2f6a736f6e22066964656d2d31280730033a390a3730302d30616637363531393136636434336464383434386562323131633830333139632d623761643662373136393230333333312d3031420e0a06726567696f6e12040a026575420d0a0772657472696573120218024a060880e2cfaa06122430313233343536372d383961622d636465662d303132332d343536373839616263646566",
-            "1a160a066f72646572730a06656d61696c7310b0ea011805",
+            "0acd010ac3010a9a010a066f7264657273120a73656e642d656d61696c1a160a027b7d12106170706c69636174696f6e2f6a736f6e22066964656d2d31280730033a390a3730302d30616637363531393136636434336464383434386562323131633830333139632d623761643662373136393230333333312d3031420e0a06726567696f6e12040a026575420d0a0772657472696573120218024a060880e2cfaa06122430313233343536372d383961622d636465662d303132332d3435363738396162636465661080d095ffbc31",
+            "12cd010ac3010a9a010a066f7264657273120a73656e642d656d61696c1a160a027b7d12106170706c69636174696f6e2f6a736f6e22066964656d2d31280730033a390a3730302d30616637363531393136636434336464383434386562323131633830333139632d623761643662373136393230333333312d3031420e0a06726567696f6e12040a026575420d0a0772657472696573120218024a060880e2cfaa06122430313233343536372d383961622d636465662d303132332d3435363738396162636465661080d095ffbc31",
+            "1a1d0a066f72646572730a06656d61696c7310b0ea0118052080d095ffbc31",
             "22090a056a6f622d311002",
-            "2a1c0a1a0a056a6f622d3110021a04626f6f6d2204120208052a03772d31",
-            "32140a120a056a6f622d3110021a02081e2203772d31",
+            "2a230a1a0a056a6f622d3110021a04626f6f6d2204120208052a03772d311080d095ffbc31",
+            "321b0a120a056a6f622d3110021a02081e2203772d311080d095ffbc31",
             "3a0a0a066f7264657273100a",
-            "42080a066f7264657273",
+            "420f0a066f72646572731080d095ffbc31",
             "4a080a066f7264657273",
-            "52100a066f726465727312026b3112026b32",
-            "5a160a066f726465727310031a026b3122066d616e75616c",
+            "52170a066f726465727312026b3112026b321880d095ffbc31",
+            "5a1d0a066f726465727310031a026b3122066d616e75616c2880d095ffbc31",
             "620c0a066f726465727312026b31",
             "6a0b0a066f726465727310e807",
         ];
@@ -406,7 +492,10 @@ mod tests {
         assert!(Op::from_proto(proto::Op { op: None }).is_err());
 
         let no_request = proto::Op {
-            op: Some(proto::op::Op::Nack(proto::NackOp { request: None })),
+            op: Some(proto::op::Op::Nack(proto::NackOp {
+                request: None,
+                now_ms: NOW,
+            })),
         };
         assert!(Op::from_proto(no_request).is_err());
 
@@ -416,6 +505,7 @@ mod tests {
                 state: 99,
                 keys: vec![],
                 reason: None,
+                now_ms: NOW,
             })),
         };
         assert!(Op::from_proto(unknown_state).is_err());
