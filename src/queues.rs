@@ -8,9 +8,18 @@ use crate::config::{Config, EffectiveLimits, QueueConfig};
 pub struct QueueRegistry {
     defaults: EffectiveLimits,
     declared: HashMap<String, QueueConfig>,
+    // Bumped on every publish() so a registry snapshot can be referenced
+    // compactly (e.g. by an op-stream recording). Boot is generation 0.
+    generation: u64,
 }
 
 pub type SharedRegistry = Arc<ArcSwap<QueueRegistry>>;
+
+// All swaps go through here so generations stay monotonic.
+pub fn publish(shared: &SharedRegistry, mut next: QueueRegistry) {
+    next.generation = shared.load().generation + 1;
+    shared.store(Arc::new(next));
+}
 
 impl QueueRegistry {
     pub fn from_config(cfg: &Config) -> Self {
@@ -21,11 +30,19 @@ impl QueueRegistry {
             .map(|q| (q.name.clone(), q.clone()))
             .collect();
 
-        Self { defaults, declared }
+        Self {
+            defaults,
+            declared,
+            generation: 0,
+        }
     }
 
     pub fn into_shared(self) -> SharedRegistry {
         Arc::new(ArcSwap::from_pointee(self))
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     pub fn effective(&self, queue: &str) -> EffectiveLimits {
@@ -67,6 +84,16 @@ mod tests {
             queues,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn publish_bumps_the_generation() {
+        let shared = QueueRegistry::from_config(&cfg_with(vec![])).into_shared();
+        assert_eq!(shared.load().generation(), 0);
+
+        publish(&shared, QueueRegistry::from_config(&cfg_with(vec![])));
+        publish(&shared, QueueRegistry::from_config(&cfg_with(vec![])));
+        assert_eq!(shared.load().generation(), 2);
     }
 
     #[test]

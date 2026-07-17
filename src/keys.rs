@@ -160,6 +160,18 @@ impl TimerKey<'_> {
     }
 }
 
+// Key in the `meta` keyspace marking a queue as closing: `"closing/" | queue`.
+// The value is the grace deadline (i64 BE).
+pub(crate) const CLOSING_PREFIX: &[u8] = b"closing/";
+
+pub(crate) fn closing_key(queue: &str) -> Vec<u8> {
+    [CLOSING_PREFIX, queue.as_bytes()].concat()
+}
+
+pub(crate) fn closing_queue(key: &[u8]) -> Option<&str> {
+    std::str::from_utf8(key.strip_prefix(CLOSING_PREFIX)?).ok()
+}
+
 // Key into the `dedup` keyspace: `queue | idempotency_key`.
 pub(crate) struct DedupKey<'a> {
     pub queue: &'a str,
@@ -436,6 +448,12 @@ mod tests {
     }
 
     #[test]
+    fn closing_key_round_trips_queue() {
+        assert_eq!(closing_queue(&closing_key("orders")), Some("orders"));
+        assert_eq!(closing_queue(b"format_version"), None);
+    }
+
+    #[test]
     fn dedup_timer_key_carries_deadline_and_queue() {
         let dkey = DedupKey {
             queue: "orders",
@@ -521,6 +539,34 @@ mod tests {
         let (queue, decoded) = JobValue::decode(&bytes).expect("decodes");
         assert_eq!(queue, "orders");
         assert_eq!(decoded, job);
+    }
+
+    #[test]
+    fn job_value_custom_map_encodes_canonically() {
+        // Guards the btree_map setting in build.rs: the same logical job must
+        // persist as the same bytes regardless of custom-map insertion order.
+        use crate::pb::sepp::v1::{PrimitiveValue, primitive_value::Value};
+
+        let entries: Vec<_> = (b'a'..=b'h')
+            .map(|k| {
+                let value = Some(Value::IntValue(k as i64));
+                ((k as char).to_string(), PrimitiveValue { value })
+            })
+            .collect();
+
+        let mut forward = sample_job("job-42");
+        forward.custom.extend(entries.iter().cloned());
+        let mut reverse = sample_job("job-42");
+        reverse.custom.extend(entries.iter().rev().cloned());
+
+        let encode = |job: &Job| {
+            JobValue {
+                queue: "orders",
+                job,
+            }
+            .encode()
+        };
+        assert_eq!(encode(&forward), encode(&reverse));
     }
 
     #[test]

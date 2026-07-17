@@ -2,6 +2,11 @@ pub mod sepp {
     pub mod v1 {
         include!(concat!(env!("OUT_DIR"), "/sepp.v1.rs"));
     }
+    pub mod storage {
+        pub mod v1 {
+            include!(concat!(env!("OUT_DIR"), "/sepp.storage.v1.rs"));
+        }
+    }
 }
 
 // Internally we use ms since epoch so we need to convert at the wire boundary.
