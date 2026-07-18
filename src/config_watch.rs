@@ -112,9 +112,7 @@ fn apply_reload(state: &ReloadState, path: &Path) {
     }
 
     // Theoretically there is a small window in which a request could observe the new registry but the old keys
-    state
-        .registry
-        .store(Arc::new(QueueRegistry::from_config(&new)));
+    crate::queues::publish(&state.registry, QueueRegistry::from_config(&new));
     state.interceptor.set_keys(new.auth.api_keys.clone());
 
     state.config.store(Arc::new(new));
