@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { useQueryClient } from '@tanstack/vue-query'
-import { watch } from 'vue'
+import { ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { setUnauthorizedHandler } from './api/client'
+import { AdminApiError, api, setUnauthorizedHandler } from './api/client'
 import SeppMark from './components/SeppMark.vue'
 import { useSession } from './composables/useSession'
 import { useStatsStream, type StreamStatus } from './composables/useStatsStream'
@@ -56,6 +56,50 @@ async function signOut() {
   }
 }
 
+const jobSearch = ref('')
+const searching = ref(false)
+const searchError = ref('')
+
+// The lookup resolves the owning queue and state first, then deep-links into
+// the queue drawer; JobsTab consumes the `job` query param and opens the
+// detail panel from the seeded ['job', id] cache entry.
+async function findJob() {
+  const id = jobSearch.value.trim()
+  if (id === '' || searching.value) return
+  searching.value = true
+  searchError.value = ''
+  try {
+    const job = await api.job(id)
+    queryClient.setQueryData(['job', id], job)
+    jobSearch.value = ''
+    await router.push({
+      name: 'queue',
+      params: { name: job.queue, tab: 'jobs' },
+      query: { job: id },
+    })
+  } catch (e) {
+    searchError.value =
+      e instanceof AdminApiError && e.status === 404
+        ? 'No live job with this ID: it may have completed (acked) or been dead-lettered.'
+        : e instanceof Error
+          ? e.message
+          : 'lookup failed'
+  } finally {
+    searching.value = false
+  }
+}
+
+// Typing or navigating away dismisses a stale lookup error.
+watch(jobSearch, () => {
+  searchError.value = ''
+})
+watch(
+  () => route.fullPath,
+  () => {
+    searchError.value = ''
+  },
+)
+
 const pill: Record<StreamStatus, { label: string; classes: string }> = {
   live: { label: 'online', classes: 'bg-emerald-500/15 text-emerald-400' },
   polling: { label: 'offline', classes: 'bg-red-500/15 text-red-400' },
@@ -98,7 +142,22 @@ const pill: Record<StreamStatus, { label: string; classes: string }> = {
         <span class="rounded-full px-2 py-0.5 text-xs" :class="pill[status].classes">
           {{ pill[status].label }}
         </span>
-        <div v-if="session.authEnabled.value && session.name.value" class="ml-auto flex items-center gap-2">
+        <form class="relative ml-auto" @submit.prevent="findJob">
+          <input
+            v-model="jobSearch"
+            placeholder="Find job by ID"
+            spellcheck="false"
+            :class="searching ? 'opacity-60' : ''"
+            class="w-56 rounded border border-ink-800 bg-ink-950 px-2 py-1 font-mono text-xs text-ink-100 placeholder:font-sans placeholder:text-ink-500 focus:border-ink-600 focus:outline-none"
+          />
+          <p
+            v-if="searchError"
+            class="absolute top-full right-0 z-20 mt-1 w-72 rounded border border-ink-700 bg-ink-900 px-3 py-2 text-xs text-ink-300 shadow-lg"
+          >
+            {{ searchError }}
+          </p>
+        </form>
+        <div v-if="session.authEnabled.value && session.name.value" class="flex items-center gap-2">
           <span class="text-xs text-ink-400">
             <span class="text-ink-200">{{ session.name.value }}</span>
           </span>

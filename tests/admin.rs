@@ -871,6 +871,8 @@ async fn peek_lists_ready_jobs_and_pages_with_cursors() {
     let detail = resp.json();
     assert_eq!(detail["id"], some_id.as_str());
     assert!(detail["payload"]["data_b64"].is_string());
+    assert_eq!(detail["queue"], "adm-peek-q");
+    assert_eq!(detail["state"], "ready");
     let resp = http(
         port,
         "GET",

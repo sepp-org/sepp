@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { useInfiniteQuery, useMutation, useQueryClient } from '@tanstack/vue-query'
-import { computed, ref, watch } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { api } from '../../api/client'
-import type { JobState, JobSummary } from '../../api/types'
+import type { JobLookup, JobState, JobSummary } from '../../api/types'
 import ConfirmDialog from '../../components/ConfirmDialog.vue'
 import CopyButton from '../../components/CopyButton.vue'
 import { useSession } from '../../composables/useSession'
@@ -53,6 +54,37 @@ watch(state, () => {
   checked.value = new Set()
   actionNotice.value = ''
 })
+
+const route = useRoute()
+const router = useRouter()
+
+// The header job search lands here as ?job=<id> with the ['job', id] cache
+// seeded: consume the param, flip to the job's state tab and open its detail.
+async function openFromQuery() {
+  const id = typeof route.query.job === 'string' ? route.query.job : ''
+  if (id === '') return
+  // During a queue-to-queue navigation the outgoing keyed instance still sees
+  // the query change; the param belongs to the instance matching the route.
+  const n = route.params.name
+  if ((Array.isArray(n) ? n[0] : n) !== props.queue) return
+  void router.replace({ query: { ...route.query, job: undefined } })
+  const job =
+    queryClient.getQueryData<JobLookup>(['job', id]) ??
+    (await queryClient
+      .fetchQuery({ queryKey: ['job', id], queryFn: () => api.job(id) })
+      .catch(() => null))
+  if (!job || job.queue !== props.queue) return
+  state.value = job.state
+  // The state watcher above clears the selection on its flush; select after.
+  await nextTick()
+  selected.value = job
+}
+
+watch(
+  () => route.query.job,
+  () => void openFromQuery(),
+  { immediate: true },
+)
 
 const allChecked = computed(
   () => jobs.value.length > 0 && jobs.value.every((j) => checked.value.has(j.key_b64)),

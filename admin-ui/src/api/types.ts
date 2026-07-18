@@ -200,6 +200,13 @@ export interface JobDetail extends JobSummary {
   payload: JobPayload & { data_b64: string }
 }
 
+// GET /jobs/{id} additionally reports where the job lives; a by-id lookup
+// has no queue context of its own. Live jobs only, so never dead_letter.
+export interface JobLookup extends JobDetail {
+  queue: string
+  state: Exclude<JobState, 'dead_letter'>
+}
+
 // POST /queues/{name}/jobs
 export interface EnqueuePayload {
   encoding: string

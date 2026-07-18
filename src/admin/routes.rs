@@ -444,6 +444,14 @@ fn job_json(aj: &AdminJob, full: bool) -> Value {
     v
 }
 
+fn state_label(state: AdminJobState) -> &'static str {
+    match state {
+        AdminJobState::Ready => "ready",
+        AdminJobState::Scheduled => "scheduled",
+        AdminJobState::Inflight => "inflight",
+    }
+}
+
 fn cause_label(cause: i32) -> &'static str {
     match pb::DeadLetterCause::try_from(cause) {
         Ok(pb::DeadLetterCause::AttemptsExhausted) => "attempts_exhausted",
@@ -560,7 +568,12 @@ pub(super) async fn get_job(
     let job = resolve_blocking(move || read.get_job(&id))
         .await?
         .ok_or_else(|| ApiError::not_found("job not found"))?;
-    Ok(Json(job_json(&job, true)))
+    // Unlike the per-queue listing, a by-id lookup has no context: report
+    // where the job lives so the UI can link back to its queue.
+    let mut v = job_json(&job, true);
+    v["queue"] = Value::String(job.job.queue.clone());
+    v["state"] = Value::String(state_label(job.state).to_string());
+    Ok(Json(v))
 }
 
 pub(super) async fn get_dead_letter(

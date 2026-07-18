@@ -9,6 +9,7 @@ import type {
   EnqueueJobResponse,
   EnqueueRejection,
   JobDetail,
+  JobLookup,
   JobState,
   JobsPage,
   Overview,
@@ -99,7 +100,7 @@ export const api = {
     if (limit !== undefined) params.set('limit', String(limit))
     return request<JobsPage>('GET', `/queues/${seg(name)}/jobs?${params}`)
   },
-  job: (id: string) => request<JobDetail>('GET', `/jobs/${seg(id)}`),
+  job: (id: string) => request<JobLookup>('GET', `/jobs/${seg(id)}`),
   deadLetter: (name: string, keyB64: string) =>
     request<JobDetail>('GET', `/queues/${seg(name)}/dead-letters/${seg(keyB64)}`),
   enqueue: (name: string, body: EnqueueJobRequest) =>
