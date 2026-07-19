@@ -32,6 +32,7 @@ use stats::RateSample;
 pub enum Event {
     Stats(Arc<String>),
     Config(u64),
+    Audit(Arc<String>),
 }
 
 pub type History = Arc<RwLock<HashMap<String, VecDeque<RateSample>>>>;

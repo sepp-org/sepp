@@ -8,15 +8,19 @@
 //!   operator  job-level mutations: enqueue, dead-letter, requeue, delete dead letters
 //!   admin     config-level mutations: queue create/update/delete, config edits
 
+use std::sync::Arc;
+
 use axum::extract::FromRequestParts;
 use axum::http::StatusCode;
 use axum::http::request::Parts;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::config::Role;
+use crate::pb::sepp::storage::v1::AuditRecord;
 
 use super::auth::AuthCtx;
 use super::routes::ApiError;
+use super::{AdminState, Event};
 
 // Read-only handlers take RequireViewer purely for the access check, so its
 // identity field is intentionally unread.
@@ -68,9 +72,7 @@ impl<S: Send + Sync> FromRequestParts<S> for RequireAdmin {
     }
 }
 
-// One line per successful mutation, attributed to the acting key. Routed by
-// target so operators can split the audit trail off into its own sink.
-pub fn audit(ctx: &AuthCtx, action: &str, details: Value) {
+pub fn audit(state: &AdminState, ctx: &AuthCtx, action: &str, details: Value) {
     tracing::info!(
         target: "sepp::audit",
         actor = %ctx.actor(),
@@ -79,6 +81,38 @@ pub fn audit(ctx: &AuthCtx, action: &str, details: Value) {
         details = %details,
         "admin action"
     );
+    store_audit(state, ctx.actor(), ctx.role, action, details);
+}
+
+// Fire-and-forget: the admin action already succeeded and must not block on
+// or fail with the append.
+fn store_audit(state: &AdminState, actor: &str, role: Role, action: &str, details: Value) {
+    let record = AuditRecord {
+        actor: actor.to_string(),
+        role: role.to_string(),
+        action: action.to_string(),
+        details_json: details.to_string(),
+    };
+    let storage = state.storage.clone();
+    let hub = state.hub.clone();
+
+    tokio::spawn(async move {
+        match storage.append_audit(record).await {
+            Ok(entry) => {
+                let payload = json!({
+                    "seq": entry.seq,
+                    "ts_ms": entry.ts_ms,
+                    "actor": entry.record.actor,
+                    "role": entry.record.role,
+                    "action": entry.record.action,
+                    "details": details,
+                })
+                .to_string();
+                let _ = hub.send(Event::Audit(Arc::new(payload)));
+            }
+            Err(e) => tracing::warn!(error = %e, "audit append failed"),
+        }
+    });
 }
 
 #[cfg(test)]

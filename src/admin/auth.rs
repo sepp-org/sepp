@@ -239,12 +239,14 @@ pub async fn login(
         sessions.insert(token.clone(), session);
     }
 
-    tracing::info!(
-        target: "sepp::audit",
-        actor = %matched.name,
-        role = %matched.role,
-        action = "session.login",
-        "admin login"
+    super::authz::audit(
+        &state,
+        &AuthCtx {
+            name: Some(matched.name.clone()),
+            role: matched.role,
+        },
+        "session.login",
+        serde_json::json!({}),
     );
 
     (
@@ -261,9 +263,17 @@ pub async fn login(
         .into_response()
 }
 
-pub async fn logout(State(state): State<Arc<AdminState>>, headers: HeaderMap) -> Response {
-    if let Some(token) = cookie_token(&headers) {
-        state.sessions.write().expect("session lock").remove(&token);
+pub async fn logout(
+    State(state): State<Arc<AdminState>>,
+    ctx: Option<axum::Extension<AuthCtx>>,
+    headers: HeaderMap,
+) -> Response {
+    let removed = cookie_token(&headers)
+        .and_then(|token| state.sessions.write().expect("session lock").remove(&token));
+    if removed.is_some()
+        && let Some(axum::Extension(ctx)) = ctx
+    {
+        super::authz::audit(&state, &ctx, "session.logout", serde_json::json!({}));
     }
 
     (

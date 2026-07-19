@@ -276,6 +276,7 @@ pub(super) async fn put_queue(
 
     let (applied, requires_restart, etag) = validate_and_write(&state, doc).await?;
     audit(
+        &state,
         &ctx,
         "queue.put",
         json!({ "queue": name, "overrides": body.overrides.keys().collect::<Vec<_>>() }),
@@ -378,6 +379,7 @@ pub(super) async fn delete_queue(
     }
 
     audit(
+        &state,
         &ctx,
         "queue.delete",
         json!({ "queue": name, "purged": purged }),
@@ -751,6 +753,7 @@ pub(super) async fn enqueue_job(
     match results.pop() {
         Some(Ok(resp)) => {
             audit(
+                &state,
                 &ctx,
                 "job.enqueue",
                 json!({ "queue": queue, "job_id": resp.job_id, "job_type": job_type }),
@@ -822,6 +825,7 @@ pub(super) async fn dead_letter_jobs(
         .dead_letter_jobs(name.clone(), peek_state, keys, body.reason)
         .await?;
     audit(
+        &state,
         &ctx,
         "jobs.dead_letter",
         json!({ "queue": name, "dead_lettered": outcome.dead_lettered }),
@@ -844,6 +848,7 @@ pub(super) async fn requeue_dead_letters(
         .requeue_dead_letters(name.clone(), keys)
         .await?;
     audit(
+        &state,
         &ctx,
         "dead_letters.requeue",
         json!({ "queue": name, "requeued": outcome.requeued }),
@@ -865,6 +870,7 @@ pub(super) async fn delete_dead_letters(
         .delete_dead_letters(name.clone(), keys)
         .await?;
     audit(
+        &state,
         &ctx,
         "dead_letters.delete",
         json!({ "queue": name, "deleted": outcome.deleted }),
@@ -1089,6 +1095,7 @@ pub(super) async fn put_config(
 
     let (applied, requires_restart, etag) = validate_and_write(&state, doc).await?;
     audit(
+        &state,
         &ctx,
         "config.put",
         json!({ "paths": body.changes.iter().map(|c| &c.path).collect::<Vec<_>>() }),
@@ -1191,7 +1198,7 @@ pub(super) async fn add_auth_key(
         .map_err(|e| ApiError::bad_request("invalid_change", e))?;
 
     let (applied, requires_restart, etag) = validate_and_write(&state, doc).await?;
-    audit(&ctx, "auth_key.add", json!({ "name": body.name }));
+    audit(&state, &ctx, "auth_key.add", json!({ "name": body.name }));
     Ok(Json(json!({
         "applied": applied,
         "requires_restart": requires_restart,
@@ -1234,7 +1241,7 @@ pub(super) async fn delete_auth_key(
         .map_err(|e| ApiError::bad_request("invalid_change", e))?;
 
     let (applied, requires_restart, etag) = validate_and_write(&state, doc).await?;
-    audit(&ctx, "auth_key.revoke", json!({ "name": name }));
+    audit(&state, &ctx, "auth_key.revoke", json!({ "name": name }));
     Ok(Json(json!({
         "applied": applied,
         "requires_restart": requires_restart,
@@ -1271,7 +1278,7 @@ pub(super) async fn disable_auth(
     }
 
     let (applied, requires_restart, etag) = validate_and_write(&state, doc).await?;
-    audit(&ctx, "auth.disable", json!({}));
+    audit(&state, &ctx, "auth.disable", json!({}));
     Ok(Json(json!({
         "applied": applied,
         "requires_restart": requires_restart,

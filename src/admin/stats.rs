@@ -196,8 +196,10 @@ pub(super) async fn events(
         Ok(Event::Config(seq)) => Some(Ok(SseEvent::default()
             .event("config")
             .data(seq.to_string()))),
-        // A lagged subscriber just skips to the next full-snapshot frame.
-        Err(BroadcastStreamRecvError::Lagged(_)) => None,
+        Ok(Event::Audit(entry)) => Some(Ok(SseEvent::default().event("audit").data(&*entry))),
+        Err(BroadcastStreamRecvError::Lagged(n)) => {
+            Some(Ok(SseEvent::default().event("lagged").data(n.to_string())))
+        }
     });
 
     let sse =

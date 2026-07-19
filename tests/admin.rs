@@ -343,6 +343,21 @@ fn stats_frames(body: &str) -> Vec<Value> {
     frames
 }
 
+/// Every complete `event: audit` entry in the decoded SSE body, in order.
+fn audit_events(body: &str) -> Vec<Value> {
+    let mut events = Vec::new();
+    let mut lines = body.lines().peekable();
+    while let Some(line) = lines.next() {
+        if line.trim() == "event: audit"
+            && let Some(data) = lines.peek().and_then(|l| l.strip_prefix("data: "))
+            && let Ok(event) = serde_json::from_str(data)
+        {
+            events.push(event);
+        }
+    }
+    events
+}
+
 // ---------------------------------------------------------------------------
 // 0. Auth + roles
 // ---------------------------------------------------------------------------
@@ -2120,4 +2135,84 @@ async fn sse_streams_hello_then_stats_frames() {
     assert!(frame["seq"].as_u64().unwrap() > 0);
     assert!(frame["ts_ms"].as_i64().unwrap() > 0);
     assert!(frame["server"]["command_queue_len"].is_number());
+}
+
+#[tokio::test]
+async fn audited_actions_stream_audit_sse_events() {
+    let (_guard, _client, port) = start_admin_server("audit-sse", ROLES_CFG, &[]).await;
+
+    let (auth_name, auth_value) = bearer("admin-key");
+    let mut sse = sse_connect_with(port, &[(auth_name, &auth_value)]).await;
+
+    let login = json!({ "name": "o", "key": "operator-key" }).to_string();
+    let resp = http(port, "POST", "/admin/api/v1/session", &[], Some(&login)).await;
+    assert_eq!(resp.status, 200, "login failed: {}", resp.body);
+    let cookie = resp
+        .header("set-cookie")
+        .expect("login sets a session cookie")
+        .split(';')
+        .next()
+        .expect("cookie value")
+        .to_string();
+
+    let enqueue = json!({ "job_type": "audit-test" }).to_string();
+    let resp = http_as(
+        port,
+        "operator-key",
+        "POST",
+        "/admin/api/v1/queues/audit-q/jobs",
+        Some(&enqueue),
+    )
+    .await;
+    assert_eq!(resp.status, 200, "enqueue failed: {}", resp.body);
+
+    let resp = http(
+        port,
+        "DELETE",
+        "/admin/api/v1/session",
+        &[("Cookie", &cookie)],
+        None,
+    )
+    .await;
+    assert_eq!(resp.status, 204, "logout failed: {}", resp.body);
+
+    // The appends are fire-and-forget, so the events arrive asynchronously
+    // and in no guaranteed relative order.
+    sse.wait_for(Instant::now() + Duration::from_secs(10), |body| {
+        body.contains(r#""action":"session.login""#)
+            && body.contains(r#""action":"job.enqueue""#)
+            && body.contains(r#""action":"session.logout""#)
+    })
+    .await;
+
+    let events = audit_events(&sse.body);
+    let login = events
+        .iter()
+        .find(|e| e["action"] == "session.login")
+        .expect("matched by wait_for");
+    assert_eq!(login["actor"], "o");
+    assert_eq!(login["role"], "operator");
+    assert!(login["ts_ms"].as_i64().unwrap() > 0);
+
+    let enqueued = events
+        .iter()
+        .find(|e| e["action"] == "job.enqueue")
+        .expect("matched by wait_for");
+    assert_eq!(enqueued["actor"], "o");
+    assert_eq!(enqueued["role"], "operator");
+    assert_eq!(enqueued["details"]["queue"], "audit-q");
+    assert_eq!(enqueued["details"]["job_type"], "audit-test");
+    assert!(enqueued["details"]["job_id"].is_string());
+
+    let logout = events
+        .iter()
+        .find(|e| e["action"] == "session.logout")
+        .expect("matched by wait_for");
+    assert_eq!(logout["actor"], "o");
+    assert_eq!(logout["role"], "operator");
+
+    let mut seqs: Vec<u64> = events.iter().map(|e| e["seq"].as_u64().unwrap()).collect();
+    seqs.sort_unstable();
+    seqs.dedup();
+    assert_eq!(seqs.len(), events.len(), "every entry gets a distinct seq");
 }

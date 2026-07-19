@@ -455,7 +455,7 @@ enum OpOutcome {
     DeleteDeadLetters(DeleteOutcome),
     PurgeQueueChunk(PurgeOutcome),
     Sweep(usize),
-    AuditAppend,
+    AuditAppend { seq: u64, ts_ms: i64 },
 }
 
 // An applied op's outcome parked until the cycle's commit decides whether the
@@ -941,8 +941,8 @@ fn apply_op(
             dead_letter_enabled,
         )?),
         Op::AuditAppend { record, now_ms } => {
-            apply_audit_append(store, tx, cycle, &record, now_ms)?;
-            OpOutcome::AuditAppend
+            let seq = apply_audit_append(store, tx, cycle, &record, now_ms)?;
+            OpOutcome::AuditAppend { seq, ts_ms: now_ms }
         }
     })
 }
@@ -2546,7 +2546,7 @@ fn apply_audit_append(
     cycle: &mut Cycle,
     record: &AuditRecord,
     now_ms: i64,
-) -> Result<(), Status> {
+) -> Result<u64, Status> {
     let seq = match tx.get(&store.meta, AUDIT_SEQ_KEY).map_err(stg_err)? {
         Some(v) => <[u8; 8]>::try_from(v.as_ref())
             .ok()
@@ -2571,7 +2571,7 @@ fn apply_audit_append(
     );
     cycle.dirty = true;
 
-    Ok(())
+    Ok(seq)
 }
 
 // Past this many distinct queue names, `get` prunes notifiers that no Reserve
@@ -3371,9 +3371,15 @@ impl Storage {
         }
     }
 
-    pub async fn append_audit(&self, record: AuditRecord) -> Result<(), Status> {
-        match self.send_op(Op::AuditAppend { record, now_ms: 0 }).await? {
-            OpOutcome::AuditAppend => Ok(()),
+    // Returns the stored entry so the caller can fan it out (SSE) exactly as
+    // a later page read would return it.
+    pub async fn append_audit(&self, record: AuditRecord) -> Result<AuditEntry, Status> {
+        let op = Op::AuditAppend {
+            record: record.clone(),
+            now_ms: 0,
+        };
+        match self.send_op(op).await? {
+            OpOutcome::AuditAppend { seq, ts_ms } => Ok(AuditEntry { seq, ts_ms, record }),
             _ => Err(Self::mismatched_outcome()),
         }
     }
