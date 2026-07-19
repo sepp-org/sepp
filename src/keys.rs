@@ -1,6 +1,7 @@
 use prost::Message;
 use tonic::Status;
 
+use crate::pb::sepp::storage::v1::AuditRecord;
 use crate::pb::sepp::v1::{Job, TraceContext};
 
 struct KeyWriter(Vec<u8>);
@@ -170,6 +171,34 @@ pub(crate) fn closing_key(queue: &str) -> Vec<u8> {
 
 pub(crate) fn closing_queue(key: &[u8]) -> Option<&str> {
     std::str::from_utf8(key.strip_prefix(CLOSING_PREFIX)?).ok()
+}
+
+pub(crate) const AUDIT_SEQ_KEY: &[u8] = b"audit_seq";
+
+// Value in the `audit` keyspace: `ts_ms | protobuf(AuditRecord)`. The key is
+// the entry's seq (u64 BE), allocated from the meta `audit_seq` row so entries
+// sort in insertion order regardless of clock steps.
+pub(crate) struct AuditValue<'a> {
+    pub ts_ms: i64,
+    pub record: &'a AuditRecord,
+}
+
+impl AuditValue<'_> {
+    pub fn encode(&self) -> Vec<u8> {
+        let bytes = self.record.encode_to_vec();
+        let mut w = KeyWriter::with_capacity(8 + bytes.len());
+        w.i64(self.ts_ms).tail(&bytes);
+
+        w.into_vec()
+    }
+
+    pub fn decode(bytes: &[u8]) -> Option<(i64, AuditRecord)> {
+        let mut r = KeyReader::new(bytes);
+        let ts_ms = r.i64()?;
+        let record = AuditRecord::decode(r.tail()).ok()?;
+
+        Some((ts_ms, record))
+    }
 }
 
 // Key into the `dedup` keyspace: `queue | idempotency_key`.
@@ -514,6 +543,33 @@ mod tests {
         let mut bad = 1i64.to_be_bytes().to_vec();
         bad.extend_from_slice(&[0xff, 0xff]);
         assert!(DedupValue::decode(&bad).is_none());
+    }
+
+    #[test]
+    fn audit_value_round_trips() {
+        let record = AuditRecord {
+            actor: "root".into(),
+            role: "admin".into(),
+            action: "queue.open".into(),
+            details_json: r#"{"queue":"alpha"}"#.into(),
+        };
+        let bytes = AuditValue {
+            ts_ms: 42,
+            record: &record,
+        }
+        .encode();
+        let (ts_ms, decoded) = AuditValue::decode(&bytes).expect("decodes");
+        assert_eq!(ts_ms, 42);
+        assert_eq!(decoded, record);
+    }
+
+    #[test]
+    fn audit_value_decode_rejects_short_and_invalid_input() {
+        assert!(AuditValue::decode(&[]).is_none());
+        assert!(AuditValue::decode(&1i64.to_be_bytes()[..7]).is_none());
+        let mut bad = 1i64.to_be_bytes().to_vec();
+        bad.push(0xff);
+        assert!(AuditValue::decode(&bad).is_none());
     }
 
     fn sample_job(id: &str) -> Job {

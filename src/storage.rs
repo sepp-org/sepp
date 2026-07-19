@@ -21,11 +21,13 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::{Config, RetryBackoff};
 use crate::keys::{
-    CLOSING_PREFIX, DeadLetterKey, DedupKey, DedupTimerKey, DedupValue, Inflight, JobValue,
-    ReadyKey, TimerKey, closing_key, closing_queue, deadline_of, queue_prefix, read_queue,
+    AUDIT_SEQ_KEY, AuditValue, CLOSING_PREFIX, DeadLetterKey, DedupKey, DedupTimerKey, DedupValue,
+    Inflight, JobValue, ReadyKey, TimerKey, closing_key, closing_queue, deadline_of, queue_prefix,
+    read_queue,
 };
 use crate::metrics::{CycleMetrics, Metrics, QueueDepthSnapshot};
 use crate::op::{Op, PreparedJob};
+use crate::pb::sepp::storage::v1::AuditRecord;
 use crate::pb::sepp::v1::{
     DeadLetterCause, DeadLetterRecord, EnqueueRequest, EnqueueResponse, ExtendRequest, Job,
     JobRejection, NackRequest, Payload, QueueClosing, QueueFull, TraceContext, job_rejection,
@@ -61,6 +63,7 @@ struct Store {
     leases: TxKeyspace,
     dead_letter: TxKeyspace,
     meta: TxKeyspace,
+    audit: TxKeyspace,
     params: StorageParams,
     metrics: Metrics,
 }
@@ -452,6 +455,7 @@ enum OpOutcome {
     DeleteDeadLetters(DeleteOutcome),
     PurgeQueueChunk(PurgeOutcome),
     Sweep(usize),
+    AuditAppend,
 }
 
 // An applied op's outcome parked until the cycle's commit decides whether the
@@ -936,6 +940,10 @@ fn apply_op(
             retention_cutoff_ms,
             dead_letter_enabled,
         )?),
+        Op::AuditAppend { record, now_ms } => {
+            apply_audit_append(store, tx, cycle, &record, now_ms)?;
+            OpOutcome::AuditAppend
+        }
     })
 }
 
@@ -2532,6 +2540,40 @@ fn apply_sweep(
     Ok(processed)
 }
 
+fn apply_audit_append(
+    store: &Store,
+    tx: &mut WriteTransaction<'_>,
+    cycle: &mut Cycle,
+    record: &AuditRecord,
+    now_ms: i64,
+) -> Result<(), Status> {
+    let seq = match tx.get(&store.meta, AUDIT_SEQ_KEY).map_err(stg_err)? {
+        Some(v) => <[u8; 8]>::try_from(v.as_ref())
+            .ok()
+            .and_then(|b| u64::from_be_bytes(b).checked_add(1))
+            .ok_or_else(|| Status::internal("corrupt audit_seq row"))?,
+        None => 1,
+    };
+
+    tx.insert(
+        &store.meta,
+        AUDIT_SEQ_KEY.to_vec(),
+        seq.to_be_bytes().to_vec(),
+    );
+    tx.insert(
+        &store.audit,
+        seq.to_be_bytes().to_vec(),
+        AuditValue {
+            ts_ms: now_ms,
+            record,
+        }
+        .encode(),
+    );
+    cycle.dirty = true;
+
+    Ok(())
+}
+
 // Past this many distinct queue names, `get` prunes notifiers that no Reserve
 // is parked on; otherwise every queue name ever reserved leaks an Arc<Notify>
 // for the process lifetime.
@@ -2621,9 +2663,16 @@ pub struct AdminDeadLetter {
     pub record: DeadLetterRecord,
 }
 
-// Point-get-only view of the database for admin reads off the committer
-// thread. Methods are sync (callers wrap them in spawn_blocking) and peeked
-// keys can vanish between peek and resolve, so misses are silently skipped.
+pub struct AuditEntry {
+    pub seq: u64,
+    pub ts_ms: i64,
+    pub record: AuditRecord,
+}
+
+// Snapshot-read view of the database for admin reads off the committer
+// thread: point gets, plus the bounded audit range. Methods are sync (callers
+// wrap them in spawn_blocking) and peeked keys can vanish between peek and
+// resolve, so misses are silently skipped.
 #[derive(Clone)]
 pub struct ReadHandle {
     db: TxDatabase,
@@ -2633,6 +2682,7 @@ pub struct ReadHandle {
     ready: TxKeyspace,
     scheduled: TxKeyspace,
     dead_letter: TxKeyspace,
+    audit: TxKeyspace,
 }
 
 impl ReadHandle {
@@ -2805,6 +2855,28 @@ impl ReadHandle {
 
         Some(AdminJob { key, state, job })
     }
+
+    // Newest-first page of audit entries, strictly older than `before` when
+    // given. The keyspace is tiny and cold (admin actions only), so a bounded
+    // reverse range does not contend with the committer.
+    pub fn list_audit(&self, before: Option<u64>, limit: usize) -> Vec<AuditEntry> {
+        let snap = self.db.read_tx();
+        let iter = match before {
+            Some(seq) => snap.range(&self.audit, ..seq.to_be_bytes().to_vec()),
+            None => snap.iter(&self.audit),
+        };
+
+        iter.rev()
+            .take(limit)
+            .filter_map(|guard| {
+                let (key, value) = guard.into_inner().ok()?;
+                let seq = u64::from_be_bytes(key.as_ref().try_into().ok()?);
+                let (ts_ms, record) = AuditValue::decode(&value)?;
+
+                Some(AuditEntry { seq, ts_ms, record })
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone)]
@@ -2915,6 +2987,7 @@ impl Storage {
                 hits().with_kv_separation(Some(KvSeparationOptions::default()))
             })?,
             meta,
+            audit: db.keyspace("audit", KeyspaceCreateOptions::default)?,
             db,
             params,
             metrics,
@@ -2927,6 +3000,7 @@ impl Storage {
             ready: store.ready.clone(),
             scheduled: store.scheduled.clone(),
             dead_letter: store.dead_letter.clone(),
+            audit: store.audit.clone(),
         };
         let admin_stats = Arc::new(ArcSwap::from_pointee(AdminSnapshot::default()));
         let indexes = rebuild_indexes(&store)?;
@@ -3293,6 +3367,13 @@ impl Storage {
         let max = max.clamp(1, PURGE_CHUNK_MAX);
         match self.send_op(Op::PurgeQueueChunk { queue, max }).await? {
             OpOutcome::PurgeQueueChunk(outcome) => Ok(outcome),
+            _ => Err(Self::mismatched_outcome()),
+        }
+    }
+
+    pub async fn append_audit(&self, record: AuditRecord) -> Result<(), Status> {
+        match self.send_op(Op::AuditAppend { record, now_ms: 0 }).await? {
+            OpOutcome::AuditAppend => Ok(()),
             _ => Err(Self::mismatched_outcome()),
         }
     }
@@ -3812,6 +3893,7 @@ mod tests {
             leases: db.keyspace("leases", opts).unwrap(),
             dead_letter: db.keyspace("dead_letter", opts).unwrap(),
             meta: db.keyspace("meta", opts).unwrap(),
+            audit: db.keyspace("audit", opts).unwrap(),
             db,
             params: StorageParams {
                 persist_mode: PersistMode::Buffer,
@@ -4045,6 +4127,64 @@ mod tests {
             !cycle.dirty,
             "opening a queue that isn't closing is a no-op"
         );
+    }
+
+    fn audit_record(action: &str) -> AuditRecord {
+        AuditRecord {
+            actor: "root".into(),
+            role: "admin".into(),
+            action: action.into(),
+            details_json: "{}".into(),
+        }
+    }
+
+    #[test]
+    fn audit_appends_read_back_newest_first_with_cursor() {
+        let store = open_test_store();
+
+        let mut tx = store.db.write_tx();
+        let mut cycle = Cycle::new(false);
+        apply_audit_append(&store, &mut tx, &mut cycle, &audit_record("a.one"), 1_000)
+            .expect("applies");
+        apply_audit_append(&store, &mut tx, &mut cycle, &audit_record("a.two"), 1_000)
+            .expect("applies");
+        assert!(cycle.dirty);
+        tx.commit().expect("commit");
+
+        // A later cycle continues from the persisted counter.
+        let mut tx = store.db.write_tx();
+        let mut cycle = Cycle::new(false);
+        apply_audit_append(&store, &mut tx, &mut cycle, &audit_record("a.three"), 2_000)
+            .expect("applies");
+        tx.commit().expect("commit");
+
+        let read = ReadHandle {
+            db: store.db.clone(),
+            jobs: store.jobs.clone(),
+            payloads: store.payloads.clone(),
+            inflight: store.inflight.clone(),
+            ready: store.ready.clone(),
+            scheduled: store.scheduled.clone(),
+            dead_letter: store.dead_letter.clone(),
+            audit: store.audit.clone(),
+        };
+
+        let brief = |page: Vec<AuditEntry>| {
+            page.into_iter()
+                .map(|e| (e.seq, e.ts_ms, e.record.action))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            brief(read.list_audit(None, 2)),
+            vec![(3, 2_000, "a.three".into()), (2, 1_000, "a.two".into())]
+        );
+        assert_eq!(
+            brief(read.list_audit(Some(2), 10)),
+            vec![(1, 1_000, "a.one".into())],
+            "the cursor page excludes the cursor itself"
+        );
+        assert!(read.list_audit(Some(1), 10).is_empty());
     }
 
     #[test]

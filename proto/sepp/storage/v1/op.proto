@@ -151,6 +151,20 @@ message SweepOp {
   bool dead_letter_enabled = 4;
 }
 
+message AuditRecord {
+  string actor = 1;
+  string role = 2;
+  string action = 3;
+
+  // Action-specific fields as a JSON object.
+  string details_json = 4;
+}
+
+message AuditAppendOp {
+  AuditRecord record = 1;
+  int64 now_ms = 2;
+}
+
 // One mutating committer operation. Exactly one field is set.
 message Op {
   oneof op {
@@ -168,5 +182,6 @@ message Op {
     DeleteDeadLettersOp delete_dead_letters = 12;
     PurgeQueueChunkOp purge_queue_chunk = 13;
     SweepOp sweep = 14;
+    AuditAppendOp audit_append = 15;
   }
 }

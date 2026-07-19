@@ -1,7 +1,7 @@
 use tonic::Status;
 use uuid::Uuid;
 
-use crate::pb::sepp::storage::v1 as proto;
+use crate::pb::sepp::storage::v1::{self as proto, AuditRecord};
 use crate::pb::sepp::v1::{EnqueueRequest, ExtendRequest, NackRequest};
 use crate::queues::QueueRegistry;
 use crate::storage::PeekState;
@@ -81,6 +81,10 @@ pub enum Op {
         retention_cutoff_ms: Option<i64>,
         dead_letter_enabled: bool,
     },
+    AuditAppend {
+        record: AuditRecord,
+        now_ms: i64,
+    },
 }
 
 impl Op {
@@ -98,7 +102,8 @@ impl Op {
             | Op::CloseQueue { now_ms, .. }
             | Op::RequeueDeadLetters { now_ms, .. }
             | Op::DeadLetterJobs { now_ms, .. }
-            | Op::Sweep { now_ms, .. } => *now_ms = now,
+            | Op::Sweep { now_ms, .. }
+            | Op::AuditAppend { now_ms, .. } => *now_ms = now,
             Op::Ack { .. }
             | Op::DrainDeadLetters { .. }
             | Op::OpenQueue { .. }
@@ -320,6 +325,10 @@ impl Op {
                 retention_cutoff_ms: *retention_cutoff_ms,
                 dead_letter_enabled: *dead_letter_enabled,
             }),
+            Op::AuditAppend { record, now_ms } => P::AuditAppend(proto::AuditAppendOp {
+                record: Some(record.clone()),
+                now_ms: *now_ms,
+            }),
         };
 
         proto::Op { op: Some(op) }
@@ -400,6 +409,12 @@ impl Op {
                 budget: o.budget as usize,
                 retention_cutoff_ms: o.retention_cutoff_ms,
                 dead_letter_enabled: o.dead_letter_enabled,
+            },
+            P::AuditAppend(o) => Op::AuditAppend {
+                record: o
+                    .record
+                    .ok_or_else(|| corrupt("audit append without record"))?,
+                now_ms: o.now_ms,
             },
         })
     }
@@ -550,6 +565,15 @@ mod tests {
                 retention_cutoff_ms: Some(NOW - 86_400_000),
                 dead_letter_enabled: true,
             },
+            Op::AuditAppend {
+                record: AuditRecord {
+                    actor: "root".into(),
+                    role: "admin".into(),
+                    action: "config.edit".into(),
+                    details_json: r#"{"path":"limits.default_priority"}"#.into(),
+                },
+                now_ms: NOW,
+            },
         ]
     }
 
@@ -595,6 +619,7 @@ mod tests {
             "620c0a066f726465727312026b31",
             "6a0b0a066f726465727310e807",
             "72130880d095ffbc3110e807188098fcd5bc312001",
+            "7a470a3e0a04726f6f74120561646d696e1a0b636f6e6669672e6564697422227b2270617468223a226c696d6974732e64656661756c745f7072696f72697479227d1080d095ffbc31",
         ];
 
         let ops = sample_ops();
@@ -651,5 +676,13 @@ mod tests {
             })),
         };
         assert!(Op::from_proto(unknown_state).is_err());
+
+        let no_record = proto::Op {
+            op: Some(proto::op::Op::AuditAppend(proto::AuditAppendOp {
+                record: None,
+                now_ms: NOW,
+            })),
+        };
+        assert!(Op::from_proto(no_record).is_err());
     }
 }

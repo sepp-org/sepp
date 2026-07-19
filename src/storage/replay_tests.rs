@@ -76,6 +76,7 @@ impl Harness {
             leases: db.keyspace("leases", opts).unwrap(),
             dead_letter: db.keyspace("dead_letter", opts).unwrap(),
             meta: db.keyspace("meta", opts).unwrap(),
+            audit: db.keyspace("audit", opts).unwrap(),
             db,
             params,
             metrics: Metrics::new(false),
@@ -127,7 +128,7 @@ fn dbg_outcome(outcome: Result<OpOutcome, Status>) -> String {
 }
 
 fn logical_contents(store: &Store) -> BTreeMap<&'static str, BTreeMap<Vec<u8>, Vec<u8>>> {
-    let keyspaces: [(&'static str, &TxKeyspace); 10] = [
+    let keyspaces: [(&'static str, &TxKeyspace); 11] = [
         ("jobs", &store.jobs),
         ("payloads", &store.payloads),
         ("inflight", &store.inflight),
@@ -138,6 +139,7 @@ fn logical_contents(store: &Store) -> BTreeMap<&'static str, BTreeMap<Vec<u8>, V
         ("leases", &store.leases),
         ("dead_letter", &store.dead_letter),
         ("meta", &store.meta),
+        ("audit", &store.audit),
     ];
 
     let snap = store.db.read_tx();
@@ -485,6 +487,26 @@ fn recorded_stream_replays_identically() {
             retention_cutoff_ms: Some(t - 54_100),
             dead_letter_enabled: true,
         },
+        // Two in a row so the replayed seq allocation is exercised, not just
+        // the first-row default.
+        Op::AuditAppend {
+            record: op_proto::AuditRecord {
+                actor: "root".into(),
+                role: "admin".into(),
+                action: "queue.open".into(),
+                details_json: r#"{"queue":"alpha"}"#.into(),
+            },
+            now_ms: t + 9_000,
+        },
+        Op::AuditAppend {
+            record: op_proto::AuditRecord {
+                actor: "ops-bot".into(),
+                role: "operator".into(),
+                action: "dead_letter.requeue".into(),
+                details_json: r#"{"queue":"gamma","count":1}"#.into(),
+            },
+            now_ms: t + 9_100,
+        },
     ];
 
     let outcomes: Vec<String> = ops.iter().map(|op| dbg_outcome(source.apply(op))).collect();
@@ -636,10 +658,19 @@ fn random_op(
             queue: rng.queue(),
             max: 1 + rng.below(5) as usize,
         },
-        _ => Op::DrainDeadLetters {
+        98 => Op::DrainDeadLetters {
             queue: rng.chance(50).then(|| rng.queue()),
             max: 1 + rng.below(3) as usize,
             scan_cap: 100,
+        },
+        _ => Op::AuditAppend {
+            record: op_proto::AuditRecord {
+                actor: format!("op-{}", rng.below(3)),
+                role: "operator".into(),
+                action: "random.action".into(),
+                details_json: format!(r#"{{"n":{}}}"#, rng.below(1_000)),
+            },
+            now_ms: now,
         },
     }
 }
