@@ -319,7 +319,10 @@ mod tests {
     #[test]
     fn auth_changes_are_never_restart_only() {
         let mut new = Config::default();
-        new.auth.api_keys = Some(vec!["k".into()]);
+        new.auth.api_keys = Some(vec![crate::config::ApiKeyEntry {
+            name: "w".into(),
+            key: "k".into(),
+        }]);
         assert!(restart_only_changes(&Config::default(), &new).is_empty());
     }
 
@@ -334,7 +337,7 @@ mod tests {
         std::fs::write(
             &path,
             "[server]\nstrict_queues = true\n\n\
-             [auth]\napi_keys = [\"secret\"]\n\n\
+             [auth]\napi_keys = [{ name = \"w\", key = \"secret\" }]\n\n\
              [[queues]]\nname = \"emails\"\nmax_payload_bytes = 4321\n",
         )
         .unwrap();
@@ -363,7 +366,12 @@ mod tests {
         assert!(state.config.load().server.strict_queues);
         assert_eq!(
             state.config.load().auth.api_keys.as_deref(),
-            Some(&["secret".to_string()][..])
+            Some(
+                &[crate::config::ApiKeyEntry {
+                    name: "w".into(),
+                    key: "secret".into(),
+                }][..]
+            )
         );
 
         std::fs::remove_dir_all(&dir).ok();

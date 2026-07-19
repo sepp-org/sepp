@@ -5,6 +5,8 @@ use tonic::service::Interceptor;
 use tonic::{Request, Status};
 use tracing::warn;
 
+use crate::config::ApiKeyEntry;
+
 #[derive(Clone)]
 pub struct ApiKeyInterceptor {
     // None = auth disabled, allow all. Some(set) = only those keys pass;
@@ -13,13 +15,13 @@ pub struct ApiKeyInterceptor {
 }
 
 impl ApiKeyInterceptor {
-    pub fn new(api_keys: &Option<Vec<String>>) -> Self {
+    pub fn new(api_keys: &Option<Vec<ApiKeyEntry>>) -> Self {
         Self {
             policy: Arc::new(RwLock::new(to_policy(api_keys.clone()))),
         }
     }
 
-    pub fn set_keys(&self, api_keys: Option<Vec<String>>) {
+    pub fn set_keys(&self, api_keys: Option<Vec<ApiKeyEntry>>) {
         *self.policy.write().expect("api-key policy lock") = to_policy(api_keys);
     }
 
@@ -28,8 +30,8 @@ impl ApiKeyInterceptor {
     }
 }
 
-fn to_policy(api_keys: Option<Vec<String>>) -> Option<HashSet<String>> {
-    api_keys.map(|keys| keys.into_iter().collect())
+fn to_policy(api_keys: Option<Vec<ApiKeyEntry>>) -> Option<HashSet<String>> {
+    api_keys.map(|keys| keys.into_iter().map(|k| k.key).collect())
 }
 
 impl Interceptor for ApiKeyInterceptor {
@@ -74,6 +76,18 @@ mod tests {
         req
     }
 
+    fn keys(entries: &[(&str, &str)]) -> Option<Vec<ApiKeyEntry>> {
+        Some(
+            entries
+                .iter()
+                .map(|(name, key)| ApiKeyEntry {
+                    name: (*name).into(),
+                    key: (*key).into(),
+                })
+                .collect(),
+        )
+    }
+
     #[test]
     fn absent_list_allows_everything() {
         let mut interceptor = ApiKeyInterceptor::new(&None);
@@ -95,7 +109,7 @@ mod tests {
 
     #[test]
     fn non_empty_list_admits_only_listed_keys() {
-        let mut interceptor = ApiKeyInterceptor::new(&Some(vec!["good".to_string()]));
+        let mut interceptor = ApiKeyInterceptor::new(&keys(&[("worker", "good")]));
         assert!(interceptor.call(request_with(Some("Bearer good"))).is_ok());
         assert!(interceptor.call(request_with(Some("Bearer bad"))).is_err());
         assert!(interceptor.call(request_with(Some("good"))).is_err()); // no scheme
@@ -104,13 +118,13 @@ mod tests {
 
     #[test]
     fn keys_can_be_replaced_at_runtime() {
-        let interceptor = ApiKeyInterceptor::new(&Some(vec!["old".to_string()]));
+        let interceptor = ApiKeyInterceptor::new(&keys(&[("worker", "old")]));
         // A separate clone stands in for the copy tonic hands each request.
         let mut handle = interceptor.clone();
         assert!(handle.call(request_with(Some("Bearer old"))).is_ok());
 
         // An update through one handle is visible to the other clone.
-        interceptor.set_keys(Some(vec!["new".to_string()]));
+        interceptor.set_keys(keys(&[("worker", "new")]));
         assert!(handle.call(request_with(Some("Bearer old"))).is_err());
         assert!(handle.call(request_with(Some("Bearer new"))).is_ok());
 

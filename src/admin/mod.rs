@@ -14,7 +14,7 @@ use std::sync::{Arc, RwLock};
 
 use arc_swap::ArcSwap;
 use axum::Router;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum_server::tls_rustls::RustlsConfig;
 use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
@@ -235,6 +235,14 @@ fn router(state: Arc<AdminState>) -> Router {
         .route(
             "/admin/api/v1/config",
             get(routes::get_config).put(routes::put_config),
+        )
+        .route(
+            "/admin/api/v1/auth/keys",
+            post(routes::add_auth_key).delete(routes::disable_auth),
+        )
+        .route(
+            "/admin/api/v1/auth/keys/{name}",
+            delete(routes::delete_auth_key),
         )
         .route("/admin/api/v1/server-info", get(routes::server_info))
         .route("/admin/api/v1/events", get(stats::events))

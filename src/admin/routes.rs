@@ -877,13 +877,17 @@ pub(super) async fn delete_dead_letters(
 // ---------------------------------------------------------------------------
 // Config
 
-// Key material never leaves the server: worker API keys collapse to a count,
-// admin keys to their names and roles. Writes still go through put_config, so
-// keys are managed by editing the file (or env), not round-tripped via the UI.
+// Key material never leaves the server: worker API keys collapse to their
+// names, admin keys to names and roles. Worker keys are written through the
+// dedicated /auth/keys endpoints, admin keys only by editing the file.
 fn redact_config(mut v: Value) -> Value {
     if let Some(api_keys) = v.pointer_mut("/auth/api_keys") {
         *api_keys = match api_keys.as_array() {
-            Some(keys) => json!({ "count": keys.len() }),
+            Some(keys) => Value::Array(
+                keys.iter()
+                    .map(|k| json!({ "name": k.get("name").cloned().unwrap_or(Value::Null) }))
+                    .collect(),
+            ),
             None => Value::Null,
         };
     }
@@ -907,9 +911,13 @@ fn redact_config(mut v: Value) -> Value {
 
 fn env_pinned() -> Vec<String> {
     let mut paths: Vec<String> = std::env::vars()
-        .filter(|(k, _)| k != "SEPP_CONFIG")
+        .filter(|(k, _)| !k.eq_ignore_ascii_case("SEPP_CONFIG"))
         .filter_map(|(k, _)| {
-            k.strip_prefix("SEPP_")
+            // figment matches the SEPP_ prefix case-insensitively, so a
+            // mis-cased variable still pins its field; mirror that here or
+            // the pin guards pass.
+            k.to_uppercase()
+                .strip_prefix("SEPP_")
                 .map(|rest| rest.to_lowercase().replace("__", "."))
         })
         .collect();
@@ -934,11 +942,14 @@ fn check_etag(current: &str, presented: &str) -> Result<(), ApiError> {
 }
 
 fn parse_doc(current: &str) -> Result<DocumentMut, ApiError> {
-    current.parse().map_err(|e| {
+    current.parse().map_err(|e: toml_edit::TomlError| {
+        // The Display impl echoes the offending source line, which on or near
+        // the key lists would put key material in the response body; the
+        // message alone stays clean.
         ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "invalid",
-            format!("config file is not valid TOML: {e}"),
+            format!("config file is not valid TOML: {}", e.message()),
         )
     })
 }
@@ -956,15 +967,19 @@ async fn validate_and_write(
     let requires_restart = config_watch::restart_only_changes(&running, &candidate);
 
     let mut rx = state.reload_seq.clone();
-    let pre = *rx.borrow_and_update();
+    rx.mark_unchanged();
     config_edit::write_atomic(&state.config_path, &candidate_text)
         .map_err(|e| ApiError::internal(format!("writing config file: {e}")))?;
 
-    // Bumped even for failed or no-op reloads, so this only times out when no
-    // watcher is running (e.g. the file did not exist at startup).
+    // A seq bump alone is not proof: a cycle already in flight can have read
+    // the file before this write yet bump after it. Only the running config
+    // matching the candidate shows this write applied; the watcher bumps once
+    // per cycle (no-op reloads included), so the loop re-checks until it
+    // matches or times out (e.g. no watcher because the file did not exist at
+    // startup).
     let applied = tokio::time::timeout(RELOAD_WAIT, async move {
         loop {
-            if *rx.borrow_and_update() > pre {
+            if **state.config.load() == candidate {
                 return true;
             }
             if rx.changed().await.is_err() {
@@ -1041,6 +1056,23 @@ pub(super) async fn put_config(
         ));
     }
 
+    // Worker keys go through the /auth/keys endpoints, which can only add or
+    // revoke named entries; a raw path edit could null the list and hot-disable
+    // gRPC auth.
+    if let Some(change) = body
+        .changes
+        .iter()
+        .find(|c| c.path == "auth.api_keys" || c.path.starts_with("auth.api_keys."))
+    {
+        return Err(ApiError::bad_request(
+            "api_keys_immutable",
+            format!(
+                "{} can only be changed through the API key endpoints",
+                change.path
+            ),
+        ));
+    }
+
     let pinned = env_pinned();
     if let Some(change) = body.changes.iter().find(|c| pinned.contains(&c.path)) {
         return Err(ApiError::bad_request(
@@ -1068,15 +1100,203 @@ pub(super) async fn put_config(
     })))
 }
 
+// ---------------------------------------------------------------------------
+// Worker API keys
+//
+// Write-only: the key is generated client-side, stored in sepp.toml, and only
+// its name is ever reported back (see redact_config).
+
+fn reject_env_pinned_api_keys() -> Result<(), ApiError> {
+    if env_pinned().iter().any(|p| p == "auth.api_keys") {
+        return Err(ApiError::bad_request(
+            "env_pinned",
+            "auth.api_keys is pinned by an environment variable",
+        ));
+    }
+    Ok(())
+}
+
+fn parse_entries(current: &str) -> Result<Vec<crate::config::ApiKeyEntry>, ApiError> {
+    Ok(Config::from_toml_str(current)
+        .map_err(|e| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "invalid", e.to_string()))?
+        .auth
+        .api_keys
+        .unwrap_or_default())
+}
+
+#[derive(Deserialize)]
+pub struct AddAuthKeyBody {
+    etag: String,
+    name: String,
+    key: String,
+}
+
+pub(super) async fn add_auth_key(
+    RequireAdmin(ctx): RequireAdmin,
+    State(state): State<Arc<AdminState>>,
+    Json(body): Json<AddAuthKeyBody>,
+) -> ApiResult<Json<Value>> {
+    if body.name.is_empty() || body.key.is_empty() {
+        return Err(ApiError::bad_request(
+            "invalid_argument",
+            "name and key must not be empty",
+        ));
+    }
+    // "." and ".." vanish under URL normalization before the revoke route
+    // could ever match them, so a key with either name could not be revoked.
+    if body.name == "."
+        || body.name == ".."
+        || body.name.contains('/')
+        || body.name.chars().any(char::is_control)
+    {
+        return Err(ApiError::bad_request(
+            "invalid_argument",
+            "name must not be \".\" or \"..\" or contain '/' or control characters",
+        ));
+    }
+    if !body.key.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
+        return Err(ApiError::bad_request(
+            "invalid_argument",
+            "key must be visible ASCII",
+        ));
+    }
+    reject_env_pinned_api_keys()?;
+
+    let _guard = state.config_write_lock.lock().await;
+    let current = read_config_file(&state)?;
+    check_etag(&current, &body.etag)?;
+    let mut doc = parse_doc(&current)?;
+
+    let mut entries = parse_entries(&current)?;
+    if entries.iter().any(|e| e.name == body.name) {
+        return Err(ApiError::bad_request(
+            "invalid_change",
+            format!("an API key named {:?} already exists", body.name),
+        ));
+    }
+    // Config validation also rejects this, but as a 422 on the whole
+    // candidate file; catching it here keeps sibling failures of one request
+    // on the same 400 path.
+    if entries.iter().any(|e| e.key == body.key) {
+        return Err(ApiError::bad_request(
+            "invalid_change",
+            "another API key already uses this key",
+        ));
+    }
+    entries.push(crate::config::ApiKeyEntry {
+        name: body.name.clone(),
+        key: body.key.clone(),
+    });
+    config_edit::set_api_keys(&mut doc, &entries)
+        .map_err(|e| ApiError::bad_request("invalid_change", e))?;
+
+    let (applied, requires_restart, etag) = validate_and_write(&state, doc).await?;
+    audit(&ctx, "auth_key.add", json!({ "name": body.name }));
+    Ok(Json(json!({
+        "applied": applied,
+        "requires_restart": requires_restart,
+        "etag": etag,
+    })))
+}
+
+pub(super) async fn delete_auth_key(
+    RequireAdmin(ctx): RequireAdmin,
+    State(state): State<Arc<AdminState>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    let presented = headers
+        .get(header::IF_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            ApiError::bad_request(
+                "if_match_required",
+                "If-Match header with the config etag is required",
+            )
+        })?;
+    reject_env_pinned_api_keys()?;
+
+    let _guard = state.config_write_lock.lock().await;
+    let current = read_config_file(&state)?;
+    check_etag(&current, &presented)?;
+    let mut doc = parse_doc(&current)?;
+
+    let mut entries = parse_entries(&current)?;
+    let before = entries.len();
+    entries.retain(|e| e.name != name);
+    if entries.len() == before {
+        return Err(ApiError::not_found(format!("no API key named {name:?}")));
+    }
+    // The emptied list stays as [] (deny-all): revoking the last key must not
+    // silently turn auth off (an absent list allows everyone).
+    config_edit::set_api_keys(&mut doc, &entries)
+        .map_err(|e| ApiError::bad_request("invalid_change", e))?;
+
+    let (applied, requires_restart, etag) = validate_and_write(&state, doc).await?;
+    audit(&ctx, "auth_key.revoke", json!({ "name": name }));
+    Ok(Json(json!({
+        "applied": applied,
+        "requires_restart": requires_restart,
+        "etag": etag,
+    })))
+}
+
+// Turns gRPC auth off by deleting the whole list.
+// Only accessible via this endpoint.
+pub(super) async fn disable_auth(
+    RequireAdmin(ctx): RequireAdmin,
+    State(state): State<Arc<AdminState>>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    let presented = headers
+        .get(header::IF_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            ApiError::bad_request(
+                "if_match_required",
+                "If-Match header with the config etag is required",
+            )
+        })?;
+    reject_env_pinned_api_keys()?;
+
+    let _guard = state.config_write_lock.lock().await;
+    let current = read_config_file(&state)?;
+    check_etag(&current, &presented)?;
+
+    let mut doc = parse_doc(&current)?;
+    if !config_edit::remove_api_keys(&mut doc) {
+        return Err(ApiError::not_found("gRPC auth is already off"));
+    }
+
+    let (applied, requires_restart, etag) = validate_and_write(&state, doc).await?;
+    audit(&ctx, "auth.disable", json!({}));
+    Ok(Json(json!({
+        "applied": applied,
+        "requires_restart": requires_restart,
+        "etag": etag,
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AdminKey, Role};
+    use crate::config::{AdminKey, ApiKeyEntry, Role};
 
     #[test]
     fn redaction_hides_worker_keys_and_admin_key_material() {
         let mut cfg = Config::default();
-        cfg.auth.api_keys = Some(vec!["secret-a".into(), "secret-b".into()]);
+        cfg.auth.api_keys = Some(vec![
+            ApiKeyEntry {
+                name: "pool-1".into(),
+                key: "secret-a".into(),
+            },
+            ApiKeyEntry {
+                name: "pool-2".into(),
+                key: "secret-b".into(),
+            },
+        ]);
         cfg.admin.keys = Some(vec![AdminKey {
             name: "ops".into(),
             key: "hunter2".into(),
@@ -1084,7 +1304,10 @@ mod tests {
         }]);
 
         let v = redact_config(serde_json::to_value(&cfg).unwrap());
-        assert_eq!(v["auth"]["api_keys"], json!({ "count": 2 }));
+        assert_eq!(
+            v["auth"]["api_keys"],
+            json!([{ "name": "pool-1" }, { "name": "pool-2" }])
+        );
         assert_eq!(
             v["admin"]["keys"],
             json!([{ "name": "ops", "role": "operator" }])

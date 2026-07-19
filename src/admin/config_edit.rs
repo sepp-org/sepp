@@ -2,7 +2,9 @@ use std::path::Path;
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use toml_edit::{Array, ArrayOfTables, DocumentMut, Item, Table};
+use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table};
+
+use crate::config::ApiKeyEntry;
 
 // Fields a [[queues]] entry may carry besides its name.
 const QUEUE_FIELDS: &[&str] = &[
@@ -179,6 +181,46 @@ pub(super) fn upsert_queue_field(
     Ok(())
 }
 
+pub(super) fn set_api_keys(doc: &mut DocumentMut, entries: &[ApiKeyEntry]) -> Result<(), String> {
+    let auth = doc
+        .entry("auth")
+        .or_insert(Item::Table(Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| "auth is not a table".to_string())?;
+
+    let mut arr = Array::new();
+    for e in entries {
+        let mut entry = InlineTable::new();
+        entry.insert("name", e.name.as_str().into());
+        entry.insert("key", e.key.as_str().into());
+        arr.push(entry);
+    }
+    if !entries.is_empty() {
+        for item in arr.iter_mut() {
+            item.decor_mut().set_prefix("\n  ");
+        }
+        arr.set_trailing("\n");
+        arr.set_trailing_comma(true);
+    }
+
+    auth.remove("api_keys");
+    auth["api_keys"] = Item::Value(arr.into());
+    Ok(())
+}
+
+// Deletes the whole api_keys list, turning gRPC auth off (absent = allow
+// all). Only the explicit disable-auth endpoint uses this
+pub(super) fn remove_api_keys(doc: &mut DocumentMut) -> bool {
+    let Some(auth) = doc.get_mut("auth").and_then(Item::as_table_mut) else {
+        return false;
+    };
+    let removed = auth.remove("api_keys").is_some();
+    if auth.is_empty() {
+        doc.remove("auth");
+    }
+    removed
+}
+
 pub(super) fn remove_queue(doc: &mut DocumentMut, name: &str) -> bool {
     let Some(arr) = doc.get_mut("queues").and_then(Item::as_array_of_tables_mut) else {
         return false;
@@ -254,6 +296,75 @@ mod tests {
         let out = d.to_string();
         assert!(!out.contains("emails"));
         assert!(out.contains("other"), "unrelated entries survive");
+    }
+
+    fn entries(pairs: &[(&str, &str)]) -> Vec<ApiKeyEntry> {
+        pairs
+            .iter()
+            .map(|(name, key)| ApiKeyEntry {
+                name: (*name).into(),
+                key: (*key).into(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn set_api_keys_writes_one_entry_per_line_and_preserves_surroundings() {
+        let mut d = doc("# top comment\n[auth]\n# keep me\n");
+        set_api_keys(&mut d, &entries(&[("pool", "s1"), ("producers", "s2")])).unwrap();
+        let out = d.to_string();
+        assert!(out.contains("# top comment"));
+        assert!(out.contains("# keep me"));
+        assert!(out.contains(
+            "api_keys = [\n  { name = \"pool\", key = \"s1\" },\n  { name = \"producers\", key = \"s2\" },\n]"
+        ));
+
+        set_api_keys(&mut d, &entries(&[("producers", "s2")])).unwrap();
+        let out = d.to_string();
+        assert!(!out.contains("pool"));
+        assert!(out.contains("producers"));
+
+        // An empty list renders as [] (deny-all), never as a removed key,
+        // which would silently disable auth.
+        set_api_keys(&mut d, &[]).unwrap();
+        assert!(d.to_string().contains("api_keys = []"));
+    }
+
+    #[test]
+    fn set_api_keys_creates_the_section_and_replaces_the_array_of_tables_form() {
+        let mut d = doc("");
+        set_api_keys(&mut d, &entries(&[("pool", "s1")])).unwrap();
+        assert!(d.to_string().contains("[auth]"));
+
+        // serde accepts [[auth.api_keys]] sections as the same list, so a
+        // server booted from that form must still be manageable.
+        let mut d = doc("[[auth.api_keys]]\nname = \"pool\"\nkey = \"s1\"\n\n\
+             [[auth.api_keys]]\nname = \"producers\"\nkey = \"s2\"\n");
+        set_api_keys(&mut d, &entries(&[("producers", "s2"), ("extra", "s3")])).unwrap();
+        let out = d.to_string();
+        assert!(
+            out.contains(
+                "api_keys = [\n  { name = \"producers\", key = \"s2\" },\n  { name = \"extra\", key = \"s3\" },\n]"
+            ),
+            "actual output:\n{out}"
+        );
+        assert!(!out.contains("[[auth.api_keys]]"));
+    }
+
+    #[test]
+    fn remove_api_keys_deletes_the_list_and_an_emptied_section() {
+        let mut d = doc(
+            "[auth]\napi_keys = [{ name = \"pool\", key = \"s1\" }]\n\n[limits]\ndefault_priority = 3\n",
+        );
+        assert!(remove_api_keys(&mut d));
+        assert!(!remove_api_keys(&mut d), "already off");
+        let out = d.to_string();
+        assert!(!out.contains("api_keys"));
+        assert!(!out.contains("[auth]"), "emptied section is dropped");
+        assert!(
+            out.contains("default_priority = 3"),
+            "other sections survive"
+        );
     }
 
     #[test]

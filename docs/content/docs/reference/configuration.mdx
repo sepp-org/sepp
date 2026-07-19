@@ -62,7 +62,7 @@ gRPC API key authentication for clients (producers and workers).
 
 | Key | Type | Default | Hot-reload | Description |
 | --- | --- | --- | --- | --- |
-| `api_keys` | optional array of strings | none | yes | gRPC API keys. `None` (or omitted) allows all connections. `[]` denies all. `["k1", "k2"]` allows only those keys. |
+| `api_keys` | optional array of `{ name, key }` tables | none | yes | Named gRPC API keys. Omitted allows all connections, `[]` denies all, otherwise only the listed keys are accepted. The name labels the client in the admin UI; only the key is secret. Names must be unique and so must keys. |
 
 <Callout type="info" title="gRPC vs admin auth">
 `[auth]` keys protect the gRPC endpoint used by SDKs. `[admin]` keys protect the web UI. They are entirely separate; you can have one, both, or neither. See [Authentication & TLS](/docs/operations/security) for the full picture.
@@ -218,12 +218,11 @@ The prefix `SEPP_` is stripped and the `__` (double underscore) separates the TO
 | --- | --- |
 | `SEPP_SERVER__LISTEN_ADDR=0.0.0.0:6000` | `server.listen_addr` |
 | `SEPP_SERVER__STRICT_QUEUES=true` | `server.strict_queues` |
-| `SEPP_AUTH__API_KEYS` | `auth.api_keys` |
 | `SEPP_STORAGE__PERSIST_MODE=buffer` | `storage.persist_mode` |
 | `SEPP_METRICS__PROMETHEUS_LISTEN_ADDR=127.0.0.1:9464` | `metrics.prometheus_listen_addr` |
 | `SEPP_ADMIN__SESSION_TTL_MS=86400000` | `admin.session_ttl_ms` |
 
-Structured values like `[[queues]]` array entries and `[admin] keys` (arrays of tables) cannot be set through environment variables. Keep those in the `sepp.toml` file.
+Keep structured values like `[[queues]]` entries, `[auth] api_keys` and `[admin] keys` in the `sepp.toml` file. The env syntax can technically express them (`SEPP_AUTH__API_KEYS='[{name="w",key="..."}]'`) but this is unsupported. An env-supplied `auth.api_keys` also pins the list, so the admin UI's key management rejects every change with `env_pinned`.
 
 The environment variable `SEPP_CONFIG` is reserved: it sets the path to the config file itself, not a config key. Fields pinned by environment variables override any file value and are shown as locked in the admin UI editor.
 
@@ -240,6 +239,7 @@ The following rules are checked when the config is loaded and on every hot-reloa
 | `max_queue_name_bytes` must be between `1` and `65535`. | `[limits]` |
 | Queue names must be valid (no empty, `"."`, `".."`, `/`, or control characters) and unique. | `[[queues]]` |
 | Queue names must not exceed `limits.max_queue_name_bytes`. | `[[queues]]` |
+| `api_keys` entries must have non-empty, unique names and non-empty, unique secrets. | `[auth]` |
 | Admin UI on a non-loopback address requires `keys` to be set. | `[admin]` |
 | Admin `keys` entries must have non-empty, unique names and non-empty, unique secrets. | `[admin]` |
 | `session_ttl_ms` must be between `60000` and `31536000000`. | `[admin]` |

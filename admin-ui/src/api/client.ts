@@ -127,6 +127,14 @@ export const api = {
 
   config: () => request<ConfigResponse>('GET', '/config'),
   updateConfig: (body: ConfigUpdateRequest) => request<ConfigWriteResult>('PUT', '/config', body),
+  addAuthKey: (body: { etag: string; name: string; key: string }) =>
+    request<ConfigWriteResult>('POST', '/auth/keys', body),
+  deleteAuthKey: (name: string, etag: string) =>
+    request<ConfigWriteResult>('DELETE', `/auth/keys/${seg(name)}`, undefined, {
+      'If-Match': etag,
+    }),
+  disableAuth: (etag: string) =>
+    request<ConfigWriteResult>('DELETE', '/auth/keys', undefined, { 'If-Match': etag }),
 
   session: () => request<SessionInfo>('GET', '/session'),
   login: (name: string, key: string) =>

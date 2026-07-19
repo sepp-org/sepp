@@ -194,10 +194,9 @@ impl EffectiveLimits {
         }
 
         if self.retry_delay_ms > self.retry_delay_max_ms {
-            return Err(format!(
-                "{scope}.retry_delay_ms: must not exceed retry_delay_max_ms"
-            )
-            .into());
+            return Err(
+                format!("{scope}.retry_delay_ms: must not exceed retry_delay_max_ms").into(),
+            );
         }
 
         Ok(())
@@ -207,8 +206,19 @@ impl EffectiveLimits {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Validate)]
 #[serde(default)]
 pub struct AuthConfig {
-    #[garde(inner(inner(length(min = 1))))]
-    pub api_keys: Option<Vec<String>>,
+    // None = auth disabled; Some(vec![]) = deny all. Validated in
+    // Config::validate alongside admin.keys.
+    #[garde(skip)]
+    pub api_keys: Option<Vec<ApiKeyEntry>>,
+}
+
+// A named gRPC API key. The name labels the client (worker pool, producer)
+// in the admin UI and audit trail; only the key is the secret.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApiKeyEntry {
+    pub name: String,
+    pub key: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Validate)]
@@ -582,6 +592,30 @@ impl Config {
                 }
             }
         }
+        if let Some(keys) = &self.auth.api_keys {
+            let mut names: HashSet<&str> = HashSet::new();
+            let mut secrets: HashSet<&str> = HashSet::new();
+            for k in keys {
+                if k.name.is_empty() {
+                    return Err("auth.api_keys[].name must not be empty".into());
+                }
+                if k.key.is_empty() {
+                    return Err(format!("API key {:?} has an empty key", k.name).into());
+                }
+                if !k.key.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
+                    return Err(format!("API key {:?} must be visible ASCII", k.name).into());
+                }
+                if !names.insert(&k.name) {
+                    return Err(format!("auth.api_keys has a duplicate name {:?}", k.name).into());
+                }
+                if !secrets.insert(&k.key) {
+                    return Err(
+                        format!("API keys {:?} and another share the same key", k.name).into(),
+                    );
+                }
+            }
+        }
+
         // One year keeps expiry arithmetic far from overflow; one minute keeps
         // a typo'd TTL from instantly expiring every session.
         if !(60_000..=31_536_000_000).contains(&self.admin.session_ttl_ms) {
@@ -908,6 +942,42 @@ mod tests {
 
         cfg.admin.keys = Some(vec![key("ops", "a"), key("dev", "b")]);
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn api_keys_must_be_well_formed() {
+        let key = |name: &str, key: &str| ApiKeyEntry {
+            name: name.into(),
+            key: key.into(),
+        };
+
+        let mut cfg = Config::default();
+        cfg.auth.api_keys = Some(vec![key("pool", "a"), key("pool", "b")]);
+        assert!(cfg.validate().is_err(), "duplicate names are rejected");
+
+        cfg.auth.api_keys = Some(vec![key("", "a")]);
+        assert!(cfg.validate().is_err(), "empty names are rejected");
+
+        cfg.auth.api_keys = Some(vec![key("pool", "")]);
+        assert!(cfg.validate().is_err(), "empty keys are rejected");
+
+        cfg.auth.api_keys = Some(vec![key("pool", "same"), key("dev", "same")]);
+        assert!(
+            cfg.validate().is_err(),
+            "a shared secret across entries is rejected"
+        );
+
+        cfg.auth.api_keys = Some(vec![key("pool", "sécret")]);
+        assert!(
+            cfg.validate().is_err(),
+            "non-ASCII cannot cross an authorization header"
+        );
+
+        cfg.auth.api_keys = Some(vec![key("pool", "a"), key("dev", "b")]);
+        assert!(cfg.validate().is_ok());
+
+        cfg.auth.api_keys = Some(vec![]);
+        assert!(cfg.validate().is_ok(), "deny-all is valid");
     }
 
     #[test]

@@ -93,7 +93,7 @@ spec:
         resources: { requests: { storage: 10Gi } }
 ```
 
-- **Config** goes in a ConfigMap mounted over `/etc/sepp/sepp.toml` or as `SEPP_` environment variables. Keep secrets (`auth.api_keys`, `admin.keys`) in a Secret, not the ConfigMap.
+- **Config** goes in a ConfigMap mounted over `/etc/sepp/sepp.toml` or as `SEPP_` environment variables. Once it carries secrets (`auth.api_keys`, `admin.keys`), mount the whole file from a Secret instead of a ConfigMap; passing secrets as env vars also pins those fields against the admin UI.
 - **Health probes** use the built-in gRPC health service; set the probe's `service` to `sepp.v1.QueueService`.
 - **Metrics**: enable `metrics.prometheus_enabled` and scrape port `9464` with a ServiceMonitor or a `prometheus.io/scrape` annotation.
 - **The admin UI** needs the same `0.0.0.0` bind plus keys as in Docker before a Service can reach it.

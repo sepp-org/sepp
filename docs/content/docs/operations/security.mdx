@@ -7,12 +7,17 @@ Sepp has two independent authentication planes: API keys gate the gRPC job API a
 
 ## API key authentication
 
-The gRPC API (enqueue, reserve, ack and everything else clients call) is gated by `[auth] api_keys`, a list of bearer secrets. It is off by default: a fresh server accepts any client that can reach the port.
+The gRPC API (enqueue, reserve, ack and everything else clients call) is gated by `[auth] api_keys`, a list of named bearer secrets. It is off by default: a fresh server accepts any client that can reach the port.
 
 ```toml
 [auth]
-api_keys = ["a-long-random-secret", "a-second-for-rotation"]
+api_keys = [
+  { name = "worker-pool", key = "a-long-random-secret" },
+  { name = "producers",   key = "another-long-random-secret" },
+]
 ```
+
+The name labels the client (a worker pool, a producer service); only the key is secret. Clients present just the key, names never cross the wire.
 
 Each first-party client takes the key as a connect option and sends it as an `authorization: Bearer <key>` header on every request:
 
@@ -50,6 +55,8 @@ const client = await SeppClient.connect("https://sepp.example.com:50051", {
 
 A request with no key or an unrecognized one is rejected with `UNAUTHENTICATED`. The keys are opaque, so generate long random values and treat them like passwords. They are unrelated to the admin UI keys covered [below](#admin-ui-authentication).
 
+Keys can also be added and revoked from the admin UI's Config page (admin role). The key is generated in the browser, or paste your own to register an existing secret. Either way it is shown once at creation; the server stores it in `sepp.toml` but only ever reports names back. The same page can turn API-key auth off entirely, which deletes the whole list; the UI asks for confirmation since the port then accepts any client.
+
 <Callout type="warn" title="An open gRPC port accepts any client">
 With `api_keys` unset, anyone who can reach the port can enqueue, reserve and delete jobs. Set keys before exposing sepp beyond a trusted network and pair them with TLS so the key is not sent in the clear.
 </Callout>
@@ -64,7 +71,7 @@ With `api_keys` unset, anyone who can reach the port can enqueue, reserve and de
 | a non-empty list | Only the listed keys are accepted. |
 | `[]` (empty list) | Every request is rejected. |
 
-The empty list is a deliberate "deny all" you can use to seal the gRPC plane. Every listed key is equivalent; list more than one so you can rotate without a gap (see [Rotating keys](#rotating-keys-with-hot-reload)).
+The empty list is a deliberate "deny all" you can use to seal the gRPC plane. Revoking the last key through the admin UI leaves this state rather than turning auth off; turning auth off is its own explicit action there. Every listed key is equivalent; list more than one so you can rotate without a gap (see [Rotating keys](#rotating-keys-with-hot-reload)).
 
 ## Enabling TLS
 
@@ -86,9 +93,9 @@ API keys are bearer tokens: the `Bearer` header is sent on every request and gra
 
 `auth.api_keys` is hot-reloadable. Editing the list takes effect on the next request, with no restart and no dropped connections. To rotate without a gap:
 
-1. Add the new key to the list alongside the old one and save.
+1. Add the new key alongside the old one, in the file or from the admin UI.
 2. Move clients over to the new key.
-3. Remove the old key and save.
+3. Remove the old key.
 
 Removing a key takes effect immediately, so anything still presenting it starts getting `UNAUTHENTICATED`.
 
@@ -112,7 +119,7 @@ keys = [
 
 Serve the UI over HTTPS with `admin.tls_cert_path` and `admin.tls_key_path` (restart-only, independent of the gRPC certificates and free to point at the same files), or terminate TLS in a fronting proxy or SSH tunnel. The session cookie is marked `Secure` only when this listener terminates TLS itself; behind a proxy the final hop is plain HTTP, so the flag stays off. See [Deployment](/docs/operations/deployment) for the proxy setup.
 
-Secrets are never exposed through the UI: the config endpoint reports `auth.api_keys` as a count and `admin.keys` as names and roles only. `admin.keys` also cannot be edited through the admin API; change them in `sepp.toml` on the server.
+Secrets are never exposed through the UI: the config endpoint reports `auth.api_keys` as names only and `admin.keys` as names and roles only. Worker API keys can be added and revoked through the UI but never read back; `admin.keys` cannot be edited through the admin API at all; change them in `sepp.toml` on the server.
 
 ## Admin roles
 
@@ -128,7 +135,7 @@ A request whose role is too low gets `403 Forbidden`; an unauthenticated one get
 
 ## Audit log
 
-Every successful admin mutation and every login attempt is written to the `sepp::audit` tracing target, one line each, carrying the actor (the key's name), its role and the action. The action labels are values like `job.enqueue`, `queue.put`, `queue.delete`, `config.put`, `session.login` and `session.login_failed`. When admin auth is off on a loopback bind, the actor is `local`.
+Every successful admin mutation and every login attempt is written to the `sepp::audit` tracing target, one line each, carrying the actor (the key's name), its role and the action. The action labels are values like `job.enqueue`, `queue.put`, `queue.delete`, `config.put`, `auth_key.add`, `auth_key.revoke`, `auth.disable`, `session.login` and `session.login_failed`. When admin auth is off on a loopback bind, the actor is `local`.
 
 Only mutations and logins are audited, not reads. Key secrets never appear in the log. Because it is a dedicated tracing target, you can route `sepp::audit` to its own sink independent of the rest of the logs; see [Observability](/docs/observability).
 

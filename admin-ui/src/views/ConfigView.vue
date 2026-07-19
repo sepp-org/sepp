@@ -191,7 +191,7 @@ async function save() {
     const res = await api.updateConfig({ etag: data.value.etag, changes })
     discardAll()
     if (res.requires_restart.length > 0) restartFields.value = res.requires_restart
-    else if (!res.applied) saveNotice.value = 'Written to sepp.toml; reload not confirmed yet.'
+    else if (!res.applied) saveNotice.value = RELOAD_UNCONFIRMED
     await queryClient.invalidateQueries({ queryKey: ['config'] })
   } catch (e) {
     if (e instanceof AdminApiError && e.status === 412) showReloadPrompt.value = true
@@ -205,6 +205,147 @@ async function reloadAfterConflict() {
   showReloadPrompt.value = false
   discardAll()
   await refetch()
+}
+
+// Worker API key management. The key is generated here in the browser and
+// shown once; the server only ever reports names back.
+const apiKeysPinned = computed(() => pinned('auth.api_keys'))
+const addingKey = ref(false)
+const keySaved = ref(false)
+const newKeyName = ref('')
+const newKeyValue = ref('')
+const keyError = ref('')
+const keyNotice = ref('')
+const keyBusy = ref(false)
+const keyCopied = ref(false)
+const revokeTarget = ref<string | null>(null)
+
+const RELOAD_UNCONFIRMED = 'Saved to sepp.toml, but the server has not reloaded it yet.'
+
+function generateKey(): string {
+  const bytes = new Uint8Array(32)
+  crypto.getRandomValues(bytes)
+  let bin = ''
+  for (const b of bytes) bin += String.fromCharCode(b)
+  return btoa(bin).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '')
+}
+
+function openAddKey() {
+  newKeyName.value = ''
+  newKeyValue.value = generateKey()
+  keyError.value = ''
+  keyNotice.value = ''
+  keyCopied.value = false
+  keySaved.value = false
+  addingKey.value = true
+}
+
+function openRevoke(name: string) {
+  keyError.value = ''
+  revokeTarget.value = name
+}
+
+function regenerateKey() {
+  newKeyValue.value = generateKey()
+  keyCopied.value = false
+}
+
+// Editable so an existing key (a secret manager's, a running fleet's) can be
+// pasted in; the warning nudges hand-typed values back toward generated ones.
+const shortKey = computed(() => {
+  const k = newKeyValue.value.trim()
+  return k.length > 0 && k.length < 32
+})
+
+async function copyKey() {
+  // Trim first so what lands on the clipboard is exactly what save stores.
+  newKeyValue.value = newKeyValue.value.trim()
+  try {
+    if (navigator.clipboard) {
+      await navigator.clipboard.writeText(newKeyValue.value)
+    } else {
+      // Plain-HTTP non-loopback origins have no clipboard API.
+      const el = document.getElementById('auth-key-value') as HTMLInputElement | null
+      el?.select()
+      if (!document.execCommand('copy')) throw new Error('copy rejected')
+    }
+    keyCopied.value = true
+  } catch {
+    keyError.value = 'copy failed, copy the key manually'
+  }
+}
+
+async function saveKey() {
+  if (!data.value || keyBusy.value) return
+  // Trim the refs themselves so the displayed, copied and stored values are
+  // one and the same.
+  newKeyName.value = newKeyName.value.trim()
+  newKeyValue.value = newKeyValue.value.trim()
+  if (newKeyName.value === '' || newKeyValue.value === '') return
+  keyBusy.value = true
+  keyError.value = ''
+  try {
+    const res = await api.addAuthKey({
+      etag: data.value.etag,
+      name: newKeyName.value,
+      key: newKeyValue.value,
+    })
+    keySaved.value = true
+    keyNotice.value = res.applied ? '' : RELOAD_UNCONFIRMED
+    await queryClient.invalidateQueries({ queryKey: ['config'] })
+  } catch (e) {
+    if (e instanceof AdminApiError && e.status === 412) {
+      addingKey.value = false
+      showReloadPrompt.value = true
+    } else keyError.value = e instanceof AdminApiError ? e.message : 'save failed'
+  } finally {
+    keyBusy.value = false
+  }
+}
+
+async function revokeKey() {
+  if (!data.value || keyBusy.value || revokeTarget.value === null) return
+  keyBusy.value = true
+  keyError.value = ''
+  try {
+    const res = await api.deleteAuthKey(revokeTarget.value, data.value.etag)
+    revokeTarget.value = null
+    if (!res.applied) saveNotice.value = RELOAD_UNCONFIRMED
+    await queryClient.invalidateQueries({ queryKey: ['config'] })
+  } catch (e) {
+    if (e instanceof AdminApiError && e.status === 412) {
+      revokeTarget.value = null
+      showReloadPrompt.value = true
+    } else keyError.value = e instanceof AdminApiError ? e.message : 'revoke failed'
+  } finally {
+    keyBusy.value = false
+  }
+}
+
+const disablingAuth = ref(false)
+
+function openDisableAuth() {
+  keyError.value = ''
+  disablingAuth.value = true
+}
+
+async function disableAuth() {
+  if (!data.value || keyBusy.value) return
+  keyBusy.value = true
+  keyError.value = ''
+  try {
+    const res = await api.disableAuth(data.value.etag)
+    disablingAuth.value = false
+    if (!res.applied) saveNotice.value = RELOAD_UNCONFIRMED
+    await queryClient.invalidateQueries({ queryKey: ['config'] })
+  } catch (e) {
+    if (e instanceof AdminApiError && e.status === 412) {
+      disablingAuth.value = false
+      showReloadPrompt.value = true
+    } else keyError.value = e instanceof AdminApiError ? e.message : 'disable failed'
+  } finally {
+    keyBusy.value = false
+  }
 }
 </script>
 
@@ -259,15 +400,52 @@ async function reloadAfterConflict() {
             @revert="revert(`${section.table}.${field.key}`)"
           />
 
-          <div v-if="section.table === 'auth'" class="flex items-center gap-3 px-4 py-2">
-            <div class="w-64 shrink-0">
+          <div v-if="section.table === 'auth'" class="flex items-start gap-3 px-4 py-2">
+            <div class="w-64 shrink-0 pt-0.5">
               <span class="font-mono text-sm text-ink-200">api_keys</span>
             </div>
-            <p class="text-sm text-ink-300">
-              <template v-if="apiKeys">{{ apiKeys.count }} key{{ apiKeys.count === 1 ? '' : 's' }} configured</template>
-              <template v-else>not set — gRPC auth is off</template>
-              <span class="text-ink-500"> · managed in sepp.toml; never shown here</span>
-            </p>
+            <div class="flex min-w-0 flex-1 flex-col gap-1.5">
+              <div v-if="apiKeys && apiKeys.length > 0" class="flex flex-wrap gap-1.5">
+                <span
+                  v-for="k in apiKeys"
+                  :key="k.name"
+                  class="flex items-center gap-1.5 rounded-full bg-ink-800 px-2 py-0.5 font-mono text-xs text-ink-200"
+                >
+                  {{ k.name }}
+                  <button
+                    v-if="canAdmin && !apiKeysPinned"
+                    class="text-ink-500 hover:text-red-400"
+                    :title="`Revoke ${k.name}`"
+                    @click="openRevoke(k.name)"
+                  >
+                    ✕
+                  </button>
+                </span>
+              </div>
+              <p v-else-if="apiKeys" class="text-sm text-ink-300">
+                empty list — every gRPC caller is rejected
+              </p>
+              <p v-else class="text-sm text-ink-300">not set — gRPC auth is off</p>
+              <p class="text-xs text-ink-500">
+                Keys are shown once, when added.
+                <template v-if="apiKeysPinned"> Pinned by an environment variable.</template>
+              </p>
+              <div v-if="canAdmin && !apiKeysPinned" class="flex gap-2">
+                <button
+                  class="rounded border border-ink-700 px-2 py-1 text-xs text-ink-300 hover:border-accent hover:text-ink-100"
+                  @click="openAddKey"
+                >
+                  Add key
+                </button>
+                <button
+                  v-if="apiKeys"
+                  class="rounded border border-red-500/40 px-2 py-1 text-xs text-red-400 hover:bg-red-500/10"
+                  @click="openDisableAuth"
+                >
+                  Disable auth
+                </button>
+              </div>
+            </div>
           </div>
 
           <div v-if="section.table === 'admin'" class="flex items-start gap-3 px-4 py-2">
@@ -341,6 +519,147 @@ async function reloadAfterConflict() {
         </div>
       </div>
     </template>
+
+    <div v-if="addingKey" class="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+      <div class="w-[28rem] rounded-lg border border-ink-700 bg-ink-900 p-5">
+        <h3 class="mb-2 text-sm font-semibold">{{ keySaved ? 'API key added' : 'Add API key' }}</h3>
+        <template v-if="!keySaved">
+          <p class="mb-3 text-sm text-ink-300">
+            Name the client this key belongs to. Use the generated key or paste your own.
+          </p>
+          <p v-if="!apiKeys" class="mb-3 text-sm text-amber-300">
+            Adding the first key turns gRPC auth on. Clients without a key will be rejected.
+          </p>
+          <label class="mb-1 block text-xs text-ink-400" for="auth-key-name">name</label>
+          <input
+            id="auth-key-name"
+            v-model="newKeyName"
+            class="mb-3 w-full rounded border border-ink-700 bg-ink-950 px-2 py-1.5 font-mono text-sm text-ink-100"
+            placeholder="worker-pool-1"
+            @keyup.enter="saveKey"
+          />
+        </template>
+        <p v-else class="mb-3 text-sm text-ink-300">Copy the key now. It will not be shown again.</p>
+        <p v-if="keySaved && keyNotice" class="mb-3 text-sm text-amber-300">{{ keyNotice }}</p>
+        <label class="mb-1 block text-xs text-ink-400" for="auth-key-value">key</label>
+        <div class="mb-1 flex gap-2">
+          <input
+            id="auth-key-value"
+            v-model="newKeyValue"
+            :readonly="keySaved"
+            spellcheck="false"
+            class="w-full rounded border border-ink-700 bg-ink-950 px-2 py-1.5 font-mono text-xs text-ink-100"
+            @input="keyCopied = false"
+          />
+          <button
+            class="shrink-0 rounded border border-ink-700 px-2 py-1 text-xs text-ink-300 hover:text-ink-100"
+            @click="copyKey"
+          >
+            {{ keyCopied ? 'Copied' : 'Copy' }}
+          </button>
+          <button
+            v-if="!keySaved"
+            class="shrink-0 rounded border border-ink-700 px-2 py-1 text-xs text-ink-300 hover:text-ink-100"
+            @click="regenerateKey"
+          >
+            Regenerate
+          </button>
+        </div>
+        <p v-if="shortKey && !keySaved" class="mb-1 text-xs text-amber-300">
+          Short for a bearer secret.
+        </p>
+        <p v-if="keyError" class="mt-2 text-sm text-red-400">{{ keyError }}</p>
+        <div class="mt-3 flex justify-end gap-2">
+          <template v-if="!keySaved">
+            <button
+              class="rounded border border-ink-700 px-3 py-1.5 text-sm text-ink-300 hover:text-ink-100 disabled:opacity-50"
+              :disabled="keyBusy"
+              @click="addingKey = false"
+            >
+              Cancel
+            </button>
+            <button
+              class="rounded bg-accent px-3 py-1.5 text-sm font-medium text-ink-950 hover:bg-accent-bright disabled:opacity-50"
+              :disabled="keyBusy || newKeyName.trim() === '' || newKeyValue.trim() === ''"
+              @click="saveKey"
+            >
+              {{ keyBusy ? 'Adding…' : 'Add key' }}
+            </button>
+          </template>
+          <button
+            v-else
+            class="rounded bg-accent px-3 py-1.5 text-sm font-medium text-ink-950 hover:bg-accent-bright"
+            @click="addingKey = false"
+          >
+            Done
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <div
+      v-if="revokeTarget !== null"
+      class="fixed inset-0 z-50 flex items-center justify-center bg-black/60"
+    >
+      <div class="w-96 rounded-lg border border-ink-700 bg-ink-900 p-5">
+        <h3 class="mb-2 text-sm font-semibold">Revoke API key</h3>
+        <p class="mb-2 text-sm text-ink-300">
+          <span class="font-mono">{{ revokeTarget }}</span> stops being accepted on the next
+          request.
+        </p>
+        <p v-if="apiKeys && apiKeys.length === 1" class="mb-2 text-sm text-amber-300">
+          This is the last key. All gRPC callers will be rejected until a new key is added.
+        </p>
+        <p v-if="keyError" class="mb-2 text-sm text-red-400">{{ keyError }}</p>
+        <div class="mt-4 flex justify-end gap-2">
+          <button
+            class="rounded border border-ink-700 px-3 py-1.5 text-sm text-ink-300 hover:text-ink-100 disabled:opacity-50"
+            :disabled="keyBusy"
+            @click="revokeTarget = null"
+          >
+            Cancel
+          </button>
+          <button
+            class="rounded bg-red-500/80 px-3 py-1.5 text-sm font-medium text-white hover:bg-red-500 disabled:opacity-50"
+            :disabled="keyBusy"
+            @click="revokeKey"
+          >
+            {{ keyBusy ? 'Revoking…' : 'Revoke' }}
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <div
+      v-if="disablingAuth"
+      class="fixed inset-0 z-50 flex items-center justify-center bg-black/60"
+    >
+      <div class="w-96 rounded-lg border border-ink-700 bg-ink-900 p-5">
+        <h3 class="mb-2 text-sm font-semibold">Disable gRPC auth</h3>
+        <p class="mb-2 text-sm text-ink-300">
+          Removes all keys from sepp.toml and turns gRPC auth off. Any client that can reach
+          the port will be accepted.
+        </p>
+        <p class="mb-2 text-sm text-amber-300">The removed keys cannot be restored.</p>
+        <p v-if="keyError" class="mb-2 text-sm text-red-400">{{ keyError }}</p>
+        <div class="mt-4 flex justify-end gap-2">
+          <button
+            class="rounded border border-ink-700 px-3 py-1.5 text-sm text-ink-300 hover:text-ink-100 disabled:opacity-50"
+            :disabled="keyBusy"
+            @click="disablingAuth = false"
+          >
+            Cancel
+          </button>
+          <button
+            class="rounded bg-red-500/80 px-3 py-1.5 text-sm font-medium text-white hover:bg-red-500 disabled:opacity-50"
+            :disabled="keyBusy"
+            @click="disableAuth"
+          >
+            {{ keyBusy ? 'Disabling…' : 'Disable auth' }}
+          </button>
+        </div>
+      </div>
+    </div>
 
     <div
       v-if="showReloadPrompt"

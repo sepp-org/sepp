@@ -57,11 +57,16 @@ listen_addr = "127.0.0.1:9465"
 #session_ttl_ms = 43200000
 
 [auth]
-# Primitive API key authentication. If omitted, every caller is allowed.
-# If set to a non-empty list, only those keys are accepted.
-# If set to an empty list, no caller is allowed.
+# Named API keys for gRPC clients (workers and producers). If omitted, every
+# caller is allowed. If set to a non-empty list, only the listed keys are
+# accepted. If set to an empty list, no caller is allowed.
+# The name labels the client; only the key is secret. Names show up in the
+# admin UI, where keys can also be added and revoked; key material never does.
 # Should always be used over TLS, otherwise keys are sent in the clear.
-#api_keys = ["key-for-worker-pool", "key-for-producers"]
+#api_keys = [
+#  { name = "python-email-worker", key = "generate-a-long-random-secret" },
+#  { name = "rust-checkout-producer", key = "another-long-random-secret" },
+#]
 
 [limits]
 # Maximum time a client has to complete a job before it is eligible to be leased out again.

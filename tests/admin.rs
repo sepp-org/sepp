@@ -15,8 +15,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use sepp::pb::sepp::v1::{
-    EnqueueBatchRequest, EnqueueRequest, Job, NackRequest, NackRetry, Payload, job_result,
-    nack_retry,
+    EnqueueBatchRequest, EnqueueRequest, GetServerInfoRequest, Job, NackRequest, NackRetry,
+    Payload, job_result, nack_retry,
 };
 
 // ---------------------------------------------------------------------------
@@ -354,7 +354,9 @@ fn admin_cfg_with_key(key: &str) -> String {
 }
 
 /// One key per role, plus worker API keys to exercise config redaction.
-const ROLES_CFG: &str = "[auth]\napi_keys = [\"worker-secret-1\", \"worker-secret-2\"]\n\n\
+const ROLES_CFG: &str = "[auth]\napi_keys = [\n\
+    { name = \"pool-1\", key = \"worker-secret-1\" },\n\
+    { name = \"pool-2\", key = \"worker-secret-2\" },\n]\n\n\
     [admin]\nenabled = true\nlisten_addr = \"127.0.0.1:0\"\nkeys = [\n\
     { name = \"v\", key = \"viewer-key\", role = \"viewer\" },\n\
     { name = \"o\", key = \"operator-key\", role = \"operator\" },\n\
@@ -662,7 +664,7 @@ async fn config_is_redacted_and_admin_keys_are_immutable() {
     let config = resp.json();
     assert_eq!(
         config["effective"]["auth"]["api_keys"],
-        json!({ "count": 2 })
+        json!([{ "name": "pool-1" }, { "name": "pool-2" }])
     );
     assert_eq!(
         config["effective"]["admin"]["keys"],
@@ -697,6 +699,314 @@ async fn config_is_redacted_and_admin_keys_are_immutable() {
     .await;
     assert_eq!(resp.status, 400, "{}", resp.body);
     assert_eq!(resp.json()["code"], "admin_keys_immutable");
+}
+
+#[tokio::test]
+async fn auth_keys_add_and_revoke_round_trip() {
+    let (_guard, _client, port) = start_admin_server("auth-keys", ROLES_CFG, &[]).await;
+
+    let etag = http_as(port, "admin-key", "GET", "/admin/api/v1/config", None)
+        .await
+        .json()["etag"]
+        .as_str()
+        .expect("config etag")
+        .to_string();
+
+    // Key management is config-level: operator is refused.
+    let boot_etag = etag.clone();
+    let add = json!({ "etag": etag, "name": "pool-3", "key": "fresh-secret" }).to_string();
+    let resp = http_as(
+        port,
+        "operator-key",
+        "POST",
+        "/admin/api/v1/auth/keys",
+        Some(&add),
+    )
+    .await;
+    assert_eq!(resp.status, 403, "operator cannot add API keys");
+
+    let resp = http_as(
+        port,
+        "admin-key",
+        "POST",
+        "/admin/api/v1/auth/keys",
+        Some(&add),
+    )
+    .await;
+    assert_eq!(resp.status, 200, "{}", resp.body);
+    let etag = resp.json()["etag"].as_str().expect("etag").to_string();
+
+    // The new key shows up by name only; its material never rounds back.
+    let resp = http_as(port, "admin-key", "GET", "/admin/api/v1/config", None).await;
+    assert_eq!(
+        resp.json()["effective"]["auth"]["api_keys"],
+        json!([{ "name": "pool-1" }, { "name": "pool-2" }, { "name": "pool-3" }])
+    );
+    assert!(!resp.body.contains("fresh-secret"));
+
+    let dup = json!({ "etag": etag, "name": "pool-3", "key": "other" }).to_string();
+    let resp = http_as(
+        port,
+        "admin-key",
+        "POST",
+        "/admin/api/v1/auth/keys",
+        Some(&dup),
+    )
+    .await;
+    assert_eq!(resp.status, 400, "duplicate name is rejected: {}", resp.body);
+
+    let dup_secret = json!({ "etag": etag, "name": "pool-4", "key": "fresh-secret" }).to_string();
+    let resp = http_as(
+        port,
+        "admin-key",
+        "POST",
+        "/admin/api/v1/auth/keys",
+        Some(&dup_secret),
+    )
+    .await;
+    assert_eq!(
+        resp.status, 400,
+        "duplicate key material is rejected: {}",
+        resp.body
+    );
+
+    // "." and ".." would vanish under URL normalization on the revoke route.
+    let dotted = json!({ "etag": etag, "name": "..", "key": "another-one" }).to_string();
+    let resp = http_as(
+        port,
+        "admin-key",
+        "POST",
+        "/admin/api/v1/auth/keys",
+        Some(&dotted),
+    )
+    .await;
+    assert_eq!(resp.status, 400, "dot names are rejected: {}", resp.body);
+
+    let non_ascii = json!({ "etag": etag, "name": "pool-4", "key": "sécret" }).to_string();
+    let resp = http_as(
+        port,
+        "admin-key",
+        "POST",
+        "/admin/api/v1/auth/keys",
+        Some(&non_ascii),
+    )
+    .await;
+    assert_eq!(resp.status, 400, "non-ASCII keys are rejected: {}", resp.body);
+
+    let stale = json!({ "etag": boot_etag, "name": "pool-4", "key": "another-one" }).to_string();
+    let resp = http_as(
+        port,
+        "admin-key",
+        "POST",
+        "/admin/api/v1/auth/keys",
+        Some(&stale),
+    )
+    .await;
+    assert_eq!(resp.status, 412, "{}", resp.body);
+    assert_eq!(resp.json()["code"], "etag_mismatch");
+
+    // The generic config editor refuses the list, so it cannot be nulled.
+    let body = json!({
+        "etag": etag,
+        "changes": [{ "path": "auth.api_keys", "value": null }],
+    })
+    .to_string();
+    let resp = http_as(port, "admin-key", "PUT", "/admin/api/v1/config", Some(&body)).await;
+    assert_eq!(resp.status, 400, "{}", resp.body);
+    assert_eq!(resp.json()["code"], "api_keys_immutable");
+
+    let (auth_name, auth_value) = bearer("admin-key");
+    let resp = http(
+        port,
+        "DELETE",
+        "/admin/api/v1/auth/keys/pool-3",
+        &[(auth_name, auth_value.as_str())],
+        None,
+    )
+    .await;
+    assert_eq!(resp.status, 400, "{}", resp.body);
+    assert_eq!(resp.json()["code"], "if_match_required");
+
+    let resp = http(
+        port,
+        "DELETE",
+        "/admin/api/v1/auth/keys/pool-3",
+        &[(auth_name, auth_value.as_str()), ("If-Match", &etag)],
+        None,
+    )
+    .await;
+    assert_eq!(resp.status, 200, "{}", resp.body);
+    let etag = resp.json()["etag"].as_str().expect("etag").to_string();
+
+    let resp = http(
+        port,
+        "DELETE",
+        "/admin/api/v1/auth/keys/pool-3",
+        &[(auth_name, auth_value.as_str()), ("If-Match", &etag)],
+        None,
+    )
+    .await;
+    assert_eq!(resp.status, 404, "revoking an unknown name: {}", resp.body);
+
+    let config = http_as(port, "admin-key", "GET", "/admin/api/v1/config", None)
+        .await
+        .json();
+    assert_eq!(
+        config["effective"]["auth"]["api_keys"],
+        json!([{ "name": "pool-1" }, { "name": "pool-2" }])
+    );
+}
+
+#[tokio::test]
+async fn env_pinned_api_keys_reject_ui_management() {
+    // Lowercase on purpose: figment matches the SEPP_ prefix
+    // case-insensitively, so the pin guard must catch this spelling too.
+    let cfg = admin_cfg_with_key("root-key");
+    let (_guard, _client, port) = start_admin_server(
+        "auth-pin",
+        &cfg,
+        &[(
+            "sepp_auth__api_keys",
+            "[{name=\"envkey\",key=\"env-secret\"}]",
+        )],
+    )
+    .await;
+
+    let config = http_as(port, "root-key", "GET", "/admin/api/v1/config", None)
+        .await
+        .json();
+    assert_eq!(
+        config["effective"]["auth"]["api_keys"],
+        json!([{ "name": "envkey" }]),
+        "the env-supplied list is live"
+    );
+    let etag = config["etag"].as_str().expect("config etag").to_string();
+
+    let add = json!({ "etag": etag, "name": "pool", "key": "some-secret" }).to_string();
+    let resp = http_as(
+        port,
+        "root-key",
+        "POST",
+        "/admin/api/v1/auth/keys",
+        Some(&add),
+    )
+    .await;
+    assert_eq!(resp.status, 400, "{}", resp.body);
+    assert_eq!(resp.json()["code"], "env_pinned");
+
+    let (auth_name, auth_value) = bearer("root-key");
+    for path in [
+        "/admin/api/v1/auth/keys/envkey",
+        "/admin/api/v1/auth/keys",
+    ] {
+        let resp = http(
+            port,
+            "DELETE",
+            path,
+            &[(auth_name, auth_value.as_str()), ("If-Match", &etag)],
+            None,
+        )
+        .await;
+        assert_eq!(resp.status, 400, "{path}: {}", resp.body);
+        assert_eq!(resp.json()["code"], "env_pinned");
+    }
+}
+
+#[tokio::test]
+async fn disabling_grpc_auth_removes_the_key_list() {
+    let (_guard, client, port) = start_admin_server("auth-off", ROLES_CFG, &[]).await;
+
+    // The boot config lists worker keys, so the keyless test client is locked
+    // out of the gRPC plane.
+    let err = client
+        .clone()
+        .get_server_info(GetServerInfoRequest {})
+        .await
+        .expect_err("gRPC auth is on at boot");
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
+
+    let etag = http_as(port, "admin-key", "GET", "/admin/api/v1/config", None)
+        .await
+        .json()["etag"]
+        .as_str()
+        .expect("config etag")
+        .to_string();
+
+    let (op_name, op_value) = bearer("operator-key");
+    let resp = http(
+        port,
+        "DELETE",
+        "/admin/api/v1/auth/keys",
+        &[(op_name, op_value.as_str()), ("If-Match", &etag)],
+        None,
+    )
+    .await;
+    assert_eq!(resp.status, 403, "operator cannot disable auth");
+
+    let (auth_name, auth_value) = bearer("admin-key");
+    let resp = http(
+        port,
+        "DELETE",
+        "/admin/api/v1/auth/keys",
+        &[(auth_name, auth_value.as_str())],
+        None,
+    )
+    .await;
+    assert_eq!(resp.status, 400, "{}", resp.body);
+    assert_eq!(resp.json()["code"], "if_match_required");
+
+    let resp = http(
+        port,
+        "DELETE",
+        "/admin/api/v1/auth/keys",
+        &[(auth_name, auth_value.as_str()), ("If-Match", "stale")],
+        None,
+    )
+    .await;
+    assert_eq!(resp.status, 412, "{}", resp.body);
+    assert_eq!(resp.json()["code"], "etag_mismatch");
+
+    let resp = http(
+        port,
+        "DELETE",
+        "/admin/api/v1/auth/keys",
+        &[(auth_name, auth_value.as_str()), ("If-Match", &etag)],
+        None,
+    )
+    .await;
+    assert_eq!(resp.status, 200, "{}", resp.body);
+    let etag = resp.json()["etag"].as_str().expect("etag").to_string();
+
+    let config = http_as(port, "admin-key", "GET", "/admin/api/v1/config", None)
+        .await
+        .json();
+    assert_eq!(config["effective"]["auth"]["api_keys"], Value::Null);
+
+    // The interceptor hot-reloaded: the same keyless client now passes.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match client
+            .clone()
+            .get_server_info(GetServerInfoRequest {})
+            .await
+        {
+            Ok(_) => break,
+            Err(_) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => panic!("gRPC auth never turned off: {e}"),
+        }
+    }
+
+    let resp = http(
+        port,
+        "DELETE",
+        "/admin/api/v1/auth/keys",
+        &[(auth_name, auth_value.as_str()), ("If-Match", &etag)],
+        None,
+    )
+    .await;
+    assert_eq!(resp.status, 404, "already off: {}", resp.body);
 }
 
 #[tokio::test]

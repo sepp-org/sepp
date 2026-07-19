@@ -293,9 +293,9 @@ export interface ServerConfigView {
   strict_queues: boolean
 }
 
-// Redacted: the server never serves key material, only the count.
+// Redacted: the server never serves key material, only names.
 export interface AuthConfigView {
-  api_keys: { count: number } | null
+  api_keys: { name: string }[] | null
 }
 
 export interface LimitsConfigView {

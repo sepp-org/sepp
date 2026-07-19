@@ -1047,14 +1047,13 @@ fn with_key<T>(msg: T, key: &str) -> tonic::Request<T> {
 
 #[tokio::test]
 async fn api_key_auth_gates_requests() {
-    let db_path = temp_db("auth");
-    let (child, client) =
-        spawn_server_with_env(&db_path, &[("SEPP_AUTH__API_KEYS", r#"["smoke-secret"]"#)]).await;
-    let _guard = ServerGuard {
-        child,
-        db_path: Some(db_path),
-        cfg_path: None,
-    };
+    // A config file rather than env: env-supplied api_keys is unsupported
+    // and pins the list against the admin API's key management.
+    let (_guard, client) = start_server_with_config(
+        "auth",
+        "[auth]\napi_keys = [{ name = \"smoke\", key = \"smoke-secret\" }]\n",
+    )
+    .await;
 
     // No key at all is rejected.
     let status = client
