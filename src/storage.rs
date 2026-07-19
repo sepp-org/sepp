@@ -2669,6 +2669,34 @@ pub struct AuditEntry {
     pub record: AuditRecord,
 }
 
+#[derive(Default)]
+pub struct AuditFilter {
+    pub actor: Option<String>,
+    pub action_prefix: Option<String>,
+}
+
+impl AuditFilter {
+    fn matches(&self, record: &AuditRecord) -> bool {
+        self.actor.as_deref().is_none_or(|a| record.actor == a)
+            && self
+                .action_prefix
+                .as_deref()
+                .is_none_or(|p| record.action.starts_with(p))
+    }
+}
+
+pub struct AuditPage {
+    pub entries: Vec<AuditEntry>,
+    // Resume cursor: pass as `before` to continue the walk. None means the
+    // scan reached the oldest entry.
+    pub next_before: Option<u64>,
+}
+
+// Rows examined per list_audit call. Bounds the work of a filtered walk: a
+// page can come back short (even empty) with next_before set instead of
+// scanning arbitrarily far for the next match.
+const AUDIT_SCAN_CAP: usize = 1_000;
+
 // Snapshot-read view of the database for admin reads off the committer
 // thread: point gets, plus the bounded audit range. Methods are sync (callers
 // wrap them in spawn_blocking) and peeked keys can vanish between peek and
@@ -2856,26 +2884,48 @@ impl ReadHandle {
         Some(AdminJob { key, state, job })
     }
 
-    // Newest-first page of audit entries, strictly older than `before` when
-    // given. The keyspace is tiny and cold (admin actions only), so a bounded
-    // reverse range does not contend with the committer.
-    pub fn list_audit(&self, before: Option<u64>, limit: usize) -> Vec<AuditEntry> {
+    // The keyspace is cold (admin actions only) and every call scans at
+    // most AUDIT_SCAN_CAP rows, so it does not contend with the committer.
+    pub fn list_audit(&self, before: Option<u64>, limit: usize, filter: &AuditFilter) -> AuditPage {
         let snap = self.db.read_tx();
         let iter = match before {
             Some(seq) => snap.range(&self.audit, ..seq.to_be_bytes().to_vec()),
             None => snap.iter(&self.audit),
         };
 
-        iter.rev()
-            .take(limit)
-            .filter_map(|guard| {
-                let (key, value) = guard.into_inner().ok()?;
-                let seq = u64::from_be_bytes(key.as_ref().try_into().ok()?);
-                let (ts_ms, record) = AuditValue::decode(&value)?;
+        let mut entries = Vec::new();
+        let mut last_seq = 0;
+        for (scanned, guard) in iter.rev().enumerate() {
+            // Checked before consuming the pulled row, so next_before is only
+            // set when at least one unexamined row remains.
+            if entries.len() >= limit || scanned >= AUDIT_SCAN_CAP {
+                return AuditPage {
+                    entries,
+                    next_before: Some(last_seq),
+                };
+            }
+            let Ok((key, value)) = guard.into_inner() else {
+                continue;
+            };
+            let Ok(bytes) = <[u8; 8]>::try_from(key.as_ref()) else {
+                continue;
+            };
+            last_seq = u64::from_be_bytes(bytes);
+            if let Some((ts_ms, record)) = AuditValue::decode(&value)
+                && filter.matches(&record)
+            {
+                entries.push(AuditEntry {
+                    seq: last_seq,
+                    ts_ms,
+                    record,
+                });
+            }
+        }
 
-                Some(AuditEntry { seq, ts_ms, record })
-            })
-            .collect()
+        AuditPage {
+            entries,
+            next_before: None,
+        }
     }
 }
 
@@ -4135,12 +4185,25 @@ mod tests {
         );
     }
 
-    fn audit_record(action: &str) -> AuditRecord {
+    fn audit_record(actor: &str, action: &str) -> AuditRecord {
         AuditRecord {
-            actor: "root".into(),
+            actor: actor.into(),
             role: "admin".into(),
             action: action.into(),
             details_json: "{}".into(),
+        }
+    }
+
+    fn audit_read_handle(store: &Store) -> ReadHandle {
+        ReadHandle {
+            db: store.db.clone(),
+            jobs: store.jobs.clone(),
+            payloads: store.payloads.clone(),
+            inflight: store.inflight.clone(),
+            ready: store.ready.clone(),
+            scheduled: store.scheduled.clone(),
+            dead_letter: store.dead_letter.clone(),
+            audit: store.audit.clone(),
         }
     }
 
@@ -4150,47 +4213,154 @@ mod tests {
 
         let mut tx = store.db.write_tx();
         let mut cycle = Cycle::new(false);
-        apply_audit_append(&store, &mut tx, &mut cycle, &audit_record("a.one"), 1_000)
-            .expect("applies");
-        apply_audit_append(&store, &mut tx, &mut cycle, &audit_record("a.two"), 1_000)
-            .expect("applies");
+        apply_audit_append(
+            &store,
+            &mut tx,
+            &mut cycle,
+            &audit_record("root", "a.one"),
+            1_000,
+        )
+        .expect("applies");
+        apply_audit_append(
+            &store,
+            &mut tx,
+            &mut cycle,
+            &audit_record("root", "a.two"),
+            1_000,
+        )
+        .expect("applies");
         assert!(cycle.dirty);
         tx.commit().expect("commit");
 
         // A later cycle continues from the persisted counter.
         let mut tx = store.db.write_tx();
         let mut cycle = Cycle::new(false);
-        apply_audit_append(&store, &mut tx, &mut cycle, &audit_record("a.three"), 2_000)
-            .expect("applies");
+        apply_audit_append(
+            &store,
+            &mut tx,
+            &mut cycle,
+            &audit_record("root", "a.three"),
+            2_000,
+        )
+        .expect("applies");
         tx.commit().expect("commit");
 
-        let read = ReadHandle {
-            db: store.db.clone(),
-            jobs: store.jobs.clone(),
-            payloads: store.payloads.clone(),
-            inflight: store.inflight.clone(),
-            ready: store.ready.clone(),
-            scheduled: store.scheduled.clone(),
-            dead_letter: store.dead_letter.clone(),
-            audit: store.audit.clone(),
-        };
-
-        let brief = |page: Vec<AuditEntry>| {
-            page.into_iter()
+        let read = audit_read_handle(&store);
+        let all = AuditFilter::default();
+        let brief = |page: AuditPage| {
+            page.entries
+                .into_iter()
                 .map(|e| (e.seq, e.ts_ms, e.record.action))
                 .collect::<Vec<_>>()
         };
 
+        let first = read.list_audit(None, 2, &all);
         assert_eq!(
-            brief(read.list_audit(None, 2)),
-            vec![(3, 2_000, "a.three".into()), (2, 1_000, "a.two".into())]
+            first.next_before,
+            Some(2),
+            "a full page with rows left reports a resume cursor"
         );
         assert_eq!(
-            brief(read.list_audit(Some(2), 10)),
+            brief(first),
+            vec![(3, 2_000, "a.three".into()), (2, 1_000, "a.two".into())]
+        );
+
+        let rest = read.list_audit(Some(2), 10, &all);
+        assert_eq!(rest.next_before, None, "the scan reached the oldest entry");
+        assert_eq!(
+            brief(rest),
             vec![(1, 1_000, "a.one".into())],
             "the cursor page excludes the cursor itself"
         );
-        assert!(read.list_audit(Some(1), 10).is_empty());
+
+        let exact = read.list_audit(None, 3, &all);
+        assert_eq!(exact.entries.len(), 3);
+        assert_eq!(
+            exact.next_before, None,
+            "a page ending exactly at the oldest entry has no cursor"
+        );
+
+        assert!(read.list_audit(Some(1), 10, &all).entries.is_empty());
+    }
+
+    #[test]
+    fn audit_listing_filters_by_actor_and_action_prefix() {
+        let store = open_test_store();
+
+        let mut tx = store.db.write_tx();
+        let mut cycle = Cycle::new(false);
+        for (actor, action) in [
+            ("root", "job.enqueue"),
+            ("o", "session.login"),
+            ("root", "job.delete"),
+        ] {
+            apply_audit_append(&store, &mut tx, &mut cycle, &audit_record(actor, action), 0)
+                .expect("applies");
+        }
+        tx.commit().expect("commit");
+
+        let read = audit_read_handle(&store);
+        let seqs = |page: AuditPage| page.entries.into_iter().map(|e| e.seq).collect::<Vec<_>>();
+
+        let by_actor = AuditFilter {
+            actor: Some("root".into()),
+            ..Default::default()
+        };
+        assert_eq!(seqs(read.list_audit(None, 10, &by_actor)), vec![3, 1]);
+
+        let by_prefix = AuditFilter {
+            action_prefix: Some("session.".into()),
+            ..Default::default()
+        };
+        assert_eq!(seqs(read.list_audit(None, 10, &by_prefix)), vec![2]);
+
+        let both = AuditFilter {
+            actor: Some("o".into()),
+            action_prefix: Some("job.".into()),
+        };
+        let page = read.list_audit(None, 10, &both);
+        assert!(page.entries.is_empty());
+        assert_eq!(
+            page.next_before, None,
+            "an exhausted scan reports no cursor even when nothing matched"
+        );
+    }
+
+    #[test]
+    fn audit_listing_bounds_scan_work_under_a_selective_filter() {
+        let store = open_test_store();
+
+        let mut tx = store.db.write_tx();
+        let mut cycle = Cycle::new(false);
+        for _ in 0..AUDIT_SCAN_CAP + 2 {
+            apply_audit_append(
+                &store,
+                &mut tx,
+                &mut cycle,
+                &audit_record("root", "job.enqueue"),
+                0,
+            )
+            .expect("applies");
+        }
+        tx.commit().expect("commit");
+
+        let read = audit_read_handle(&store);
+        let nobody = AuditFilter {
+            actor: Some("nobody".into()),
+            ..Default::default()
+        };
+
+        let page = read.list_audit(None, 10, &nobody);
+        assert!(page.entries.is_empty());
+        assert_eq!(
+            page.next_before,
+            Some(3),
+            "the cap stops the walk with a resume cursor"
+        );
+
+        let page = read.list_audit(Some(3), 10, &nobody);
+        assert!(page.entries.is_empty());
+        assert_eq!(page.next_before, None);
     }
 
     #[test]

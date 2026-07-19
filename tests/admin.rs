@@ -2216,3 +2216,124 @@ async fn audited_actions_stream_audit_sse_events() {
     seqs.dedup();
     assert_eq!(seqs.len(), events.len(), "every entry gets a distinct seq");
 }
+
+#[tokio::test]
+async fn the_audit_trail_pages_and_filters_over_http() {
+    let (_guard, _client, port) = start_admin_server("audit-read", ROLES_CFG, &[]).await;
+
+    // Three audited actions: an operator login and two admin enqueues.
+    let (_session, _cookie) = login(port, "o", "operator-key").await;
+    for job_type in ["first", "second"] {
+        let body = json!({ "job_type": job_type }).to_string();
+        let resp = http_as(
+            port,
+            "admin-key",
+            "POST",
+            "/admin/api/v1/queues/audit-read-q/jobs",
+            Some(&body),
+        )
+        .await;
+        assert_eq!(resp.status, 200, "enqueue failed: {}", resp.body);
+    }
+
+    // Appends are fire-and-forget, so poll as the viewer until all three
+    // landed; viewer access is itself part of the contract under test.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let entries = loop {
+        let resp = http_as(port, "viewer-key", "GET", "/admin/api/v1/audit", None).await;
+        assert_eq!(resp.status, 200, "viewer reads the trail: {}", resp.body);
+        let page = resp.json();
+        let entries = page["entries"].as_array().expect("entries array").clone();
+        if entries.len() >= 3 {
+            assert_eq!(entries.len(), 3, "exactly the three actions: {}", resp.body);
+            assert!(page["next_before"].is_null(), "trail fits one page");
+            break entries;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "audit entries never appeared: {}",
+            resp.body
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+
+    // Newest first, in the SSE payload shape with details as an object. The
+    // appends race each other, so entries are matched by content, not index.
+    let seqs: Vec<u64> = entries.iter().map(|e| e["seq"].as_u64().unwrap()).collect();
+    assert!(
+        seqs.windows(2).all(|w| w[0] > w[1]),
+        "newest first: {seqs:?}"
+    );
+    let enqueued = entries
+        .iter()
+        .find(|e| e["details"]["job_type"] == "second")
+        .expect("the second enqueue is in the trail");
+    assert_eq!(enqueued["action"], "job.enqueue");
+    assert_eq!(enqueued["actor"], "a");
+    assert_eq!(enqueued["role"], "admin");
+    assert_eq!(enqueued["details"]["queue"], "audit-read-q");
+    assert!(enqueued["ts_ms"].as_i64().unwrap() > 0);
+
+    // A limit=1 keyset walk visits the same trail without gaps or repeats.
+    let mut walked = Vec::new();
+    let mut before: Option<u64> = None;
+    loop {
+        let path = match before {
+            Some(b) => format!("/admin/api/v1/audit?limit=1&before={b}"),
+            None => "/admin/api/v1/audit?limit=1".to_string(),
+        };
+        let resp = http_as(port, "viewer-key", "GET", &path, None).await;
+        assert_eq!(resp.status, 200);
+        let page = resp.json();
+        for e in page["entries"].as_array().expect("entries array") {
+            walked.push(e["seq"].as_u64().unwrap());
+        }
+        match page["next_before"].as_u64() {
+            Some(b) => before = Some(b),
+            None => break,
+        }
+    }
+    assert_eq!(walked, seqs);
+
+    let resp = http_as(
+        port,
+        "viewer-key",
+        "GET",
+        "/admin/api/v1/audit?actor=o",
+        None,
+    )
+    .await;
+    let page = resp.json();
+    let actions: Vec<&str> = page["entries"]
+        .as_array()
+        .expect("entries array")
+        .iter()
+        .map(|e| e["action"].as_str().unwrap())
+        .collect();
+    assert_eq!(actions, ["session.login"], "actor filter: {}", resp.body);
+
+    let resp = http_as(
+        port,
+        "viewer-key",
+        "GET",
+        "/admin/api/v1/audit?action_prefix=job.",
+        None,
+    )
+    .await;
+    let entries = resp.json()["entries"]
+        .as_array()
+        .expect("entries array")
+        .clone();
+    assert_eq!(entries.len(), 2, "prefix filter: {}", resp.body);
+    assert!(entries.iter().all(|e| e["action"] == "job.enqueue"));
+
+    let resp = http_as(
+        port,
+        "viewer-key",
+        "GET",
+        "/admin/api/v1/audit?before=abc",
+        None,
+    )
+    .await;
+    assert_eq!(resp.status, 400, "a malformed cursor is rejected");
+}

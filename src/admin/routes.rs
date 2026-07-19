@@ -19,7 +19,9 @@ use crate::keys::DeadLetterKey;
 use crate::pb::sepp::v1::{self as pb, EnqueueRequest, Payload, PrimitiveValue};
 use crate::pb::{millis_to_timestamp, timestamp_to_millis};
 use crate::queue_server::{ServerLimits, classify_enqueue, rejection_label};
-use crate::storage::{AdminDeadLetter, AdminJob, AdminJobState, PeekState, now_ms};
+use crate::storage::{
+    AdminDeadLetter, AdminJob, AdminJobState, AuditEntry, AuditFilter, PeekState, now_ms,
+};
 
 use super::authz::{RequireAdmin, RequireOperator, RequireViewer, audit};
 use super::{AdminState, config_edit};
@@ -596,6 +598,58 @@ pub(super) async fn get_dead_letter(
         .await?
         .ok_or_else(|| ApiError::not_found("dead-letter record not found"))?;
     Ok(Json(dead_letter_json(&record, true)))
+}
+
+// ---------------------------------------------------------------------------
+// Audit trail
+
+#[derive(Deserialize)]
+pub struct AuditQuery {
+    before: Option<u64>,
+    limit: Option<usize>,
+    actor: Option<String>,
+    action_prefix: Option<String>,
+}
+
+pub(super) fn audit_json(e: &AuditEntry) -> Value {
+    let details = serde_json::from_str(&e.record.details_json)
+        .unwrap_or_else(|_| Value::String(e.record.details_json.clone()));
+    json!({
+        "seq": e.seq,
+        "ts_ms": e.ts_ms,
+        "actor": e.record.actor,
+        "role": e.record.role,
+        "action": e.record.action,
+        "details": details,
+    })
+}
+
+pub(super) async fn list_audit(
+    _viewer: RequireViewer,
+    State(state): State<Arc<AdminState>>,
+    Query(query): Query<AuditQuery>,
+) -> ApiResult<Json<Value>> {
+    let AuditQuery {
+        before,
+        limit,
+        actor,
+        action_prefix,
+    } = query;
+    let limit = limit.unwrap_or(50).clamp(1, 100);
+    let filter = AuditFilter {
+        actor: actor.filter(|s| !s.is_empty()),
+        action_prefix: action_prefix.filter(|s| !s.is_empty()),
+    };
+
+    let read = state.read.clone();
+    let page = resolve_blocking(move || read.list_audit(before, limit, &filter)).await?;
+
+    Ok(Json(json!({
+        "entries": page.entries.iter().map(audit_json).collect::<Vec<_>>(),
+        // Fewer than `limit` entries with next_before set means the scan cap
+        // was hit, not that the trail ended; keep paging from here.
+        "next_before": page.next_before,
+    })))
 }
 
 // ---------------------------------------------------------------------------

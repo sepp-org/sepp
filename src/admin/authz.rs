@@ -13,7 +13,7 @@ use std::sync::Arc;
 use axum::extract::FromRequestParts;
 use axum::http::StatusCode;
 use axum::http::request::Parts;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::config::Role;
 use crate::pb::sepp::storage::v1::AuditRecord;
@@ -99,15 +99,7 @@ fn store_audit(state: &AdminState, actor: &str, role: Role, action: &str, detail
     tokio::spawn(async move {
         match storage.append_audit(record).await {
             Ok(entry) => {
-                let payload = json!({
-                    "seq": entry.seq,
-                    "ts_ms": entry.ts_ms,
-                    "actor": entry.record.actor,
-                    "role": entry.record.role,
-                    "action": entry.record.action,
-                    "details": details,
-                })
-                .to_string();
+                let payload = super::routes::audit_json(&entry).to_string();
                 let _ = hub.send(Event::Audit(Arc::new(payload)));
             }
             Err(e) => tracing::warn!(error = %e, "audit append failed"),

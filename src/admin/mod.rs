@@ -233,6 +233,7 @@ fn router(state: Arc<AdminState>) -> Router {
             post(routes::delete_dead_letters),
         )
         .route("/admin/api/v1/jobs/{id}", get(routes::get_job))
+        .route("/admin/api/v1/audit", get(routes::list_audit))
         .route(
             "/admin/api/v1/config",
             get(routes::get_config).put(routes::put_config),
