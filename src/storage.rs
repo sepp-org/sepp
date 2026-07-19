@@ -19,7 +19,7 @@ use tokio::sync::{Notify, futures::Notified, oneshot};
 use tonic::Status;
 use tracing::{debug, error, info, warn};
 
-use crate::config::{Config, EffectiveLimits, RetryBackoff};
+use crate::config::{Config, RetryBackoff};
 use crate::keys::{
     CLOSING_PREFIX, DeadLetterKey, DedupKey, DedupTimerKey, DedupValue, Inflight, JobValue,
     ReadyKey, TimerKey, closing_key, closing_queue, deadline_of, queue_prefix, read_queue,
@@ -62,15 +62,6 @@ struct Store {
     dead_letter: TxKeyspace,
     meta: TxKeyspace,
     params: StorageParams,
-    // Live (hot-reloadable) registry. The committer pins one snapshot per
-    // cycle in run_rpc_cycle and passes it into apply; never load this inside
-    // an apply_* function!!! The cycle is the reload boundary.
-    registry: SharedRegistry,
-    // Boot snapshot of the registry. dedup_window_ms is read from here instead
-    // of the live (hot-reloadable) registry: dedup timer deadlines are fixed at
-    // insert time, so a hot-reloaded window would desync them from the check
-    // window. Everything else reads the live registry.
-    boot_registry: Arc<QueueRegistry>,
     metrics: Metrics,
 }
 
@@ -227,8 +218,7 @@ impl Indexes {
     }
 }
 
-fn warn_on_undeclared_persisted_queues(store: &Store) {
-    let registry = store.registry.load();
+fn warn_on_undeclared_persisted_queues(store: &Store, registry: &QueueRegistry) {
     let mut undeclared: BTreeSet<String> = BTreeSet::new();
     let snap = store.db.read_tx();
     for guard in snap.iter(&store.jobs) {
@@ -731,11 +721,8 @@ fn run_rpc_cycle(
     let mut cycle = Cycle::new(store.metrics.is_enabled() || store.params.admin_enabled);
     let mut responders: Vec<PendingReply> = Vec::with_capacity(rpcs.len());
 
-    // One clock read and one registry snapshot per cycle: every op applies
-    // under the same stamp and the same pinned config, making the cycle the
-    // reload boundary.
+    // One clock read per cycle: every op applies under the same stamp.
     let now = now_ms();
-    let registry = store.registry.load();
     let mut rpcs = rpcs.into_iter();
     let fatal = rpcs.by_ref().find_map(|cmd| {
         apply_command(
@@ -745,7 +732,6 @@ fn run_rpc_cycle(
             &mut cycle,
             cmd,
             now,
-            registry.as_ref(),
             &mut responders,
         )
         .err()
@@ -800,7 +786,6 @@ fn run_rpc_cycle(
 // Applies one command to the cycle's shared transaction, answering business
 // rejections immediately. Returns Err only for storage-level failures, which
 // poison the whole cycle (see run_rpc_cycle).
-#[allow(clippy::too_many_arguments)]
 fn apply_command(
     store: &Store,
     indexes: &mut Indexes,
@@ -808,13 +793,12 @@ fn apply_command(
     cycle: &mut Cycle,
     cmd: Command,
     now: i64,
-    registry: &QueueRegistry,
     responders: &mut Vec<PendingReply>,
 ) -> Result<(), Status> {
     match cmd {
         Command::Op { mut op, resp } => {
             op.stamp(now);
-            match apply_op(store, indexes, tx, cycle, op, registry) {
+            match apply_op(store, indexes, tx, cycle, op) {
                 Ok(outcome) => responders.push(PendingReply { resp, outcome }),
                 Err(e) => return reject(resp, e),
             }
@@ -845,14 +829,13 @@ fn apply_op(
     tx: &mut WriteTransaction<'_>,
     cycle: &mut Cycle,
     op: Op,
-    registry: &QueueRegistry,
 ) -> Result<OpOutcome, Status> {
     Ok(match op {
-        Op::Enqueue { jobs, now_ms } => OpOutcome::Enqueue(apply_enqueue(
-            store, indexes, tx, cycle, jobs, now_ms, registry,
-        )?),
+        Op::Enqueue { jobs, now_ms } => {
+            OpOutcome::Enqueue(apply_enqueue(store, indexes, tx, cycle, jobs, now_ms)?)
+        }
         Op::EnqueueAtomic { jobs, now_ms } => OpOutcome::EnqueueAtomic(apply_enqueue_atomic(
-            store, indexes, tx, cycle, jobs, now_ms, registry,
+            store, indexes, tx, cycle, jobs, now_ms,
         )?),
         Op::Reserve {
             queues,
@@ -868,6 +851,7 @@ fn apply_op(
         Op::Nack {
             req,
             retry_delay_ms,
+            dead_letter_enabled,
             now_ms,
         } => OpOutcome::Nack(apply_nack(
             store,
@@ -876,10 +860,15 @@ fn apply_op(
             cycle,
             req,
             retry_delay_ms,
+            dead_letter_enabled,
             now_ms,
         )?),
-        Op::Extend { req, now_ms } => OpOutcome::Extend(apply_extend(
-            store, indexes, tx, cycle, req, now_ms, registry,
+        Op::Extend {
+            req,
+            lease_ms,
+            now_ms,
+        } => OpOutcome::Extend(apply_extend(
+            store, indexes, tx, cycle, req, lease_ms, now_ms,
         )?),
         Op::DrainDeadLetters {
             queue,
@@ -912,9 +901,19 @@ fn apply_op(
             state,
             keys,
             reason,
+            dead_letter_enabled,
             now_ms,
         } => OpOutcome::DeadLetterJobs(apply_dead_letter_jobs(
-            store, indexes, tx, cycle, &queue, state, keys, reason, now_ms,
+            store,
+            indexes,
+            tx,
+            cycle,
+            &queue,
+            state,
+            keys,
+            reason,
+            dead_letter_enabled,
+            now_ms,
         )?),
         Op::DeleteDeadLetters { queue, keys } => OpOutcome::DeleteDeadLetters(
             apply_delete_dead_letters(store, indexes, tx, cycle, &queue, keys),
@@ -926,6 +925,7 @@ fn apply_op(
             now_ms,
             budget,
             retention_cutoff_ms,
+            dead_letter_enabled,
         } => OpOutcome::Sweep(apply_sweep(
             store,
             indexes,
@@ -934,6 +934,7 @@ fn apply_op(
             now_ms,
             budget,
             retention_cutoff_ms,
+            dead_letter_enabled,
         )?),
     })
 }
@@ -980,9 +981,9 @@ fn run_sweep_cycle(
         budget: store.params.sweep_limit,
         retention_cutoff_ms: (retention_ms > 0)
             .then(|| now.saturating_sub(i64::try_from(retention_ms).unwrap_or(i64::MAX))),
+        dead_letter_enabled: retention_ms > 0,
     };
-    let registry = store.registry.load();
-    let processed = match apply_op(store, indexes, &mut tx, &mut cycle, op, registry.as_ref()) {
+    let processed = match apply_op(store, indexes, &mut tx, &mut cycle, op) {
         Ok(OpOutcome::Sweep(processed)) => processed,
         Ok(_) => 0,
         Err(e) => {
@@ -1114,7 +1115,6 @@ fn apply_enqueue(
     cycle: &mut Cycle,
     jobs: Vec<PreparedJob>,
     now: i64,
-    registry: &QueueRegistry,
 ) -> Result<Vec<EnqueueResult>, Status> {
     let mut results = Vec::with_capacity(jobs.len());
 
@@ -1131,10 +1131,6 @@ fn apply_enqueue(
             continue;
         }
 
-        let mut limits = registry.effective(queue);
-        // Restart-only; see Store::boot_registry.
-        limits.dedup_window_ms = store.boot_registry.dedup_window_ms(queue);
-
         match check_dedup(store, tx, cycle, &job.req, now)? {
             DedupCheck::Hit(resp) => results.push(Ok(resp)),
             DedupCheck::Miss { stale_timer } => {
@@ -1142,7 +1138,7 @@ fn apply_enqueue(
                 // insert_job bumps immediately, so jobs admitted earlier in
                 // this batch already count against the cap. Dedup hits never
                 // get here and so never count.
-                if let Some(cap) = limits.max_queue_depth
+                if let Some(cap) = job.limits.max_queue_depth
                     && indexes.live_depth(queue) >= cap
                 {
                     results.push(Err(queue_full(queue, cap)));
@@ -1155,7 +1151,6 @@ fn apply_enqueue(
                     cycle,
                     job,
                     now,
-                    &limits,
                     stale_timer,
                 )));
             }
@@ -1172,7 +1167,6 @@ fn apply_enqueue_atomic(
     cycle: &mut Cycle,
     jobs: Vec<PreparedJob>,
     now: i64,
-    registry: &QueueRegistry,
 ) -> Result<AtomicEnqueueOutcome, Status> {
     // Atomic = all-or-nothing: if any job targets a queue being deleted, reject
     // the whole batch (mirrors the per-job QueueClosing in best-effort enqueue).
@@ -1192,15 +1186,20 @@ fn apply_enqueue_atomic(
     }
 
     // Capacity is checked for the whole batch up front so a full queue commits
-    // nothing. Dedup hits are conservatively counted as new jobs here.
-    let mut wanted: HashMap<&str, u64> = HashMap::new();
+    // nothing. Dedup hits are conservatively counted as new jobs here. Jobs in
+    // the same queue carry the same cap (resolved under one registry snapshot
+    // at propose time), so the first job seen speaks for its queue.
+    let mut wanted: HashMap<&str, (u64, Option<u64>)> = HashMap::new();
     for job in &jobs {
-        *wanted.entry(job.req.queue.as_str()).or_default() += 1;
+        wanted
+            .entry(job.req.queue.as_str())
+            .or_insert((0, job.limits.max_queue_depth))
+            .0 += 1;
     }
 
     let mut full: HashMap<&str, u64> = HashMap::new();
-    for (queue, count) in wanted {
-        if let Some(cap) = registry.effective(queue).max_queue_depth
+    for (queue, (count, cap)) in wanted {
+        if let Some(cap) = cap
             && indexes.live_depth(queue) + count > cap
         {
             full.insert(queue, cap);
@@ -1221,13 +1220,10 @@ fn apply_enqueue_atomic(
 
     let mut responses = Vec::with_capacity(jobs.len());
     for job in jobs {
-        let mut limits = registry.effective(&job.req.queue);
-        // Restart-only; see Store::boot_registry.
-        limits.dedup_window_ms = store.boot_registry.dedup_window_ms(&job.req.queue);
         responses.push(match check_dedup(store, tx, cycle, &job.req, now)? {
             DedupCheck::Hit(resp) => resp,
             DedupCheck::Miss { stale_timer } => {
-                insert_job(store, indexes, tx, cycle, job, now, &limits, stale_timer)
+                insert_job(store, indexes, tx, cycle, job, now, stale_timer)
             }
         });
     }
@@ -1235,7 +1231,6 @@ fn apply_enqueue_atomic(
     Ok(AtomicEnqueueOutcome::Committed(responses))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn insert_job(
     store: &Store,
     indexes: &mut Indexes,
@@ -1243,10 +1238,9 @@ fn insert_job(
     cycle: &mut Cycle,
     job: PreparedJob,
     now: i64,
-    limits: &EffectiveLimits,
     stale_dedup_timer: Option<Vec<u8>>,
 ) -> EnqueueResponse {
-    let PreparedJob { id, req } = job;
+    let PreparedJob { id, req, limits } = job;
     let queue = req.queue;
     let payload = req.payload;
 
@@ -1255,14 +1249,11 @@ fn insert_job(
         id: id.clone(),
         job_type: req.job_type,
         payload: None,
-        priority: req.priority.unwrap_or(limits.default_priority),
+        priority: limits.priority,
         trace_context: req.trace_context,
         enqueued_at: Some(millis_to_timestamp(now)),
         attempt: 1,
-        max_attempts: req
-            .max_attempts
-            .unwrap_or(limits.default_max_attempts)
-            .min(limits.max_attempts_ceiling),
+        max_attempts: limits.max_attempts,
         // Not yet leased; a real lease is stamped at reserve time.
         lease_expires_at: Some(millis_to_timestamp(0)),
         custom: req.custom,
@@ -1557,18 +1548,17 @@ struct DeadLetterMeta {
     last_reason: Option<String>,
 }
 
-// Depending on if the retention is set or not
+// Stores the job in the DLQ, or drops it when the op says retention is
+// disabled.
 fn maybe_store_dead_letter(
     store: &Store,
     indexes: &mut Indexes,
     tx: &mut WriteTransaction<'_>,
     job_id: &[u8],
     meta: DeadLetterMeta,
+    dead_letter_enabled: bool,
 ) -> Result<(), Status> {
-    // Deliberately boot config rather than an op scalar: whether the DLQ
-    // exists at all is a cluster invariant, like the boot_registry dedup
-    // windows.
-    if store.params.dead_letter_retention_ms == 0 {
+    if !dead_letter_enabled {
         return Ok(());
     }
 
@@ -1824,6 +1814,7 @@ fn apply_dead_letter_jobs(
     state: PeekState,
     keys: Vec<Vec<u8>>,
     reason: Option<String>,
+    dead_letter_enabled: bool,
     now: i64,
 ) -> Result<DeadLetterJobsOutcome, Status> {
     if !matches!(state, PeekState::Ready | PeekState::Scheduled) {
@@ -1913,6 +1904,7 @@ fn apply_dead_letter_jobs(
                 attempt,
                 last_reason: reason.clone(),
             },
+            dead_letter_enabled,
         )?;
 
         match state {
@@ -2124,6 +2116,7 @@ fn policy_retry_delay_ms(policy: &RetryPolicy, attempt: u32, job_id: &str) -> u6
     capped - retry_jitter_hash(job_id, attempt) % (capped / 4 + 1)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_nack(
     store: &Store,
     indexes: &mut Indexes,
@@ -2131,6 +2124,7 @@ fn apply_nack(
     cycle: &mut Cycle,
     req: NackRequest,
     retry_delay_ms: u64,
+    dead_letter_enabled: bool,
     now: i64,
 ) -> Result<NackOutcome, Status> {
     let stored = tx
@@ -2169,6 +2163,7 @@ fn apply_nack(
                 attempt: inflight.attempt,
                 last_reason: req.reason.clone(),
             },
+            dead_letter_enabled,
         )?;
 
         tx.remove(&store.jobs, req.job_id.as_bytes().to_vec());
@@ -2234,8 +2229,8 @@ fn apply_extend(
     tx: &mut WriteTransaction<'_>,
     cycle: &mut Cycle,
     req: ExtendRequest,
+    lease_ms: u64,
     now: i64,
-    registry: &QueueRegistry,
 ) -> Result<ExtendOutcome, Status> {
     let stored = tx
         .get(&store.inflight, req.job_id.as_bytes())
@@ -2247,21 +2242,14 @@ fn apply_extend(
         return Err(Status::failed_precondition("attempt mismatch"));
     }
 
-    let max_lease = registry.effective(&inflight.queue).max_lease_duration_ms;
     let old_timer = TimerKey {
         deadline: inflight.lease_expires_at,
         job_id: &req.job_id,
     }
     .encode();
-    // Floor at 1ms for the same reason as Reserve: a sub-ms lease truncates to
-    // 0 and would expire the moment it is granted (max_lease is validated >= 1).
-    let lease_ms = req
-        .lease_duration
-        .as_ref()
-        .map(duration_to_millis)
-        .unwrap_or(0)
-        .min(max_lease)
-        .max(1);
+    // The max-lease clamp happened at propose time (see resolve_extend_lease).
+    // Floor at 1ms so a zero in the log cannot grant an already-expired lease.
+    let lease_ms = lease_ms.max(1);
     let lease_expires_at = now.saturating_add(i64::try_from(lease_ms).unwrap_or(i64::MAX));
     inflight.lease_expires_at = lease_expires_at;
 
@@ -2290,6 +2278,7 @@ fn apply_extend(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_sweep(
     store: &Store,
     indexes: &mut Indexes,
@@ -2298,6 +2287,7 @@ fn apply_sweep(
     now: i64,
     budget: usize,
     retention_cutoff_ms: Option<i64>,
+    dead_letter_enabled: bool,
 ) -> Result<usize, Status> {
     let mut processed = 0usize;
 
@@ -2447,6 +2437,7 @@ fn apply_sweep(
                     attempt: inflight.attempt,
                     last_reason: None,
                 },
+                dead_letter_enabled,
             )?;
 
             tx.remove(&store.jobs, job_id.to_vec());
@@ -2824,6 +2815,8 @@ pub struct Storage {
     admin_stats: Arc<ArcSwap<AdminSnapshot>>,
     drain_scan_cap: usize,
     registry: SharedRegistry,
+    boot_registry: Arc<QueueRegistry>,
+    dead_letter_enabled: bool,
 }
 
 impl Storage {
@@ -2924,8 +2917,6 @@ impl Storage {
             meta,
             db,
             params,
-            boot_registry: registry.load_full(),
-            registry: registry.clone(),
             metrics,
         };
         let read = ReadHandle {
@@ -2949,7 +2940,7 @@ impl Storage {
         );
 
         if config.server.strict_queues {
-            warn_on_undeclared_persisted_queues(&store);
+            warn_on_undeclared_persisted_queues(&store, &registry.load());
         }
 
         let (tx, rx) = flume::bounded(config.storage.command_queue_capacity);
@@ -2995,7 +2986,9 @@ impl Storage {
             read,
             admin_stats,
             drain_scan_cap: config.storage.sweep_limit,
+            boot_registry: registry.load_full(),
             registry,
+            dead_letter_enabled: config.storage.dead_letter_retention_ms > 0,
         })
     }
 
@@ -3039,8 +3032,15 @@ impl Storage {
         Status::internal("storage returned a mismatched op outcome")
     }
 
+    fn prepare_jobs(&self, jobs: Vec<EnqueueRequest>) -> Vec<PreparedJob> {
+        let live = self.registry.load();
+        jobs.into_iter()
+            .map(|req| PreparedJob::new(req, &live, &self.boot_registry))
+            .collect()
+    }
+
     pub async fn enqueue(&self, jobs: Vec<EnqueueRequest>) -> Result<Vec<EnqueueResult>, Status> {
-        let jobs = jobs.into_iter().map(PreparedJob::new).collect();
+        let jobs = self.prepare_jobs(jobs);
         // now_ms: 0 on every op built here; the committer stamps the real
         // drain time (see Op::stamp).
         match self.send_op(Op::Enqueue { jobs, now_ms: 0 }).await? {
@@ -3053,7 +3053,7 @@ impl Storage {
         &self,
         jobs: Vec<EnqueueRequest>,
     ) -> Result<AtomicEnqueueOutcome, Status> {
-        let jobs = jobs.into_iter().map(PreparedJob::new).collect();
+        let jobs = self.prepare_jobs(jobs);
         match self.send_op(Op::EnqueueAtomic { jobs, now_ms: 0 }).await? {
             OpOutcome::EnqueueAtomic(outcome) => Ok(outcome),
             _ => Err(Self::mismatched_outcome()),
@@ -3095,6 +3095,7 @@ impl Storage {
             .send_op(Op::Nack {
                 req,
                 retry_delay_ms,
+                dead_letter_enabled: self.dead_letter_enabled,
                 now_ms: 0,
             })
             .await?
@@ -3132,10 +3133,49 @@ impl Storage {
     }
 
     pub async fn extend(&self, req: ExtendRequest) -> Result<ExtendOutcome, Status> {
-        match self.send_op(Op::Extend { req, now_ms: 0 }).await? {
+        let lease_ms = self.resolve_extend_lease(&req).await?;
+        match self
+            .send_op(Op::Extend {
+                req,
+                lease_ms,
+                now_ms: 0,
+            })
+            .await?
+        {
             OpOutcome::Extend(outcome) => Ok(outcome),
             _ => Err(Self::mismatched_outcome()),
         }
+    }
+
+    // Like resolve_retry_delay: the job's queue names the max-lease clamp. A
+    // job's queue never changes, so the read-side lookup racing the committer
+    // is safe.
+    async fn resolve_extend_lease(&self, req: &ExtendRequest) -> Result<u64, Status> {
+        let requested = req
+            .lease_duration
+            .as_ref()
+            .map(duration_to_millis)
+            .unwrap_or(0)
+            .max(1);
+
+        let registry = self.registry.load();
+        // Fast path, like any_retry_policy for nacks: at or under every
+        // queue's ceiling the clamp is the identity, so skip the lookup.
+        if requested <= registry.min_max_lease_ms() {
+            return Ok(requested);
+        }
+
+        let read = self.read.clone();
+        let job_id = req.job_id.clone();
+        let queue = tokio::task::spawn_blocking(move || read.queue_of_inflight_job(&job_id))
+            .await
+            .map_err(|_| Status::internal("storage read task failed"))??;
+        let Some(queue) = queue else {
+            return Err(Status::not_found("job not found"));
+        };
+
+        let max_lease = registry.effective(&queue).max_lease_duration_ms;
+        Ok(requested.min(max_lease))
     }
 
     pub async fn drain_dead_letters(
@@ -3225,6 +3265,7 @@ impl Storage {
             state,
             keys,
             reason,
+            dead_letter_enabled: self.dead_letter_enabled,
             now_ms: 0,
         };
         match self.send_op(op).await? {
@@ -3725,6 +3766,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
     }
 
+    #[test]
+    fn prepare_jobs_resolves_live_limits_and_boot_dedup_window() {
+        let path = std::env::temp_dir().join(format!("sepp-storage-test-{}", Uuid::new_v4()));
+        let mut boot_cfg = Config::default();
+        boot_cfg.server.db_path = path.to_str().expect("utf-8 temp path").to_string();
+        boot_cfg.storage.dedup_window_ms = 1;
+        let registry = QueueRegistry::from_config(&boot_cfg).into_shared();
+        let storage =
+            Storage::open(&boot_cfg, registry.clone(), Metrics::new(false)).expect("open storage");
+
+        // A hot reload changes both knobs; only the priority may follow it.
+        let mut live_cfg = Config::default();
+        live_cfg.storage.dedup_window_ms = 3_600_000;
+        live_cfg.limits.default_priority = 7;
+        crate::queues::publish(&registry, QueueRegistry::from_config(&live_cfg));
+
+        let jobs = storage.prepare_jobs(vec![test_req("q")]);
+        assert_eq!(jobs[0].limits.priority, 7, "live limits follow the reload");
+        assert_eq!(
+            jobs[0].limits.dedup_window_ms, 1,
+            "the dedup window stays boot-pinned"
+        );
+
+        drop(storage);
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
     fn open_test_store() -> Store {
         let path = std::env::temp_dir().join(format!("sepp-storage-test-{}", Uuid::new_v4()));
         let db = TxDatabase::builder(path)
@@ -3751,8 +3819,6 @@ mod tests {
                 dead_letter_retention_ms: 0,
                 admin_enabled: true,
             },
-            registry: crate::queues::QueueRegistry::from_config(&Config::default()).into_shared(),
-            boot_registry: Arc::new(QueueRegistry::from_config(&Config::default())),
             metrics: Metrics::new(false),
         }
     }
@@ -3786,7 +3852,8 @@ mod tests {
     }
 
     fn test_job(queue: &str) -> PreparedJob {
-        PreparedJob::new(test_req(queue))
+        let registry = QueueRegistry::from_config(&Config::default());
+        PreparedJob::new(test_req(queue), &registry, &registry)
     }
 
     #[test]
@@ -3804,7 +3871,6 @@ mod tests {
             &mut cycle,
             vec![test_job("q"), test_job("other")],
             now_ms(),
-            store.registry.load().as_ref(),
         )
         .expect("enqueue applies");
 
@@ -3825,7 +3891,6 @@ mod tests {
             &mut cycle,
             vec![test_job("q")],
             now_ms(),
-            store.registry.load().as_ref(),
         )
         .expect("enqueue applies");
         assert!(results[0].is_ok());
@@ -3846,7 +3911,6 @@ mod tests {
             &mut cycle,
             vec![test_job("other"), test_job("q")],
             now_ms(),
-            store.registry.load().as_ref(),
         )
         .expect("atomic enqueue applies");
 
@@ -3899,6 +3963,7 @@ mod tests {
             now_ms(),
             1000,
             None,
+            false,
         )
         .expect("sweep applies");
 
@@ -3930,6 +3995,7 @@ mod tests {
             1_000,
             1000,
             Some(200),
+            true,
         )
         .expect("sweep applies");
 
@@ -3990,16 +4056,18 @@ mod tests {
     }
 
     #[test]
-    fn dedup_check_window_is_pinned_at_boot() {
-        let mut store = open_test_store();
+    fn dedup_window_is_pinned_at_boot() {
+        // The pin now lives at propose time: PreparedJob::new resolves the
+        // dedup window from the boot registry, not the live (hot-reloaded)
+        // one, and apply only ever sees the carried value.
+        let store = open_test_store();
         let mut boot_cfg = Config::default();
         boot_cfg.storage.dedup_window_ms = 1;
-        store.boot_registry = Arc::new(QueueRegistry::from_config(&boot_cfg));
+        let boot = QueueRegistry::from_config(&boot_cfg);
         // An hour-long hot-reloaded window must not stretch the boot window.
         let mut live_cfg = Config::default();
         live_cfg.storage.dedup_window_ms = 3_600_000;
-        crate::queues::publish(&store.registry, QueueRegistry::from_config(&live_cfg));
-        let registry = store.registry.load();
+        let live = QueueRegistry::from_config(&live_cfg);
 
         let mut indexes = Indexes::default();
         let mut tx = store.db.write_tx();
@@ -4013,25 +4081,23 @@ mod tests {
             &mut indexes,
             &mut tx,
             &mut cycle,
-            vec![PreparedJob::new(req.clone())],
+            vec![PreparedJob::new(req.clone(), &live, &boot)],
             now_ms(),
-            registry.as_ref(),
         )
         .expect("enqueue applies")
         .remove(0)
         .expect("the first enqueue is accepted");
 
         // Outlive the 1ms boot window. The dedup record itself is still there
-        // (no sweep has run), so a check against the live window would hit.
+        // (no sweep has run), so a deadline from the live window would hit.
         std::thread::sleep(std::time::Duration::from_millis(10));
         let second = apply_enqueue(
             &store,
             &mut indexes,
             &mut tx,
             &mut cycle,
-            vec![PreparedJob::new(req)],
+            vec![PreparedJob::new(req, &live, &boot)],
             now_ms(),
-            registry.as_ref(),
         )
         .expect("enqueue applies")
         .remove(0)
@@ -4039,7 +4105,7 @@ mod tests {
 
         assert!(
             !second.deduplicated,
-            "the boot window, not the live one, bounds the dedup check"
+            "the boot window, not the live one, bounds the dedup deadline"
         );
         assert_ne!(second.job_id, first.job_id);
     }

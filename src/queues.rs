@@ -11,6 +11,10 @@ pub struct QueueRegistry {
     // True when some queue can resolve a nonzero policy delay; when false the
     // nack path skips its inflight lookup entirely.
     any_retry_policy: bool,
+    // The floor of max_lease_duration_ms across the defaults and every queue
+    // override: a lease at or under it is unclamped for every possible queue,
+    // so the extend path can skip its inflight lookup.
+    min_max_lease_ms: u64,
     // Bumped on every publish() so a registry snapshot can be referenced
     // compactly (e.g. by an op-stream recording). Boot is generation 0.
     generation: u64,
@@ -47,6 +51,11 @@ impl QueueRegistry {
                     .queues
                     .iter()
                     .any(|q| q.retry_delay_ms.is_some_and(|v| v > 0)),
+            min_max_lease_ms: cfg
+                .queues
+                .iter()
+                .filter_map(|q| q.max_lease_duration_ms)
+                .fold(defaults.max_lease_duration_ms, u64::min),
             defaults,
             declared,
             generation: 0,
@@ -70,6 +79,10 @@ impl QueueRegistry {
 
     pub fn any_retry_policy(&self) -> bool {
         self.any_retry_policy
+    }
+
+    pub fn min_max_lease_ms(&self) -> u64 {
+        self.min_max_lease_ms
     }
 
     pub fn retry_policy(&self, queue: &str) -> RetryPolicy {
@@ -186,6 +199,31 @@ mod tests {
 
         assert!(reg.any_retry_policy());
         assert!(!QueueRegistry::from_config(&cfg_with(vec![])).any_retry_policy());
+    }
+
+    #[test]
+    fn min_max_lease_is_the_floor_across_defaults_and_overrides() {
+        let mut cfg = cfg_with(vec![
+            QueueConfig {
+                name: "short".into(),
+                max_lease_duration_ms: Some(5_000),
+                ..Default::default()
+            },
+            QueueConfig {
+                name: "long".into(),
+                max_lease_duration_ms: Some(600_000),
+                ..Default::default()
+            },
+        ]);
+        cfg.limits.max_lease_duration_ms = 30_000;
+        let reg = QueueRegistry::from_config(&cfg);
+        assert_eq!(reg.min_max_lease_ms(), 5_000);
+
+        let no_overrides = QueueRegistry::from_config(&cfg_with(vec![]));
+        assert_eq!(
+            no_overrides.min_max_lease_ms(),
+            no_overrides.effective("any").max_lease_duration_ms
+        );
     }
 
     #[test]

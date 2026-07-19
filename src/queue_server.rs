@@ -896,8 +896,8 @@ impl QueueService for QueueServer {
             let req = request.into_inner();
             validate::extend_request(&req).map_err(Status::invalid_argument)?;
 
-            // The per-queue lease ceiling is applied inside storage where the
-            // job's queue is known via its Inflight record.
+            // The per-queue lease ceiling is applied by the storage handle at
+            // op construction (see resolve_extend_lease).
             let job_id = req.job_id.clone();
             let outcome = self.storage.extend(req).await?;
             let span = tracing::Span::current();

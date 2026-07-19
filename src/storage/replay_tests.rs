@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use prost::Message;
 
 use super::*;
-use crate::config::{QueueConfig, RetryBackoff};
-use crate::op::{Op, PreparedJob};
+use crate::config::QueueConfig;
+use crate::op::{JobLimits, Op, PreparedJob};
 use crate::pb::sepp::storage::v1 as op_proto;
 use crate::pb::sepp::v1::{NackRetry, Payload, nack_retry};
 use crate::pb::{duration_to_millis, millis_to_duration};
@@ -32,13 +32,32 @@ fn replay_config() -> Config {
     cfg
 }
 
+fn base_params() -> StorageParams {
+    StorageParams {
+        persist_mode: PersistMode::Buffer,
+        sweep_limit: 100,
+        dead_letter_retention_ms: 60_000,
+        admin_enabled: false,
+    }
+}
+
+// Every field differs from base_params.
+fn skewed_params() -> StorageParams {
+    StorageParams {
+        persist_mode: PersistMode::SyncAll,
+        sweep_limit: 7,
+        dead_letter_retention_ms: 0,
+        admin_enabled: true,
+    }
+}
+
 struct Harness {
     store: Store,
     indexes: Indexes,
 }
 
 impl Harness {
-    fn open(cfg: &Config) -> Self {
+    fn open(params: StorageParams) -> Self {
         let path = std::env::temp_dir().join(format!("sepp-replay-test-{}", Uuid::new_v4()));
         let db = TxDatabase::builder(path)
             .temporary(true)
@@ -58,16 +77,7 @@ impl Harness {
             dead_letter: db.keyspace("dead_letter", opts).unwrap(),
             meta: db.keyspace("meta", opts).unwrap(),
             db,
-            params: StorageParams {
-                persist_mode: PersistMode::Buffer,
-                sweep_limit: 100,
-                // Cluster invariant: must match on every store a stream is
-                // applied to. Enabled so dead-letter rows are exercised.
-                dead_letter_retention_ms: 60_000,
-                admin_enabled: false,
-            },
-            registry: QueueRegistry::from_config(cfg).into_shared(),
-            boot_registry: Arc::new(QueueRegistry::from_config(cfg)),
+            params,
             metrics: Metrics::new(false),
         };
         let indexes = rebuild_indexes(&store).expect("rebuild");
@@ -76,7 +86,6 @@ impl Harness {
     }
 
     fn apply(&mut self, op: &Op) -> Result<OpOutcome, Status> {
-        let registry = self.store.registry.load();
         let mut tx = self.store.db.write_tx();
         let mut cycle = Cycle::new(false);
         let result = apply_op(
@@ -85,7 +94,6 @@ impl Harness {
             &mut tx,
             &mut cycle,
             op.clone(),
-            registry.as_ref(),
         );
         if let Err(e) = &result {
             assert_ne!(
@@ -102,8 +110,8 @@ impl Harness {
         result
     }
 
-    fn replay(cfg: &Config, ops: &[Op]) -> (Self, Vec<String>) {
-        let mut harness = Self::open(cfg);
+    fn replay(params: StorageParams, ops: &[Op]) -> (Self, Vec<String>) {
+        let mut harness = Self::open(params);
         let outcomes = ops
             .iter()
             .map(|op| dbg_outcome(harness.apply(op)))
@@ -177,7 +185,7 @@ fn assert_indexes_match_rebuild(harness: &Harness, label: &str) {
 
 // Applies a stream to a source store and to two fresh stores, then asserts
 // the determinism contract on all three.
-fn assert_stream_replays(cfg: &Config, source: &Harness, ops: &[Op], outcomes: &[String]) {
+fn assert_stream_replays(source: &Harness, ops: &[Op], outcomes: &[String]) {
     // One replay runs the ops through their serialized form, so what's proven
     // deterministic is the recorded artifact itself, not just the in-memory
     // clones.
@@ -190,8 +198,8 @@ fn assert_stream_replays(cfg: &Config, source: &Harness, ops: &[Op], outcomes: &
         })
         .collect();
 
-    let (replay_a, outcomes_a) = Harness::replay(cfg, ops);
-    let (replay_b, outcomes_b) = Harness::replay(cfg, &roundtripped);
+    let (replay_a, outcomes_a) = Harness::replay(base_params(), ops);
+    let (replay_b, outcomes_b) = Harness::replay(base_params(), &roundtripped);
 
     for (i, (src, rep)) in outcomes.iter().zip(&outcomes_a).enumerate() {
         assert_eq!(
@@ -209,7 +217,14 @@ fn assert_stream_replays(cfg: &Config, source: &Harness, ops: &[Op], outcomes: &
 }
 
 fn job(id: &str, req: EnqueueRequest) -> PreparedJob {
-    PreparedJob { id: id.into(), req }
+    // Propose-time resolution, as the handle would do it, from the proposer's
+    // config in replay_config.
+    let registry = QueueRegistry::from_config(&replay_config());
+    PreparedJob {
+        id: id.into(),
+        limits: JobLimits::resolve(&req, &registry, &registry),
+        req,
+    }
 }
 
 fn req(queue: &str) -> EnqueueRequest {
@@ -220,7 +235,13 @@ fn req(queue: &str) -> EnqueueRequest {
     }
 }
 
-fn nack(job_id: &str, attempt: u32, strategy: nack_retry::Strategy, now_ms: i64) -> Op {
+fn nack(
+    job_id: &str,
+    attempt: u32,
+    strategy: nack_retry::Strategy,
+    dead_letter_enabled: bool,
+    now_ms: i64,
+) -> Op {
     // Stand-in for construction-time resolution: Default gets a small
     // attempt-derived delay so directive-less nacks exercise the scheduled
     // path too.
@@ -240,6 +261,7 @@ fn nack(job_id: &str, attempt: u32, strategy: nack_retry::Strategy, now_ms: i64)
             worker_id: None,
         },
         retry_delay_ms,
+        dead_letter_enabled,
         now_ms,
     }
 }
@@ -249,8 +271,7 @@ fn nack(job_id: &str, attempt: u32, strategy: nack_retry::Strategy, now_ms: i64)
 // the contract under test is that three stores agree on all of them.
 #[test]
 fn recorded_stream_replays_identically() {
-    let cfg = replay_config();
-    let mut source = Harness::open(&cfg);
+    let mut source = Harness::open(base_params());
 
     let t = 1_000_000;
     let dl_key = |failed_at: i64, queue: &str, job_id: &str| {
@@ -331,6 +352,7 @@ fn recorded_stream_replays_identically() {
             "j01",
             1,
             nack_retry::Strategy::Delay(millis_to_duration(2_000)),
+            true,
             t + 2_000,
         ),
         // Stale attempt: rejected, and the rejection must replay too.
@@ -345,6 +367,7 @@ fn recorded_stream_replays_identically() {
                 lease_duration: Some(millis_to_duration(30_000)),
                 worker_id: None,
             },
+            lease_ms: 30_000,
             now_ms: t + 3_000,
         },
         // Rejected via max_attempts = 1: lands in dead_letter at t + 4_000.
@@ -354,12 +377,19 @@ fn recorded_stream_replays_identically() {
             max_jobs: 1,
             now_ms: t + 3_500,
         },
-        nack("j07", 1, nack_retry::Strategy::DeadLetter(()), t + 4_000),
+        nack(
+            "j07",
+            1,
+            nack_retry::Strategy::DeadLetter(()),
+            true,
+            t + 4_000,
+        ),
         // Promotes j03 and the delayed j01; dedup for "k1" expires later.
         Op::Sweep {
             now_ms: t + 6_000,
             budget: 100,
             retention_cutoff_ms: Some(t - 54_000),
+            dead_letter_enabled: true,
         },
         Op::CloseQueue {
             queue: "alpha".into(),
@@ -412,6 +442,7 @@ fn recorded_stream_replays_identically() {
                 .encode(),
             ],
             reason: Some("manual".into()),
+            dead_letter_enabled: true,
             now_ms: t + 7_000,
         },
         Op::DeadLetterJobs {
@@ -425,6 +456,7 @@ fn recorded_stream_replays_identically() {
                 .encode(),
             ],
             reason: None,
+            dead_letter_enabled: true,
             now_ms: t + 7_100,
         },
         Op::DeleteDeadLetters {
@@ -451,6 +483,7 @@ fn recorded_stream_replays_identically() {
             now_ms: t + 5_900,
             budget: 100,
             retention_cutoff_ms: Some(t - 54_100),
+            dead_letter_enabled: true,
         },
     ];
 
@@ -464,7 +497,7 @@ fn recorded_stream_replays_identically() {
         );
     }
 
-    assert_stream_replays(&cfg, &source, &ops, &outcomes);
+    assert_stream_replays(&source, &ops, &outcomes);
 }
 
 // xorshift64: deterministic per seed, no dependency.
@@ -520,7 +553,13 @@ fn random_job(rng: &mut Rng, next_id: &mut u32, now: i64) -> PreparedJob {
     job(&format!("j{next_id:05}"), req)
 }
 
-fn random_op(rng: &mut Rng, next_id: &mut u32, leases: &mut Vec<(String, u32)>, now: i64) -> Op {
+fn random_op(
+    rng: &mut Rng,
+    next_id: &mut u32,
+    leases: &mut Vec<(String, u32)>,
+    dead_letter_enabled: bool,
+    now: i64,
+) -> Op {
     let lease_target = |rng: &mut Rng, leases: &mut Vec<(String, u32)>| {
         if leases.is_empty() || rng.chance(15) {
             return ("j-bogus".to_string(), 1);
@@ -564,17 +603,20 @@ fn random_op(rng: &mut Rng, next_id: &mut u32, leases: &mut Vec<(String, u32)>, 
                 1 => nack_retry::Strategy::Delay(millis_to_duration(1 + rng.below(2_000))),
                 _ => nack_retry::Strategy::DeadLetter(()),
             };
-            nack(&job_id, attempt, strategy, now)
+            nack(&job_id, attempt, strategy, dead_letter_enabled, now)
         }
         80..=84 => {
             let (job_id, attempt) = lease_target(rng, leases);
+            // Stand-in for construction-time resolution, like nack's delay.
+            let lease = 1 + rng.below(3_000);
             Op::Extend {
                 req: ExtendRequest {
                     job_id,
                     attempt,
-                    lease_duration: Some(millis_to_duration(1 + rng.below(3_000))),
+                    lease_duration: Some(millis_to_duration(lease)),
                     worker_id: None,
                 },
+                lease_ms: lease,
                 now_ms: now,
             }
         }
@@ -582,6 +624,7 @@ fn random_op(rng: &mut Rng, next_id: &mut u32, leases: &mut Vec<(String, u32)>, 
             now_ms: now,
             budget: 1 + rng.below(8) as usize,
             retention_cutoff_ms: Some(now - 60_000),
+            dead_letter_enabled,
         },
         93..=94 => Op::CloseQueue {
             queue: rng.queue(),
@@ -601,15 +644,16 @@ fn random_op(rng: &mut Rng, next_id: &mut u32, leases: &mut Vec<(String, u32)>, 
     }
 }
 
-// Applies `steps` random ops to a fresh store under `cfg` and returns the
-// store, the op stream and the outcomes. `step_now` drives the clock.
+// Applies `steps` random ops to a fresh store and returns the store, the op
+// stream and the outcomes. `step_now` drives the clock; `dead_letter_enabled`
+// is what the stream's proposer would emit from its retention config.
 fn generate_stream(
-    cfg: &Config,
     rng: &mut Rng,
     steps: usize,
+    dead_letter_enabled: bool,
     mut step_now: impl FnMut(&mut Rng) -> i64,
 ) -> (Harness, Vec<Op>, Vec<String>) {
-    let mut source = Harness::open(cfg);
+    let mut source = Harness::open(base_params());
     let mut now: i64 = 1_000_000;
     let mut next_id = 0u32;
     let mut leases: Vec<(String, u32)> = Vec::new();
@@ -618,7 +662,7 @@ fn generate_stream(
 
     for _ in 0..steps {
         now += step_now(rng);
-        let op = random_op(rng, &mut next_id, &mut leases, now);
+        let op = random_op(rng, &mut next_id, &mut leases, dead_letter_enabled, now);
         let outcome = source.apply(&op);
         if let Ok(OpOutcome::Reserve(jobs)) = &outcome {
             leases.extend(jobs.iter().map(|j| (j.id.clone(), j.attempt)));
@@ -632,7 +676,6 @@ fn generate_stream(
 
 #[test]
 fn random_interleavings_replay_identically() {
-    let cfg = replay_config();
     // Coverage markers over all seeds: the interleavings must actually hit
     // the paths the spec calls out, or the whole test is a placebo.
     let markers = [
@@ -647,8 +690,10 @@ fn random_interleavings_replay_identically() {
 
     for seed in 1..=6u64 {
         let mut rng = Rng(seed);
+        // Half the seeds propose with the DLQ disabled so both branches of
+        // maybe_store_dead_letter replay through serialization.
         let (source, ops, outcomes) =
-            generate_stream(&cfg, &mut rng, 300, |rng| match rng.below(100) {
+            generate_stream(&mut rng, 300, seed % 2 == 1, |rng| match rng.below(100) {
                 0..=69 => rng.range(1, 500),
                 70..=84 => 0,
                 85..=94 => rng.range(500, 5_000),
@@ -661,7 +706,7 @@ fn random_interleavings_replay_identically() {
             }
         }
         eprintln!("seed {seed}: {} ops applied", ops.len());
-        assert_stream_replays(&cfg, &source, &ops, &outcomes);
+        assert_stream_replays(&source, &ops, &outcomes);
     }
 
     for (i, marker) in markers.iter().enumerate() {
@@ -669,41 +714,101 @@ fn random_interleavings_replay_identically() {
     }
 }
 
-// Ops carry every config-derived value their apply path needs, so stores
-// running under different configs must produce identical outcomes and state
-// from the same stream. Retry policy is the first field covered; grow the
-// config delta as more apply sites move to op-carried values.
+// Ops carry every config-derived value their apply path needs: queue limits,
+// dedup windows, retry delays, lease clamps and the dead-letter flag all
+// resolve at propose time. The registry config can no longer leak into apply
+// at all — Store holds none — so the one node-local knob left is the params
+// struct: a store where every params field differs (most interestingly the
+// DLQ disabled) must still apply the stream identically, because whether a
+// dead-lettered job is stored rides in each op.
 #[test]
-fn replay_is_blind_to_retry_policy_config() {
-    let base = replay_config();
-    let mut skewed = replay_config();
-    skewed.limits.retry_delay_ms = 60_000;
-    skewed.limits.retry_backoff = RetryBackoff::Exponential;
-    skewed.limits.retry_delay_max_ms = 600_000;
-    for q in &mut skewed.queues {
-        q.retry_delay_ms = Some(120_000);
-        q.retry_backoff = Some(RetryBackoff::None);
-    }
-
+fn replay_is_blind_to_node_params() {
     let mut rng = Rng(42);
-    let (source, ops, outcomes) = generate_stream(&base, &mut rng, 300, |rng| rng.range(1, 500));
+    let (source, ops, outcomes) = generate_stream(&mut rng, 300, true, |rng| rng.range(1, 500));
 
-    let has_directive_less_nack = ops.iter().any(|op| {
-        matches!(op, Op::Nack { req, .. }
-        if matches!(
-            req.retry.as_ref().and_then(|r| r.strategy.as_ref()),
-            Some(nack_retry::Strategy::Default(_))
-        ))
-    });
     assert!(
-        has_directive_less_nack,
-        "stream never hit the policy-relevant path; change the seed"
+        outcomes.iter().any(|o| o.contains("dead_lettered: true")),
+        "stream never stored a dead letter; change the seed"
     );
 
-    let (skewed_replay, skewed_outcomes) = Harness::replay(&skewed, &ops);
+    let (skewed_replay, skewed_outcomes) = Harness::replay(skewed_params(), &ops);
     assert_eq!(
         outcomes, skewed_outcomes,
-        "an outcome depended on node-local retry policy config"
+        "an outcome depended on node-local params"
     );
-    assert_identical_state(&source, &skewed_replay, "base vs skewed retry policy");
+    assert_identical_state(&source, &skewed_replay, "base vs skewed params");
+}
+
+// The drop branch of the flag: a retention-disabled proposer emits
+// dead_letter_enabled: false, so dead-lettered jobs are deleted outright —
+// outcomes still report them and the stream must replay identically.
+#[test]
+fn dead_letter_disabled_stream_drops_jobs_and_replays() {
+    let mut source = Harness::open(base_params());
+    let t = 1_000_000;
+    let ops: Vec<Op> = vec![
+        Op::Enqueue {
+            jobs: vec![
+                job("j1", req("gamma")),
+                job(
+                    "j2",
+                    EnqueueRequest {
+                        priority: Some(4),
+                        ..req("alpha")
+                    },
+                ),
+            ],
+            now_ms: t,
+        },
+        Op::Reserve {
+            queues: vec!["gamma".into()],
+            lease_ms: 10_000,
+            max_jobs: 1,
+            now_ms: t + 100,
+        },
+        nack(
+            "j1",
+            1,
+            nack_retry::Strategy::DeadLetter(()),
+            false,
+            t + 200,
+        ),
+        Op::DeadLetterJobs {
+            queue: "alpha".into(),
+            state: PeekState::Ready,
+            keys: vec![
+                ReadyKey {
+                    queue: "alpha",
+                    priority: 4,
+                    enqueued_at: t,
+                    job_id: "j2",
+                }
+                .encode(),
+            ],
+            reason: None,
+            dead_letter_enabled: false,
+            now_ms: t + 300,
+        },
+    ];
+
+    let outcomes: Vec<String> = ops.iter().map(|op| dbg_outcome(source.apply(op))).collect();
+    assert!(
+        outcomes[2].contains("dead_lettered: true"),
+        "the nack still reports the dead-letter: {}",
+        outcomes[2]
+    );
+    assert!(
+        outcomes[3].contains("dead_lettered: 1"),
+        "the admin op still reports the dead-letter: {}",
+        outcomes[3]
+    );
+
+    let contents = logical_contents(&source.store);
+    assert!(contents["dead_letter"].is_empty(), "no DLQ rows are stored");
+    assert!(
+        contents["jobs"].is_empty() && contents["payloads"].is_empty(),
+        "dropped jobs are still deleted"
+    );
+
+    assert_stream_replays(&source, &ops, &outcomes);
 }

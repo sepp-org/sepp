@@ -3,6 +3,7 @@ use uuid::Uuid;
 
 use crate::pb::sepp::storage::v1 as proto;
 use crate::pb::sepp::v1::{EnqueueRequest, ExtendRequest, NackRequest};
+use crate::queues::QueueRegistry;
 use crate::storage::PeekState;
 
 // A mutating committer operation: the future replicated-log entry. Carries no
@@ -32,10 +33,12 @@ pub enum Op {
     Nack {
         req: NackRequest,
         retry_delay_ms: u64,
+        dead_letter_enabled: bool,
         now_ms: i64,
     },
     Extend {
         req: ExtendRequest,
+        lease_ms: u64,
         now_ms: i64,
     },
     DrainDeadLetters {
@@ -61,6 +64,7 @@ pub enum Op {
         state: PeekState,
         keys: Vec<Vec<u8>>,
         reason: Option<String>,
+        dead_letter_enabled: bool,
         now_ms: i64,
     },
     DeleteDeadLetters {
@@ -75,6 +79,7 @@ pub enum Op {
         now_ms: i64,
         budget: usize,
         retention_cutoff_ms: Option<i64>,
+        dead_letter_enabled: bool,
     },
 }
 
@@ -103,18 +108,61 @@ impl Op {
     }
 }
 
-// An EnqueueRequest plus its pre-assigned job ID, generated before the op is
-// built so applying it is deterministic.
+// An EnqueueRequest plus its pre-assigned job ID and resolved limits,
+// generated before the op is built so applying it is deterministic.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PreparedJob {
     pub id: String,
     pub req: EnqueueRequest,
+    pub limits: JobLimits,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct JobLimits {
+    pub priority: u32,
+    pub max_attempts: u32,
+    pub dedup_window_ms: i64,
+    pub max_queue_depth: Option<u64>,
+}
+
+impl JobLimits {
+    pub fn resolve(req: &EnqueueRequest, live: &QueueRegistry, boot: &QueueRegistry) -> Self {
+        let eff = live.effective(&req.queue);
+        Self {
+            priority: req.priority.unwrap_or(eff.default_priority),
+            max_attempts: req
+                .max_attempts
+                .unwrap_or(eff.default_max_attempts)
+                .min(eff.max_attempts_ceiling),
+            dedup_window_ms: boot.dedup_window_ms(&req.queue),
+            max_queue_depth: eff.max_queue_depth,
+        }
+    }
+
+    fn to_proto(&self) -> proto::JobLimits {
+        proto::JobLimits {
+            priority: self.priority,
+            max_attempts: self.max_attempts,
+            dedup_window_ms: self.dedup_window_ms,
+            max_queue_depth: self.max_queue_depth,
+        }
+    }
+
+    fn from_proto(msg: proto::JobLimits) -> Self {
+        Self {
+            priority: msg.priority,
+            max_attempts: msg.max_attempts,
+            dedup_window_ms: msg.dedup_window_ms,
+            max_queue_depth: msg.max_queue_depth,
+        }
+    }
 }
 
 impl PreparedJob {
-    pub fn new(req: EnqueueRequest) -> Self {
+    pub fn new(req: EnqueueRequest, live: &QueueRegistry, boot: &QueueRegistry) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
+            limits: JobLimits::resolve(&req, live, boot),
             req,
         }
     }
@@ -123,6 +171,7 @@ impl PreparedJob {
         proto::PreparedJob {
             request: Some(self.req.clone()),
             job_id: self.id.clone(),
+            limits: Some(self.limits.to_proto()),
         }
     }
 
@@ -130,6 +179,7 @@ impl PreparedJob {
         Ok(Self {
             id: msg.job_id,
             req: msg.request.ok_or_else(|| corrupt("job without request"))?,
+            limits: JobLimits::from_proto(msg.limits.ok_or_else(|| corrupt("job without limits"))?),
         })
     }
 }
@@ -187,15 +237,22 @@ impl Op {
             Op::Nack {
                 req,
                 retry_delay_ms,
+                dead_letter_enabled,
                 now_ms,
             } => P::Nack(proto::NackOp {
                 request: Some(req.clone()),
                 now_ms: *now_ms,
                 retry_delay_ms: *retry_delay_ms,
+                dead_letter_enabled: *dead_letter_enabled,
             }),
-            Op::Extend { req, now_ms } => P::Extend(proto::ExtendOp {
+            Op::Extend {
+                req,
+                lease_ms,
+                now_ms,
+            } => P::Extend(proto::ExtendOp {
                 request: Some(req.clone()),
                 now_ms: *now_ms,
+                lease_ms: *lease_ms,
             }),
             Op::DrainDeadLetters {
                 queue,
@@ -232,6 +289,7 @@ impl Op {
                 state,
                 keys,
                 reason,
+                dead_letter_enabled,
                 now_ms,
             } => P::DeadLetterJobs(proto::DeadLetterJobsOp {
                 queue: queue.clone(),
@@ -239,6 +297,7 @@ impl Op {
                 keys: keys.clone(),
                 reason: reason.clone(),
                 now_ms: *now_ms,
+                dead_letter_enabled: *dead_letter_enabled,
             }),
             Op::DeleteDeadLetters { queue, keys } => {
                 P::DeleteDeadLetters(proto::DeleteDeadLettersOp {
@@ -254,10 +313,12 @@ impl Op {
                 now_ms,
                 budget,
                 retention_cutoff_ms,
+                dead_letter_enabled,
             } => P::Sweep(proto::SweepOp {
                 now_ms: *now_ms,
                 budget: *budget as u64,
                 retention_cutoff_ms: *retention_cutoff_ms,
+                dead_letter_enabled: *dead_letter_enabled,
             }),
         };
 
@@ -294,10 +355,12 @@ impl Op {
             P::Nack(o) => Op::Nack {
                 req: o.request.ok_or_else(|| corrupt("nack without request"))?,
                 retry_delay_ms: o.retry_delay_ms,
+                dead_letter_enabled: o.dead_letter_enabled,
                 now_ms: o.now_ms,
             },
             P::Extend(o) => Op::Extend {
                 req: o.request.ok_or_else(|| corrupt("extend without request"))?,
+                lease_ms: o.lease_ms,
                 now_ms: o.now_ms,
             },
             P::DrainDeadLetters(o) => Op::DrainDeadLetters {
@@ -321,6 +384,7 @@ impl Op {
                 state: state_from_proto(o.state)?,
                 keys: o.keys,
                 reason: o.reason,
+                dead_letter_enabled: o.dead_letter_enabled,
                 now_ms: o.now_ms,
             },
             P::DeleteDeadLetters(o) => Op::DeleteDeadLetters {
@@ -335,6 +399,7 @@ impl Op {
                 now_ms: o.now_ms,
                 budget: o.budget as usize,
                 retention_cutoff_ms: o.retention_cutoff_ms,
+                dead_letter_enabled: o.dead_letter_enabled,
             },
         })
     }
@@ -394,6 +459,12 @@ mod tests {
         let job = PreparedJob {
             id: "01234567-89ab-cdef-0123-456789abcdef".into(),
             req: sample_enqueue_request(),
+            limits: JobLimits {
+                priority: 7,
+                max_attempts: 3,
+                dedup_window_ms: 86_400_000,
+                max_queue_depth: Some(10_000),
+            },
         };
 
         vec![
@@ -426,6 +497,7 @@ mod tests {
                     worker_id: Some("w-1".into()),
                 },
                 retry_delay_ms: 5_000,
+                dead_letter_enabled: true,
                 now_ms: NOW,
             },
             Op::Extend {
@@ -435,6 +507,7 @@ mod tests {
                     lease_duration: Some(millis_to_duration(30_000)),
                     worker_id: Some("w-1".into()),
                 },
+                lease_ms: 30_000,
                 now_ms: NOW,
             },
             Op::DrainDeadLetters {
@@ -460,6 +533,7 @@ mod tests {
                 state: PeekState::Inflight,
                 keys: vec![b"k1".to_vec()],
                 reason: Some("manual".into()),
+                dead_letter_enabled: true,
                 now_ms: NOW,
             },
             Op::DeleteDeadLetters {
@@ -474,6 +548,7 @@ mod tests {
                 now_ms: NOW,
                 budget: 1000,
                 retention_cutoff_ms: Some(NOW - 86_400_000),
+                dead_letter_enabled: true,
             },
         ]
     }
@@ -506,20 +581,20 @@ mod tests {
     #[test]
     fn golden_op_encoding_is_pinned() {
         const GOLDEN: &[&str] = &[
-            "0acd010ac3010a9a010a066f7264657273120a73656e642d656d61696c1a160a027b7d12106170706c69636174696f6e2f6a736f6e22066964656d2d31280730033a390a3730302d30616637363531393136636434336464383434386562323131633830333139632d623761643662373136393230333333312d3031420e0a06726567696f6e12040a026575420d0a0772657472696573120218024a060880e2cfaa06122430313233343536372d383961622d636465662d303132332d3435363738396162636465661080d095ffbc31",
-            "12cd010ac3010a9a010a066f7264657273120a73656e642d656d61696c1a160a027b7d12106170706c69636174696f6e2f6a736f6e22066964656d2d31280730033a390a3730302d30616637363531393136636434336464383434386562323131633830333139632d623761643662373136393230333333312d3031420e0a06726567696f6e12040a026575420d0a0772657472696573120218024a060880e2cfaa06122430313233343536372d383961622d636465662d303132332d3435363738396162636465661080d095ffbc31",
+            "0adb010ad1010a9a010a066f7264657273120a73656e642d656d61696c1a160a027b7d12106170706c69636174696f6e2f6a736f6e22066964656d2d31280730033a390a3730302d30616637363531393136636434336464383434386562323131633830333139632d623761643662373136393230333333312d3031420e0a06726567696f6e12040a026575420d0a0772657472696573120218024a060880e2cfaa06122430313233343536372d383961622d636465662d303132332d3435363738396162636465661a0c080710031880b8992920904e1080d095ffbc31",
+            "12db010ad1010a9a010a066f7264657273120a73656e642d656d61696c1a160a027b7d12106170706c69636174696f6e2f6a736f6e22066964656d2d31280730033a390a3730302d30616637363531393136636434336464383434386562323131633830333139632d623761643662373136393230333333312d3031420e0a06726567696f6e12040a026575420d0a0772657472696573120218024a060880e2cfaa06122430313233343536372d383961622d636465662d303132332d3435363738396162636465661a0c080710031880b8992920904e1080d095ffbc31",
             "1a1d0a066f72646572730a06656d61696c7310b0ea0118052080d095ffbc31",
             "22090a056a6f622d311002",
-            "2a260a1a0a056a6f622d3110021a04626f6f6d2204120208052a03772d311080d095ffbc31188827",
-            "321b0a120a056a6f622d3110021a02081e2203772d311080d095ffbc31",
+            "2a280a1a0a056a6f622d3110021a04626f6f6d2204120208052a03772d311080d095ffbc311888272001",
+            "321f0a120a056a6f622d3110021a02081e2203772d311080d095ffbc3118b0ea01",
             "3a0d0a066f7264657273100a18f403",
             "42130a066f72646572731080d095ffbc3118b0ea01",
             "4a080a066f7264657273",
             "52170a066f726465727312026b3112026b321880d095ffbc31",
-            "5a1d0a066f726465727310031a026b3122066d616e75616c2880d095ffbc31",
+            "5a1f0a066f726465727310031a026b3122066d616e75616c2880d095ffbc313001",
             "620c0a066f726465727312026b31",
             "6a0b0a066f726465727310e807",
-            "72110880d095ffbc3110e807188098fcd5bc31",
+            "72130880d095ffbc3110e807188098fcd5bc312001",
         ];
 
         let ops = sample_ops();
@@ -548,9 +623,22 @@ mod tests {
                 request: None,
                 now_ms: NOW,
                 retry_delay_ms: 0,
+                dead_letter_enabled: false,
             })),
         };
         assert!(Op::from_proto(no_request).is_err());
+
+        let no_limits = proto::Op {
+            op: Some(proto::op::Op::Enqueue(proto::EnqueueOp {
+                jobs: vec![proto::PreparedJob {
+                    request: Some(sample_enqueue_request()),
+                    job_id: "j1".into(),
+                    limits: None,
+                }],
+                now_ms: NOW,
+            })),
+        };
+        assert!(Op::from_proto(no_limits).is_err());
 
         let unknown_state = proto::Op {
             op: Some(proto::op::Op::DeadLetterJobs(proto::DeadLetterJobsOp {
@@ -559,6 +647,7 @@ mod tests {
                 keys: vec![],
                 reason: None,
                 now_ms: NOW,
+                dead_letter_enabled: false,
             })),
         };
         assert!(Op::from_proto(unknown_state).is_err());

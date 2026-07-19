@@ -15,12 +15,30 @@ import "sepp/v1/queue.proto";
 // shared by every op in a cycle, so replaying an op stream reproduces
 // identical timestamps.
 
-// An EnqueueRequest plus its pre-assigned job ID. IDs are generated before an
-// op is built so applying the op is deterministic.
+// Enqueue-apply limits, resolved from the proposer's config when the op is
+// built. Apply reads these instead of node-local config so every store applies
+// the op identically.
+message JobLimits {
+  // Final priority: the request's, or the queue default.
+  uint32 priority = 1;
+
+  // Final max attempts: the request's or the queue default, ceiling-clamped.
+  uint32 max_attempts = 2;
+
+  int64 dedup_window_ms = 3;
+
+  // Unset = unbounded.
+  optional uint64 max_queue_depth = 4;
+}
+
+// An EnqueueRequest plus its pre-assigned job ID and resolved limits. IDs are
+// generated before an op is built so applying the op is deterministic.
 message PreparedJob {
   sepp.v1.EnqueueRequest request = 1;
 
   string job_id = 2;
+
+  JobLimits limits = 3;
 }
 
 message EnqueueOp {
@@ -51,11 +69,19 @@ message NackOp {
 
   // 0 = immediately ready
   uint64 retry_delay_ms = 3;
+
+  // Whether a dead-lettered job is stored in the DLQ or dropped. Resolved from
+  // the proposer's retention config.
+  bool dead_letter_enabled = 4;
 }
 
 message ExtendOp {
   sepp.v1.ExtendRequest request = 1;
   int64 now_ms = 2;
+
+  // Final lease: the request's duration clamped to the queue's max at propose
+  // time. The request's own lease_duration is never read at apply.
+  uint64 lease_ms = 3;
 }
 
 message DrainDeadLettersOp {
@@ -98,6 +124,9 @@ message DeadLetterJobsOp {
   repeated bytes keys = 3;
   optional string reason = 4;
   int64 now_ms = 5;
+
+  // See NackOp.dead_letter_enabled.
+  bool dead_letter_enabled = 6;
 }
 
 message DeleteDeadLettersOp {
@@ -117,6 +146,9 @@ message SweepOp {
   // Dead letters that failed at or before this are deleted. Unset when
   // retention is disabled.
   optional int64 retention_cutoff_ms = 3;
+
+  // See NackOp.dead_letter_enabled.
+  bool dead_letter_enabled = 4;
 }
 
 // One mutating committer operation. Exactly one field is set.
