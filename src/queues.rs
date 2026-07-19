@@ -3,14 +3,25 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 
-use crate::config::{Config, EffectiveLimits, QueueConfig};
+use crate::config::{Config, EffectiveLimits, QueueConfig, RetryBackoff};
 
 pub struct QueueRegistry {
     defaults: EffectiveLimits,
     declared: HashMap<String, QueueConfig>,
+    // True when some queue can resolve a nonzero policy delay; when false the
+    // nack path skips its inflight lookup entirely.
+    any_retry_policy: bool,
     // Bumped on every publish() so a registry snapshot can be referenced
     // compactly (e.g. by an op-stream recording). Boot is generation 0.
     generation: u64,
+}
+
+// Cheaper than `effective()`: no allow-list vec clones.
+pub struct RetryPolicy {
+    pub retry_delay_ms: u64,
+    pub retry_backoff: RetryBackoff,
+    pub retry_delay_max_ms: u64,
+    pub max_schedule_horizon_ms: u64,
 }
 
 pub type SharedRegistry = Arc<ArcSwap<QueueRegistry>>;
@@ -31,6 +42,11 @@ impl QueueRegistry {
             .collect();
 
         Self {
+            any_retry_policy: defaults.retry_delay_ms > 0
+                || cfg
+                    .queues
+                    .iter()
+                    .any(|q| q.retry_delay_ms.is_some_and(|v| v > 0)),
             defaults,
             declared,
             generation: 0,
@@ -49,6 +65,28 @@ impl QueueRegistry {
         match self.declared.get(queue) {
             Some(q) => self.defaults.merged_with(q),
             None => self.defaults.clone(),
+        }
+    }
+
+    pub fn any_retry_policy(&self) -> bool {
+        self.any_retry_policy
+    }
+
+    pub fn retry_policy(&self, queue: &str) -> RetryPolicy {
+        let q = self.declared.get(queue);
+        RetryPolicy {
+            retry_delay_ms: q
+                .and_then(|q| q.retry_delay_ms)
+                .unwrap_or(self.defaults.retry_delay_ms),
+            retry_backoff: q
+                .and_then(|q| q.retry_backoff)
+                .unwrap_or(self.defaults.retry_backoff),
+            retry_delay_max_ms: q
+                .and_then(|q| q.retry_delay_max_ms)
+                .unwrap_or(self.defaults.retry_delay_max_ms),
+            max_schedule_horizon_ms: q
+                .and_then(|q| q.max_schedule_horizon_ms)
+                .unwrap_or(self.defaults.max_schedule_horizon_ms),
         }
     }
 
@@ -125,6 +163,29 @@ mod tests {
             "fields without an override fall back to the global"
         );
         assert!(reg.is_declared("emails"));
+    }
+
+    #[test]
+    fn retry_policy_matches_effective() {
+        let mut cfg = cfg_with(vec![QueueConfig {
+            name: "emails".into(),
+            retry_delay_ms: Some(5_000),
+            ..Default::default()
+        }]);
+        cfg.limits.retry_delay_ms = 1_000;
+        cfg.limits.retry_backoff = crate::config::RetryBackoff::Exponential;
+        let reg = QueueRegistry::from_config(&cfg);
+
+        let policy = reg.retry_policy("emails");
+        let eff = reg.effective("emails");
+        assert_eq!(policy.retry_delay_ms, 5_000);
+        assert_eq!(policy.retry_backoff, eff.retry_backoff);
+        assert_eq!(policy.retry_delay_max_ms, eff.retry_delay_max_ms);
+        assert_eq!(policy.max_schedule_horizon_ms, eff.max_schedule_horizon_ms);
+        assert_eq!(reg.retry_policy("other").retry_delay_ms, 1_000);
+
+        assert!(reg.any_retry_policy());
+        assert!(!QueueRegistry::from_config(&cfg_with(vec![])).any_retry_policy());
     }
 
     #[test]

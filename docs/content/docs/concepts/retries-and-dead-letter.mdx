@@ -3,13 +3,13 @@ title: "Retries & dead-letter"
 description: "Retry directives on nack, attempt exhaustion and the three ways a job is dead-lettered."
 ---
 
-When a job fails, the worker nacks it. A nack is more than "this failed": it tells sepp what happens next, an immediate retry, a delayed retry or a trip straight to the dead-letter store. Together with a per-job attempt limit, those directives decide whether a job comes back around and the three ways it can end up dead-lettered.
+When a job fails, the worker nacks it. A nack is more than "this failed": it tells sepp what happens next, a retry on the queue's schedule, a retry after a delay you pick or a trip straight to the dead-letter store. Together with a per-job attempt limit, those directives decide whether a job comes back around and the three ways it can end up dead-lettered.
 
 ## Nack retry strategies
 
 A nack carries a retry directive that picks one of three outcomes:
 
-- **Retry** (`Default`): the job goes straight back to `Ready` for another attempt, as long as attempts remain.
+- **Retry** (`Default`): another attempt as long as attempts remain, timed by the queue's [retry policy](#backoff-and-delay). Immediate unless the queue configures a delay.
 - **Retry after a delay** (`After`): the job waits in `Scheduled` and becomes `Ready` once the delay has elapsed.
 - **Dead-letter** (`DeadLetter`): the job skips any remaining attempts and is dead-lettered right away.
 
@@ -71,9 +71,24 @@ const deadLettered = await client.nack(job.ctx, { retry, reason: String(err) });
 
 ## Backoff and delay
 
-The `Default` directive retries immediately. There is no built-in backoff, so a job that fails the instant it is reserved will be retried just as fast. When you want spacing between attempts you ask for it with `After`, computing the delay yourself, often an exponential of the attempt number.
+The `Default` directive follows the queue's retry policy. Out of the box that policy is retry immediately (`retry_delay_ms = 0`), so a job that fails the instant it is reserved is retried just as fast. Give the queue a base delay and every directive-less nack waits before its next attempt. Because the policy lives on the server it also covers workers that never set a directive, so one outdated worker nacking everything cannot burn a job's attempts in milliseconds:
 
-A delayed retry takes the same path as a scheduled job: it waits in `Scheduled` and is promoted to `Ready` when the delay is up, so the delay is the earliest the retry runs and not an exact time. The delay is capped at the queue's schedule horizon, the same limit as `scheduled_at`, so a very long backoff is clamped rather than rejected.
+```toml
+[limits]
+retry_delay_ms = 5000          # first retry waits 5s
+retry_backoff = "exponential"  # then 10s, 20s, 40s, ...
+retry_delay_max_ms = 3600000   # never more than an hour
+
+[[queues]]
+name = "emails"
+retry_delay_ms = 30000         # this queue backs off harder
+```
+
+With `retry_backoff = "none"` every retry waits the base delay; `"exponential"` doubles it each attempt, capped at `retry_delay_max_ms`. The server subtracts up to 25% jitter, derived from the job id, so a batch that fails together does not retry together, even after their delays have all hit the cap. An explicit `After` directive overrides the policy for that one nack, computing the delay yourself.
+
+The policy times nacks only. A lease that expires because a worker crashed or stalled requeues the job immediately, so those attempts pace at the lease duration rather than the retry policy.
+
+A delayed retry, from the policy or from `After`, takes the same path as a scheduled job: it waits in `Scheduled` and is promoted to `Ready` when the delay is up, so the delay is the earliest the retry runs and not an exact time. The delay is capped at the queue's schedule horizon, the same limit as `scheduled_at`, so a very long backoff is clamped rather than rejected.
 
 <LangTabs items={['Rust', 'Python', 'TypeScript']} groupId="backoff">
 
@@ -81,7 +96,7 @@ A delayed retry takes the same path as a scheduled job: it waits in `Scheduled` 
 use std::time::Duration;
 use sepp_rs::client::RetryDirective;
 
-// No automatic backoff: derive the delay from the attempt number yourself.
+// Override the queue policy for this nack with a delay you compute.
 let backoff = Duration::from_secs(2u64.pow(job.ctx.attempt));
 client.nack(&job.ctx, RetryDirective::After(backoff), "retrying with backoff").await?;
 ```
@@ -90,7 +105,7 @@ client.nack(&job.ctx, RetryDirective::After(backoff), "retrying with backoff").a
 from datetime import timedelta
 from sepp import RetryDirective
 
-# No automatic backoff: derive the delay from the attempt number yourself.
+# Override the queue policy for this nack with a delay you compute.
 backoff = timedelta(seconds=2 ** job.ctx.attempt)
 await client.nack(job.ctx, RetryDirective.after(backoff), "retrying with backoff")
 ```
@@ -98,7 +113,7 @@ await client.nack(job.ctx, RetryDirective.after(backoff), "retrying with backoff
 ```ts
 import { RetryDirective } from "sepp";
 
-// No automatic backoff: derive the delay from the attempt number yourself.
+// Override the queue policy for this nack with a delay you compute.
 const backoffMs = 2 ** job.ctx.attempt * 1000;
 await client.nack(job.ctx, { retry: RetryDirective.after(backoffMs), reason: "retrying with backoff" });
 ```

@@ -48,6 +48,9 @@ message AckOp {
 message NackOp {
   sepp.v1.NackRequest request = 1;
   int64 now_ms = 2;
+
+  // 0 = immediately ready
+  uint64 retry_delay_ms = 3;
 }
 
 message ExtendOp {

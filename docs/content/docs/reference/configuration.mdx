@@ -78,6 +78,9 @@ Global ceilings checked against every request. Most limits can be overridden per
 | `default_max_attempts` | integer | `3` | yes | Default retry count before dead-letter. Range `>= 1`. May not exceed `max_attempts_ceiling`. |
 | `max_attempts_ceiling` | integer | `100` | yes | Hard ceiling on a job's `max_attempts` field. Range `>= 1`. Must be `>= default_max_attempts`. |
 | `default_priority` | integer | `0` | yes | Default priority when the client omits it. Range `0` to `9`; higher is more urgent. |
+| `retry_delay_ms` | integer | `0` | yes | Delay before redelivering a nack that carries no explicit retry directive. `0` retries immediately. Must not exceed `retry_delay_max_ms`. |
+| `retry_backoff` | `"none"` or `"exponential"` | `"none"` | yes | `"none"` waits `retry_delay_ms` on every retry; `"exponential"` doubles the delay each attempt. Up to 25% jitter is subtracted either way. |
+| `retry_delay_max_ms` | integer | `3600000` (1 h) | yes | Hard cap on a policy retry delay. Range `>= 1`. |
 | `max_reserve_batch` | integer | `256` | yes | Largest batch a `Reserve` call may claim. Range `>= 1`. |
 | `max_reserve_queues` | integer | `32` | yes | Maximum queues per `Reserve` call. Range `>= 1`. |
 | `max_wait_timeout_ms` | integer | `300000` (5 min) | yes | Clamps the `Reserve` wait timeout. Range `>= 1`. |
@@ -172,6 +175,9 @@ An array of tables declaring named queues with per-queue limit overrides. Every 
 | `default_max_attempts` | optional integer | falls to global | yes | Per-queue retry budget. |
 | `max_attempts_ceiling` | optional integer | falls to global | yes | Per-queue attempt ceiling. |
 | `default_priority` | optional integer | falls to global | yes | Per-queue default priority (`0`–`9`). |
+| `retry_delay_ms` | optional integer | falls to global | yes | Per-queue retry delay for directive-less nacks. |
+| `retry_backoff` | optional string | falls to global | yes | Per-queue backoff curve (`"none"` or `"exponential"`). |
+| `retry_delay_max_ms` | optional integer | falls to global | yes | Per-queue cap on the policy retry delay. |
 | `max_payload_bytes` | optional integer | falls to global | yes | Per-queue payload cap. |
 | `allowed_encodings` | optional array of strings | falls to global | yes | Per-queue encoding allowlist. |
 | `allowed_job_types` | optional array of strings | none (allow all) | yes | Per-queue job type allowlist. Queue-only — there is no global equivalent. |
@@ -230,6 +236,7 @@ The following rules are checked when the config is loaded and on every hot-reloa
 | `tls_cert_path` and `tls_key_path` must both be set or both unset. | `[server]`, `[admin]` |
 | `max_payload_bytes` must not exceed `max_message_bytes`. | `[limits]` (and all `[[queues]]`) |
 | `default_max_attempts` must not exceed `max_attempts_ceiling`. | `[limits]` (and all `[[queues]]`) |
+| `retry_delay_ms` must not exceed `retry_delay_max_ms`. | `[limits]` (and all `[[queues]]`) |
 | `max_queue_name_bytes` must be between `1` and `65535`. | `[limits]` |
 | Queue names must be valid (no empty, `"."`, `".."`, `/`, or control characters) and unique. | `[[queues]]` |
 | Queue names must not exceed `limits.max_queue_name_bytes`. | `[[queues]]` |

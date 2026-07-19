@@ -61,7 +61,7 @@ All three lease operations require `job_id` and `attempt`. They share the same e
 - `FAILED_PRECONDITION` means the attempt number doesn't match (the server reassigned the lease to another worker). Map it to an `AttemptMismatch` error.
 - Transient statuses (`UNAVAILABLE`, etc.) should be retried.
 
-`Nack` additionally takes a `retry` directive with three choices: an empty oneof means retry immediately under the server's default policy, `delay` schedules a retry after a given duration, and `dead_letter` sends the job straight to the dead-letter queue. Return a boolean from your `nack` wrapper indicating whether the job was dead-lettered, so the caller can drain it later.
+`Nack` additionally takes a `retry` directive with three choices: an empty oneof means retry under the queue's retry policy, `delay` schedules a retry after a given duration, and `dead_letter` sends the job straight to the dead-letter queue. Return a boolean from your `nack` wrapper indicating whether the job was dead-lettered, so the caller can drain it later.
 
 `Extend` lets a long-running handler push out the lease before it expires. Call it well before `lease_expires_at` — the server rejects extensions after the lease has already lapsed. The response carries the new expiry.
 

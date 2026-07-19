@@ -3,11 +3,11 @@ use std::collections::BTreeMap;
 use prost::Message;
 
 use super::*;
-use crate::config::QueueConfig;
+use crate::config::{QueueConfig, RetryBackoff};
 use crate::op::{Op, PreparedJob};
-use crate::pb::millis_to_duration;
 use crate::pb::sepp::storage::v1 as op_proto;
 use crate::pb::sepp::v1::{NackRetry, Payload, nack_retry};
+use crate::pb::{duration_to_millis, millis_to_duration};
 use uuid::Uuid;
 
 const QUEUES: &[&str] = &["alpha", "beta", "gamma"];
@@ -221,6 +221,14 @@ fn req(queue: &str) -> EnqueueRequest {
 }
 
 fn nack(job_id: &str, attempt: u32, strategy: nack_retry::Strategy, now_ms: i64) -> Op {
+    // Stand-in for construction-time resolution: Default gets a small
+    // attempt-derived delay so directive-less nacks exercise the scheduled
+    // path too.
+    let retry_delay_ms = match &strategy {
+        nack_retry::Strategy::Delay(d) => duration_to_millis(d),
+        nack_retry::Strategy::Default(_) => u64::from(attempt) * 500,
+        nack_retry::Strategy::DeadLetter(_) => 0,
+    };
     Op::Nack {
         req: NackRequest {
             job_id: job_id.into(),
@@ -231,6 +239,7 @@ fn nack(job_id: &str, attempt: u32, strategy: nack_retry::Strategy, now_ms: i64)
             }),
             worker_id: None,
         },
+        retry_delay_ms,
         now_ms,
     }
 }
@@ -592,6 +601,35 @@ fn random_op(rng: &mut Rng, next_id: &mut u32, leases: &mut Vec<(String, u32)>, 
     }
 }
 
+// Applies `steps` random ops to a fresh store under `cfg` and returns the
+// store, the op stream and the outcomes. `step_now` drives the clock.
+fn generate_stream(
+    cfg: &Config,
+    rng: &mut Rng,
+    steps: usize,
+    mut step_now: impl FnMut(&mut Rng) -> i64,
+) -> (Harness, Vec<Op>, Vec<String>) {
+    let mut source = Harness::open(cfg);
+    let mut now: i64 = 1_000_000;
+    let mut next_id = 0u32;
+    let mut leases: Vec<(String, u32)> = Vec::new();
+    let mut ops = Vec::new();
+    let mut outcomes = Vec::new();
+
+    for _ in 0..steps {
+        now += step_now(rng);
+        let op = random_op(rng, &mut next_id, &mut leases, now);
+        let outcome = source.apply(&op);
+        if let Ok(OpOutcome::Reserve(jobs)) = &outcome {
+            leases.extend(jobs.iter().map(|j| (j.id.clone(), j.attempt)));
+        }
+        outcomes.push(dbg_outcome(outcome));
+        ops.push(op);
+    }
+
+    (source, ops, outcomes)
+}
+
 #[test]
 fn random_interleavings_replay_identically() {
     let cfg = replay_config();
@@ -609,31 +647,13 @@ fn random_interleavings_replay_identically() {
 
     for seed in 1..=6u64 {
         let mut rng = Rng(seed);
-        let mut source = Harness::open(&cfg);
-        let mut now: i64 = 1_000_000;
-        let mut next_id = 0u32;
-        let mut leases: Vec<(String, u32)> = Vec::new();
-        let mut ops = Vec::new();
-        let mut outcomes = Vec::new();
-
-        for _ in 0..300 {
-            // Wall clock repeats and steps backwards in the wild; the stream
-            // must replay identically regardless.
-            now += match rng.below(100) {
+        let (source, ops, outcomes) =
+            generate_stream(&cfg, &mut rng, 300, |rng| match rng.below(100) {
                 0..=69 => rng.range(1, 500),
                 70..=84 => 0,
                 85..=94 => rng.range(500, 5_000),
                 _ => -rng.range(1, 100),
-            };
-
-            let op = random_op(&mut rng, &mut next_id, &mut leases, now);
-            let outcome = source.apply(&op);
-            if let Ok(OpOutcome::Reserve(jobs)) = &outcome {
-                leases.extend(jobs.iter().map(|j| (j.id.clone(), j.attempt)));
-            }
-            outcomes.push(dbg_outcome(outcome));
-            ops.push(op);
-        }
+            });
 
         for outcome in &outcomes {
             for (i, marker) in markers.iter().enumerate() {
@@ -647,4 +667,43 @@ fn random_interleavings_replay_identically() {
     for (i, marker) in markers.iter().enumerate() {
         assert!(seen[i], "no seed exercised the {marker:?} path");
     }
+}
+
+// Ops carry every config-derived value their apply path needs, so stores
+// running under different configs must produce identical outcomes and state
+// from the same stream. Retry policy is the first field covered; grow the
+// config delta as more apply sites move to op-carried values.
+#[test]
+fn replay_is_blind_to_retry_policy_config() {
+    let base = replay_config();
+    let mut skewed = replay_config();
+    skewed.limits.retry_delay_ms = 60_000;
+    skewed.limits.retry_backoff = RetryBackoff::Exponential;
+    skewed.limits.retry_delay_max_ms = 600_000;
+    for q in &mut skewed.queues {
+        q.retry_delay_ms = Some(120_000);
+        q.retry_backoff = Some(RetryBackoff::None);
+    }
+
+    let mut rng = Rng(42);
+    let (source, ops, outcomes) = generate_stream(&base, &mut rng, 300, |rng| rng.range(1, 500));
+
+    let has_directive_less_nack = ops.iter().any(|op| {
+        matches!(op, Op::Nack { req, .. }
+        if matches!(
+            req.retry.as_ref().and_then(|r| r.strategy.as_ref()),
+            Some(nack_retry::Strategy::Default(_))
+        ))
+    });
+    assert!(
+        has_directive_less_nack,
+        "stream never hit the policy-relevant path; change the seed"
+    );
+
+    let (skewed_replay, skewed_outcomes) = Harness::replay(&skewed, &ops);
+    assert_eq!(
+        outcomes, skewed_outcomes,
+        "an outcome depended on node-local retry policy config"
+    );
+    assert_identical_state(&source, &skewed_replay, "base vs skewed retry policy");
 }

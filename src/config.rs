@@ -51,6 +51,16 @@ impl Default for ServerConfig {
     }
 }
 
+// Server-side delay applied to a nack that carries no explicit retry
+// directive (NackRetry.default or no retry field at all).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryBackoff {
+    #[default]
+    None,
+    Exponential,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct QueueConfig {
@@ -59,6 +69,9 @@ pub struct QueueConfig {
     pub default_max_attempts: Option<u32>,
     pub max_attempts_ceiling: Option<u32>,
     pub default_priority: Option<u32>,
+    pub retry_delay_ms: Option<u64>,
+    pub retry_backoff: Option<RetryBackoff>,
+    pub retry_delay_max_ms: Option<u64>,
     pub max_payload_bytes: Option<u64>,
     pub allowed_encodings: Option<Vec<String>>,
     pub allowed_job_types: Option<Vec<String>>,
@@ -81,6 +94,12 @@ pub struct EffectiveLimits {
     pub max_attempts_ceiling: u32,
     #[garde(range(max = 9))]
     pub default_priority: u32,
+    #[garde(skip)]
+    pub retry_delay_ms: u64,
+    #[garde(skip)]
+    pub retry_backoff: RetryBackoff,
+    #[garde(range(min = 1))]
+    pub retry_delay_max_ms: u64,
     #[garde(range(min = 1), custom(payload_within_message_limit))]
     pub max_payload_bytes: u64,
     #[garde(inner(inner(length(min = 1))))]
@@ -118,6 +137,9 @@ impl EffectiveLimits {
             default_max_attempts: limits.default_max_attempts,
             max_attempts_ceiling: limits.max_attempts_ceiling,
             default_priority: limits.default_priority,
+            retry_delay_ms: limits.retry_delay_ms,
+            retry_backoff: limits.retry_backoff,
+            retry_delay_max_ms: limits.retry_delay_max_ms,
             max_payload_bytes: limits.max_payload_bytes,
             allowed_encodings: limits.allowed_encodings.clone(),
             allowed_job_types: None,
@@ -138,6 +160,9 @@ impl EffectiveLimits {
             default_max_attempts: q.default_max_attempts.unwrap_or(self.default_max_attempts),
             max_attempts_ceiling: q.max_attempts_ceiling.unwrap_or(self.max_attempts_ceiling),
             default_priority: q.default_priority.unwrap_or(self.default_priority),
+            retry_delay_ms: q.retry_delay_ms.unwrap_or(self.retry_delay_ms),
+            retry_backoff: q.retry_backoff.unwrap_or(self.retry_backoff),
+            retry_delay_max_ms: q.retry_delay_max_ms.unwrap_or(self.retry_delay_max_ms),
             max_payload_bytes: q.max_payload_bytes.unwrap_or(self.max_payload_bytes),
             allowed_encodings: q
                 .allowed_encodings
@@ -168,6 +193,13 @@ impl EffectiveLimits {
             .into());
         }
 
+        if self.retry_delay_ms > self.retry_delay_max_ms {
+            return Err(format!(
+                "{scope}.retry_delay_ms: must not exceed retry_delay_max_ms"
+            )
+            .into());
+        }
+
         Ok(())
     }
 }
@@ -187,6 +219,9 @@ pub struct LimitsConfig {
     pub default_max_attempts: u32,
     pub max_attempts_ceiling: u32,
     pub default_priority: u32,
+    pub retry_delay_ms: u64,
+    pub retry_backoff: RetryBackoff,
+    pub retry_delay_max_ms: u64,
     #[garde(range(min = 1))]
     pub max_reserve_batch: u32,
     #[garde(range(min = 1))]
@@ -220,6 +255,9 @@ impl Default for LimitsConfig {
             default_max_attempts: 3,
             max_attempts_ceiling: 100,
             default_priority: 0,
+            retry_delay_ms: 0,
+            retry_backoff: RetryBackoff::None,
+            retry_delay_max_ms: 60 * 60 * 1000,
             max_reserve_batch: 256,
             max_reserve_queues: 32,
             max_wait_timeout_ms: 5 * 60 * 1000,
@@ -666,6 +704,25 @@ mod tests {
         let mut cfg = Config::default();
         cfg.limits.default_max_attempts = 5;
         cfg.limits.max_attempts_ceiling = 3;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn retry_delay_must_not_exceed_its_max() {
+        let mut cfg = Config::default();
+        cfg.limits.retry_delay_ms = 10_000;
+        cfg.limits.retry_delay_max_ms = 5_000;
+        assert!(cfg.validate().is_err());
+
+        let cfg = Config {
+            queues: vec![QueueConfig {
+                name: "q".into(),
+                retry_delay_ms: Some(10_000),
+                retry_delay_max_ms: Some(5_000),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
         assert!(cfg.validate().is_err());
     }
 

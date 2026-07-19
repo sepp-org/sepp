@@ -31,6 +31,7 @@ pub enum Op {
     },
     Nack {
         req: NackRequest,
+        retry_delay_ms: u64,
         now_ms: i64,
     },
     Extend {
@@ -183,9 +184,14 @@ impl Op {
                 job_id: job_id.clone(),
                 attempt: *attempt,
             }),
-            Op::Nack { req, now_ms } => P::Nack(proto::NackOp {
+            Op::Nack {
+                req,
+                retry_delay_ms,
+                now_ms,
+            } => P::Nack(proto::NackOp {
                 request: Some(req.clone()),
                 now_ms: *now_ms,
+                retry_delay_ms: *retry_delay_ms,
             }),
             Op::Extend { req, now_ms } => P::Extend(proto::ExtendOp {
                 request: Some(req.clone()),
@@ -287,6 +293,7 @@ impl Op {
             },
             P::Nack(o) => Op::Nack {
                 req: o.request.ok_or_else(|| corrupt("nack without request"))?,
+                retry_delay_ms: o.retry_delay_ms,
                 now_ms: o.now_ms,
             },
             P::Extend(o) => Op::Extend {
@@ -418,6 +425,7 @@ mod tests {
                     }),
                     worker_id: Some("w-1".into()),
                 },
+                retry_delay_ms: 5_000,
                 now_ms: NOW,
             },
             Op::Extend {
@@ -502,7 +510,7 @@ mod tests {
             "12cd010ac3010a9a010a066f7264657273120a73656e642d656d61696c1a160a027b7d12106170706c69636174696f6e2f6a736f6e22066964656d2d31280730033a390a3730302d30616637363531393136636434336464383434386562323131633830333139632d623761643662373136393230333333312d3031420e0a06726567696f6e12040a026575420d0a0772657472696573120218024a060880e2cfaa06122430313233343536372d383961622d636465662d303132332d3435363738396162636465661080d095ffbc31",
             "1a1d0a066f72646572730a06656d61696c7310b0ea0118052080d095ffbc31",
             "22090a056a6f622d311002",
-            "2a230a1a0a056a6f622d3110021a04626f6f6d2204120208052a03772d311080d095ffbc31",
+            "2a260a1a0a056a6f622d3110021a04626f6f6d2204120208052a03772d311080d095ffbc31188827",
             "321b0a120a056a6f622d3110021a02081e2203772d311080d095ffbc31",
             "3a0d0a066f7264657273100a18f403",
             "42130a066f72646572731080d095ffbc3118b0ea01",
@@ -539,6 +547,7 @@ mod tests {
             op: Some(proto::op::Op::Nack(proto::NackOp {
                 request: None,
                 now_ms: NOW,
+                retry_delay_ms: 0,
             })),
         };
         assert!(Op::from_proto(no_request).is_err());

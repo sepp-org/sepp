@@ -325,6 +325,45 @@ async fn delayed_nack_defers_redelivery() {
 }
 
 #[tokio::test]
+async fn default_nack_uses_queue_retry_policy() {
+    let toml = r#"
+[limits]
+retry_delay_ms = 3000
+retry_backoff = "exponential"
+retry_delay_max_ms = 60000
+"#;
+    let (_guard, client) = start_server_with_config("retry-policy", toml).await;
+
+    enqueue(&client, enqueue_req("smoke-retry-policy")).await;
+    let job = reserve(&client, "smoke-retry-policy", LEASE, WAIT)
+        .await
+        .expect("policy job reservable");
+    assert_eq!(job.attempt, 1);
+
+    // No explicit retry directive: the queue policy defers the redelivery.
+    let nacked_at = std::time::Instant::now();
+    let dead = nack(&client, &job, Retry::Default, "no directive").await;
+    assert!(!dead, "a policy retry does not dead-letter");
+
+    let too_early = reserve(&client, "smoke-retry-policy", LEASE, NO_WAIT).await;
+    // The policy delay is 3000ms minus up to 25% jitter; only assert
+    // emptiness when the probe ran safely inside that window, so a stalled
+    // CI runner cannot flake this.
+    if nacked_at.elapsed() < Duration::from_millis(1500) {
+        assert!(
+            too_early.is_none(),
+            "a policy-delayed retry is not reservable before its delay elapses"
+        );
+    }
+
+    let retried = reserve(&client, "smoke-retry-policy", LEASE, Duration::from_secs(15))
+        .await
+        .expect("a policy-delayed retry becomes reservable after its delay");
+    assert_eq!(retried.attempt, 2);
+    ack(&client, &retried).await;
+}
+
+#[tokio::test]
 async fn scheduled_job_waits_for_its_time() {
     let (_guard, client) = start_server("sched").await;
 

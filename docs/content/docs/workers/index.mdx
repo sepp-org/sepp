@@ -97,7 +97,7 @@ await worker.run();
 
 A handler that returns normally acks the job. To fail it, raise a `HandlerError` (in Rust, return `Err(HandlerError::…)`); that nacks the job and tells the server what to do next:
 
-- **retry** — back to the queue for an immediate retry (up to `max_attempts`, after which it's dead-lettered).
+- **retry** — back to the queue for another attempt, timed by the queue's [retry policy](/docs/concepts/retries-and-dead-letter#backoff-and-delay), immediate by default (up to `max_attempts`, after which it's dead-lettered).
 - **retry-after** — the same, but not before the given delay.
 - **permanent** — skip retries and dead-letter it now.
 

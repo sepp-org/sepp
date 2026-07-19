@@ -87,12 +87,17 @@ export interface QueueDepths {
   dead_lettered: number
 }
 
+export type RetryBackoff = 'none' | 'exponential'
+
 export interface QueueConfig {
   name: string
   max_lease_duration_ms: number | null
   default_max_attempts: number | null
   max_attempts_ceiling: number | null
   default_priority: number | null
+  retry_delay_ms: number | null
+  retry_backoff: RetryBackoff | null
+  retry_delay_max_ms: number | null
   max_payload_bytes: number | null
   allowed_encodings: string[] | null
   allowed_job_types: string[] | null
@@ -109,6 +114,9 @@ export interface EffectiveLimits {
   default_max_attempts: number
   max_attempts_ceiling: number
   default_priority: number
+  retry_delay_ms: number
+  retry_backoff: RetryBackoff
+  retry_delay_max_ms: number
   max_payload_bytes: number
   allowed_encodings: string[] | null
   allowed_job_types: string[] | null
@@ -134,6 +142,9 @@ export interface QueueOverridesPatch {
   default_max_attempts?: number | null
   max_attempts_ceiling?: number | null
   default_priority?: number | null
+  retry_delay_ms?: number | null
+  retry_backoff?: RetryBackoff | null
+  retry_delay_max_ms?: number | null
   max_payload_bytes?: number | null
   allowed_encodings?: string[] | null
   allowed_job_types?: string[] | null
@@ -292,6 +303,9 @@ export interface LimitsConfigView {
   default_max_attempts: number
   max_attempts_ceiling: number
   default_priority: number
+  retry_delay_ms: number
+  retry_backoff: RetryBackoff
+  retry_delay_max_ms: number
   max_reserve_batch: number
   max_reserve_queues: number
   max_wait_timeout_ms: number

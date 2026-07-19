@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     future::Future,
+    hash::{DefaultHasher, Hash, Hasher},
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context, Poll},
@@ -18,7 +19,7 @@ use tokio::sync::{Notify, futures::Notified, oneshot};
 use tonic::Status;
 use tracing::{debug, error, info, warn};
 
-use crate::config::{Config, EffectiveLimits};
+use crate::config::{Config, EffectiveLimits, RetryBackoff};
 use crate::keys::{
     CLOSING_PREFIX, DeadLetterKey, DedupKey, DedupTimerKey, DedupValue, Inflight, JobValue,
     ReadyKey, TimerKey, closing_key, closing_queue, deadline_of, queue_prefix, read_queue,
@@ -31,7 +32,7 @@ use crate::pb::sepp::v1::{
     nack_retry,
 };
 use crate::pb::{duration_to_millis, millis_to_timestamp, timestamp_to_millis};
-use crate::queues::{QueueRegistry, SharedRegistry};
+use crate::queues::{QueueRegistry, RetryPolicy, SharedRegistry};
 use crate::telemetry;
 
 pub fn now_ms() -> i64 {
@@ -864,8 +865,18 @@ fn apply_op(
         Op::Ack { job_id, attempt } => {
             OpOutcome::Ack(apply_ack(store, indexes, tx, cycle, &job_id, attempt)?)
         }
-        Op::Nack { req, now_ms } => OpOutcome::Nack(apply_nack(
-            store, indexes, tx, cycle, req, now_ms, registry,
+        Op::Nack {
+            req,
+            retry_delay_ms,
+            now_ms,
+        } => OpOutcome::Nack(apply_nack(
+            store,
+            indexes,
+            tx,
+            cycle,
+            req,
+            retry_delay_ms,
+            now_ms,
         )?),
         Op::Extend { req, now_ms } => OpOutcome::Extend(apply_extend(
             store, indexes, tx, cycle, req, now_ms, registry,
@@ -2083,14 +2094,44 @@ fn apply_purge_queue_chunk(
     })
 }
 
+// An unkeyed hash instead of an RNG keeps op construction reproducible.
+fn retry_jitter_hash(job_id: &str, attempt: u32) -> u64 {
+    let mut h = DefaultHasher::new();
+    job_id.hash(&mut h);
+    attempt.hash(&mut h);
+    h.finish()
+}
+
+fn policy_retry_delay_ms(policy: &RetryPolicy, attempt: u32, job_id: &str) -> u64 {
+    let base = policy.retry_delay_ms;
+    if base == 0 {
+        return 0;
+    }
+
+    let grown = match policy.retry_backoff {
+        RetryBackoff::None => base,
+        RetryBackoff::Exponential => {
+            base.saturating_mul(2u64.saturating_pow(attempt.saturating_sub(1)))
+        }
+    };
+    let cap = policy
+        .retry_delay_max_ms
+        .min(policy.max_schedule_horizon_ms);
+    let capped = grown.min(cap);
+
+    // Subtract the jitter so that for capped delay there is still
+    // some variance.
+    capped - retry_jitter_hash(job_id, attempt) % (capped / 4 + 1)
+}
+
 fn apply_nack(
     store: &Store,
     indexes: &mut Indexes,
     tx: &mut WriteTransaction<'_>,
     cycle: &mut Cycle,
     req: NackRequest,
+    retry_delay_ms: u64,
     now: i64,
-    registry: &QueueRegistry,
 ) -> Result<NackOutcome, Status> {
     let stored = tx
         .get(&store.inflight, req.job_id.as_bytes())
@@ -2109,13 +2150,6 @@ fn apply_nack(
     .encode();
     let strategy = req.retry.as_ref().and_then(|r| r.strategy.as_ref());
     let force_dead_letter = matches!(strategy, Some(nack_retry::Strategy::DeadLetter(_)));
-    let retry_delay_ms = match strategy {
-        Some(nack_retry::Strategy::Delay(delay)) => {
-            let max = registry.effective(&inflight.queue).max_schedule_horizon_ms;
-            duration_to_millis(delay).min(max)
-        }
-        _ => 0,
-    };
 
     if force_dead_letter || inflight.attempt >= inflight.max_attempts {
         let (cause_label, cause) = if force_dead_letter {
@@ -2708,6 +2742,23 @@ impl ReadHandle {
             .collect()
     }
 
+    // A nack only carries the job ID, so we need a way to look up the queue
+    // to get the effective limits applied for that queue. It's a point read
+    // on a tx snapshot, which is cheap and doesn't contend with the committer
+    // thread. A stale answer is harmless (attempt fencing rejects the op at
+    // apply); a read error is not, so it fails the nack instead of resolving
+    // a wrong delay.
+    pub(crate) fn queue_of_inflight_job(&self, job_id: &str) -> Result<Option<String>, Status> {
+        let snap = self.db.read_tx();
+        let Some(stored) = snap
+            .get(&self.inflight, job_id.as_bytes())
+            .map_err(stg_err)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(Inflight::decode(&stored)?.queue))
+    }
+
     pub fn get_job(&self, job_id: &str) -> Option<AdminJob> {
         let snap = self.db.read_tx();
         let inflight = snap
@@ -2772,6 +2823,7 @@ pub struct Storage {
     read: ReadHandle,
     admin_stats: Arc<ArcSwap<AdminSnapshot>>,
     drain_scan_cap: usize,
+    registry: SharedRegistry,
 }
 
 impl Storage {
@@ -2873,7 +2925,7 @@ impl Storage {
             db,
             params,
             boot_registry: registry.load_full(),
-            registry,
+            registry: registry.clone(),
             metrics,
         };
         let read = ReadHandle {
@@ -2943,6 +2995,7 @@ impl Storage {
             read,
             admin_stats,
             drain_scan_cap: config.storage.sweep_limit,
+            registry,
         })
     }
 
@@ -3033,10 +3086,49 @@ impl Storage {
     }
 
     pub async fn nack(&self, req: NackRequest) -> Result<NackOutcome, Status> {
-        match self.send_op(Op::Nack { req, now_ms: 0 }).await? {
+        let retry_delay_ms = match req.retry.as_ref().and_then(|r| r.strategy.as_ref()) {
+            // Apply dead-letters from the strategy; the delay is never read.
+            Some(nack_retry::Strategy::DeadLetter(_)) => 0,
+            _ => self.resolve_retry_delay(&req).await?,
+        };
+        match self
+            .send_op(Op::Nack {
+                req,
+                retry_delay_ms,
+                now_ms: 0,
+            })
+            .await?
+        {
             OpOutcome::Nack(outcome) => Ok(outcome),
             _ => Err(Self::mismatched_outcome()),
         }
+    }
+
+    async fn resolve_retry_delay(&self, req: &NackRequest) -> Result<u64, Status> {
+        let explicit = match req.retry.as_ref().and_then(|r| r.strategy.as_ref()) {
+            Some(nack_retry::Strategy::Delay(delay)) => Some(duration_to_millis(delay)),
+            _ => None,
+        };
+        // With no policy configured anywhere a directive-less nack is always
+        // 0; skip the inflight lookup in that common case.
+        if explicit.is_none() && !self.registry.load().any_retry_policy() {
+            return Ok(0);
+        }
+
+        let read = self.read.clone();
+        let job_id = req.job_id.clone();
+        let queue = tokio::task::spawn_blocking(move || read.queue_of_inflight_job(&job_id))
+            .await
+            .map_err(|_| Status::internal("storage read task failed"))??;
+
+        // Stale job. Will be fenced off.
+        let Some(queue) = queue else { return Ok(0) };
+
+        let policy = self.registry.load().retry_policy(&queue);
+        Ok(match explicit {
+            Some(ms) => ms.min(policy.max_schedule_horizon_ms),
+            None => policy_retry_delay_ms(&policy, req.attempt, &req.job_id),
+        })
     }
 
     pub async fn extend(&self, req: ExtendRequest) -> Result<ExtendOutcome, Status> {
@@ -3207,6 +3299,76 @@ mod tests {
             job_id,
         }
         .encode()
+    }
+
+    fn retry_limits(base: u64, backoff: RetryBackoff, max: u64) -> RetryPolicy {
+        RetryPolicy {
+            retry_delay_ms: base,
+            retry_backoff: backoff,
+            retry_delay_max_ms: max,
+            max_schedule_horizon_ms: crate::config::LimitsConfig::default().max_schedule_horizon_ms,
+        }
+    }
+
+    #[test]
+    fn retry_policy_zero_base_is_immediate() {
+        let limits = retry_limits(0, RetryBackoff::Exponential, 60_000);
+        assert_eq!(policy_retry_delay_ms(&limits, 1, "job-1"), 0);
+        assert_eq!(policy_retry_delay_ms(&limits, 7, "job-1"), 0);
+    }
+
+    #[test]
+    fn retry_policy_fixed_delay_jitters_within_a_quarter() {
+        let limits = retry_limits(10_000, RetryBackoff::None, 60_000);
+        for attempt in 1..=5 {
+            let d = policy_retry_delay_ms(&limits, attempt, "job-1");
+            assert!((7_500..=10_000).contains(&d), "attempt {attempt}: {d}");
+            assert_eq!(
+                d,
+                policy_retry_delay_ms(&limits, attempt, "job-1"),
+                "same (job, attempt) must always produce the same delay"
+            );
+        }
+    }
+
+    #[test]
+    fn retry_policy_exponential_doubles_and_caps() {
+        let limits = retry_limits(1_000, RetryBackoff::Exponential, 10_000);
+        let d1 = policy_retry_delay_ms(&limits, 1, "job-1");
+        let d3 = policy_retry_delay_ms(&limits, 3, "job-1");
+        assert!((750..=1_000).contains(&d1), "{d1}");
+        assert!((3_000..=4_000).contains(&d3), "{d3}");
+        // 2^59 growth saturates instead of overflowing, and the cap stays hard.
+        for attempt in [5, 8, 60] {
+            let d = policy_retry_delay_ms(&limits, attempt, "job-1");
+            assert!((7_500..=10_000).contains(&d), "attempt {attempt}: {d}");
+        }
+        // At the cap the jitter must keep spreading jobs; a batch that failed
+        // together must not retry in lockstep forever.
+        let at_cap: std::collections::HashSet<u64> = (0..20)
+            .map(|i| policy_retry_delay_ms(&limits, 60, &format!("job-{i}")))
+            .collect();
+        assert!(
+            at_cap.len() > 10,
+            "expected spread at the cap, got {at_cap:?}"
+        );
+    }
+
+    #[test]
+    fn retry_policy_respects_schedule_horizon() {
+        let mut limits = retry_limits(8_000, RetryBackoff::None, 60_000);
+        limits.max_schedule_horizon_ms = 5_000;
+        let d = policy_retry_delay_ms(&limits, 1, "job-1");
+        assert!((3_750..=5_000).contains(&d), "{d}");
+    }
+
+    #[test]
+    fn retry_policy_jitter_spreads_jobs() {
+        let limits = retry_limits(100_000, RetryBackoff::None, 1_000_000);
+        let delays: std::collections::HashSet<u64> = (0..20)
+            .map(|i| policy_retry_delay_ms(&limits, 1, &format!("job-{i}")))
+            .collect();
+        assert!(delays.len() > 10, "expected spread, got {delays:?}");
     }
 
     #[test]

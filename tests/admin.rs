@@ -1337,6 +1337,43 @@ async fn put_queue_with_no_overrides_declares_it() {
 }
 
 #[tokio::test]
+async fn queue_retry_policy_overrides_round_trip() {
+    let (_guard, _client, port) = start_admin_server("retryq", ADMIN_CFG, &[]).await;
+
+    let config = http(port, "GET", "/admin/api/v1/config", &[], None)
+        .await
+        .json();
+    let etag = config["etag"].as_str().unwrap().to_string();
+
+    let body = json!({
+        "etag": etag,
+        "overrides": {
+            "retry_delay_ms": 2000,
+            "retry_backoff": "exponential",
+            "retry_delay_max_ms": 30000,
+        }
+    })
+    .to_string();
+    let resp = http(
+        port,
+        "PUT",
+        "/admin/api/v1/queues/adm-retry-q",
+        &[],
+        Some(&body),
+    )
+    .await;
+    assert_eq!(resp.status, 200, "{}", resp.body);
+
+    let queue = http(port, "GET", "/admin/api/v1/queues/adm-retry-q", &[], None)
+        .await
+        .json();
+    assert_eq!(queue["overrides"]["retry_backoff"], json!("exponential"));
+    assert_eq!(queue["effective"]["retry_delay_ms"], json!(2000));
+    assert_eq!(queue["effective"]["retry_backoff"], json!("exponential"));
+    assert_eq!(queue["effective"]["retry_delay_max_ms"], json!(30000));
+}
+
+#[tokio::test]
 async fn delete_queue_guards_then_purges_and_removes_declaration() {
     let cfg = format!(
         "{ADMIN_CFG}\n[storage]\ndead_letter_retention_ms = 600000\n\n\

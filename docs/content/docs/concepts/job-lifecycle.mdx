@@ -53,8 +53,8 @@ The lease expiry carried on each job's `ctx` is the real deadline, after any cla
 Once it holds a job, the worker reports the outcome:
 
 - **ack**: success. The job is removed for good.
-- **nack**: failure. By default the job returns to `Ready` for an immediate retry; with a retry-after delay it goes to `Scheduled`; as a permanent failure it is dead-lettered straight away.
-- **neither**: if the lease expires before any of those (say the worker crashed), the sweep redelivers the job exactly as if it had been nacked. Each redelivery bumps the attempt count.
+- **nack**: failure. By default the queue's [retry policy](/docs/concepts/retries-and-dead-letter#backoff-and-delay) times the retry, immediately `Ready` unless the queue configures a delay; with a retry-after delay it goes to `Scheduled`; as a permanent failure it is dead-lettered straight away.
+- **neither**: if the lease expires before any of those (say the worker crashed), the sweep requeues the job immediately; the retry policy times nacks only, not expiries. Each redelivery bumps the attempt count.
 
 <Mermaid chart={`
 sequenceDiagram

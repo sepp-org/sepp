@@ -79,6 +79,17 @@ max_attempts_ceiling = 100
 # Higher values are higher priority; lower values are lower priority.
 default_priority = 0
 
+# Default retry delay when a nack carries no explicit retry directive
+retry_delay_ms = 0
+
+# Retry backoff strategy. Can be "none" or "exponential".
+# "none" waits the base delay every time; "exponential" doubles the delay
+# each attempt (base, 2x base, 4x base, ...) up to retry_delay_max_ms.
+retry_backoff = "none"
+
+# Upper bound on the retry delay applied when a nack carries no explicit retry directive.
+retry_delay_max_ms = 3600000
+
 # Largest batch of jobs a single reserve call may claim.
 max_reserve_batch = 256
 
@@ -225,6 +236,9 @@ prometheus_listen_addr = "0.0.0.0:9464"
 #   default_max_attempts
 #   max_attempts_ceiling
 #   default_priority
+#   retry_delay_ms
+#   retry_backoff
+#   retry_delay_max_ms
 #   max_payload_bytes
 #   allowed_encodings
 #   allowed_job_types

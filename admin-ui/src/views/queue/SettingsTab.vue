@@ -2,7 +2,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query'
 import { computed, reactive, ref, watch } from 'vue'
 import { AdminApiError, api } from '../../api/client'
-import type { QueueOverridesPatch, QueueUpdateRequest } from '../../api/types'
+import type { QueueOverridesPatch, QueueUpdateRequest, RetryBackoff } from '../../api/types'
 import TagInput from '../../components/TagInput.vue'
 import { useSession } from '../../composables/useSession'
 
@@ -11,16 +11,21 @@ const props = defineProps<{ queue: string }>()
 const { canAdmin } = useSession()
 
 type ListKey = 'allowed_encodings' | 'allowed_job_types'
-type NumberKey = Exclude<keyof QueueOverridesPatch, ListKey>
+type EnumKey = 'retry_backoff'
+type NumberKey = Exclude<keyof QueueOverridesPatch, ListKey | EnumKey>
 type FieldDef =
   | { key: NumberKey; label: string; kind: 'number'; restartOnly?: boolean }
   | { key: ListKey; label: string; kind: 'list'; restartOnly?: boolean }
+  | { key: EnumKey; label: string; kind: 'enum'; options: string[]; restartOnly?: boolean }
 
 const fields: FieldDef[] = [
   { key: 'max_lease_duration_ms', label: 'Max lease duration (ms)', kind: 'number' },
   { key: 'default_max_attempts', label: 'Default max attempts', kind: 'number' },
   { key: 'max_attempts_ceiling', label: 'Max attempts ceiling', kind: 'number' },
   { key: 'default_priority', label: 'Default priority', kind: 'number' },
+  { key: 'retry_delay_ms', label: 'Retry delay (ms)', kind: 'number' },
+  { key: 'retry_backoff', label: 'Retry backoff', kind: 'enum', options: ['none', 'exponential'] },
+  { key: 'retry_delay_max_ms', label: 'Retry delay max (ms)', kind: 'number' },
   { key: 'max_payload_bytes', label: 'Max payload bytes', kind: 'number' },
   { key: 'allowed_encodings', label: 'Allowed encodings', kind: 'list' },
   { key: 'allowed_job_types', label: 'Allowed job types', kind: 'list' },
@@ -46,7 +51,7 @@ const validationError = ref('')
 const saveError = ref('')
 const restartPaths = ref<string[]>([])
 
-function toInput(v: number | string[] | null | undefined): string {
+function toInput(v: number | string | string[] | null | undefined): string {
   if (v == null) return ''
   return Array.isArray(v) ? v.join(', ') : String(v)
 }
@@ -101,6 +106,8 @@ function buildOverrides(): QueueOverridesPatch | null {
         return null
       }
       out[f.key] = n
+    } else if (f.kind === 'enum') {
+      out[f.key] = raw as RetryBackoff
     } else {
       out[f.key] = raw
         .split(',')
@@ -181,6 +188,16 @@ function reset() {
             :placeholder="effectiveText(f)"
             @update:model-value="(v) => setList(f.key as ListKey, v)"
           />
+          <select
+            v-else-if="f.kind === 'enum'"
+            :id="`qset-${f.key}`"
+            v-model="form[f.key]"
+            :disabled="!canAdmin"
+            class="rounded border border-ink-700 bg-ink-950 px-3 py-1.5 text-sm outline-none focus:border-accent disabled:opacity-50"
+          >
+            <option value="">global default</option>
+            <option v-for="o in f.options" :key="o" :value="o">{{ o }}</option>
+          </select>
           <input
             v-else
             :id="`qset-${f.key}`"
