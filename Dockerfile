@@ -20,10 +20,7 @@ RUN cargo build --release --bin sepp \
 RUN cp /app/sepp.example.toml /app/sepp.docker.toml \
     && sed -i \
         -e 's/listen_addr = "127\.0\.0\.1:9465"/listen_addr = "0.0.0.0:9465"/' \
-        -e 's/^#keys = \[/keys = [/' \
-        -e 's/^#  { name = "alice".*$/  { name = "admin", key = "admin", role = "admin" },/' \
-        -e '/^#  { name = "dashboard"/d' \
-        -e 's/^#\]/]/' \
+        -e '/^#keys = \[/,/^#\]/c\keys = [\n  { name = "admin", key = "admin", role = "admin" },\n]' \
         /app/sepp.docker.toml
 
 FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
