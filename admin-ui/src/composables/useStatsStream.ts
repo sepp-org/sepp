@@ -12,7 +12,9 @@ import type {
 
 export type StreamStatus = 'live' | 'polling' | 'connecting'
 
-const HISTORY_CAP = 60
+// Matches the admin.stats_history_ms ceiling (6h of 1s samples); the server's
+// retention decides how much of this ever fills.
+const HISTORY_CAP = 21_600
 const STALE_MS = 5_000
 const POLL_INTERVAL_MS = 5_000
 const SSE_RETRY_MS = 30_000
@@ -40,6 +42,9 @@ function breakAuditContinuity() {
 let queryClient: QueryClient | null = null
 let es: EventSource | null = null
 let lastFrameAt = 0
+// Bumped when an SSE hello lands; overview fetches in flight from before it
+// carry staler rings than the hello just delivered and are dropped.
+let fetchEpoch = 0
 let started = false
 let watchdogTimer: number | undefined
 let pollTimer: number | undefined
@@ -47,12 +52,16 @@ let retryTimer: number | undefined
 
 function appendSample(name: string, sample: RateSample) {
   const ring = history[name] ?? (history[name] = [])
-  if (ring.length > 0 && ring[ring.length - 1].ts_ms === sample.ts_ms) return
+  // >= not ===: a delayed poll response can land after newer SSE samples, and
+  // the sparkline's binary search needs the ring strictly ascending.
+  if (ring.length > 0 && ring[ring.length - 1].ts_ms >= sample.ts_ms) return
   ring.push(sample)
   if (ring.length > HISTORY_CAP) ring.splice(0, ring.length - HISTORY_CAP)
 }
 
 function applyFrame(f: StatsFrame) {
+  // A delayed response must not roll the dashboard backwards.
+  if (frame.value && f.ts_ms < frame.value.ts_ms) return
   frame.value = f
   lastFrameAt = Date.now()
   // Frames carry the authoritative queue set; drop history for queues that
@@ -103,6 +112,7 @@ function connectSse() {
   es = new EventSource(`${API_BASE}/events`)
   es.addEventListener('hello', (ev) => {
     const hello = JSON.parse((ev as MessageEvent).data) as HelloEvent
+    fetchEpoch++
     replaceHistory(hello.history)
     frame.value = hello.frame
     lastFrameAt = Date.now()
@@ -125,12 +135,22 @@ function connectSse() {
   es.addEventListener('lagged', () => breakAuditContinuity())
 }
 
-async function pollOnce() {
+// With history the server ships the full rate rings (hours of samples), so
+// only the first poll after losing SSE asks for them; later polls just append
+// their frame's sample, leaving honest 5s gaps until SSE recovers.
+async function pollOnce(withHistory: boolean) {
+  const epoch = fetchEpoch
   try {
-    const o = await api.overview()
+    const o = await api.overview(withHistory)
+    if (epoch !== fetchEpoch) return
     server.value = o.server
-    frame.value = o.frame
-    replaceHistory(o.history)
+    if (o.history) {
+      frame.value = o.frame
+      lastFrameAt = Date.now()
+      replaceHistory(o.history)
+    } else {
+      applyFrame(o.frame)
+    }
   } catch {
     // Transient fetch failure; the poll timer or SSE retry recovers.
   }
@@ -139,8 +159,8 @@ async function pollOnce() {
 function enterPolling() {
   closeSse()
   status.value = 'polling'
-  void pollOnce()
-  pollTimer = window.setInterval(() => void pollOnce(), POLL_INTERVAL_MS)
+  void pollOnce(true)
+  pollTimer = window.setInterval(() => void pollOnce(false), POLL_INTERVAL_MS)
   retryTimer = window.setInterval(connectSse, SSE_RETRY_MS)
 }
 
@@ -153,8 +173,9 @@ function start() {
   started = true
   status.value = 'connecting'
   connectSse()
-  // Hello frames carry no server info; one overview fetch seeds it for the header.
-  void pollOnce()
+  // Hello frames carry no server info; one overview fetch seeds it for the
+  // header, and the hello right behind it brings the history.
+  void pollOnce(false)
   watchdogTimer = window.setInterval(checkStale, 1_000)
 }
 

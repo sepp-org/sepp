@@ -56,6 +56,10 @@ listen_addr = "127.0.0.1:9465"
 # How long a login session stays valid (default 12h).
 #session_ttl_ms = 43200000
 
+# How much per-queue rate history the dashboard sparklines can show, one
+# sample per second held in memory (default 1h, max 6h).
+#stats_history_ms = 3600000
+
 [auth]
 # Named API keys for gRPC clients (workers and producers). If omitted, every
 # caller is allowed. If set to a non-empty list, only the listed keys are

@@ -405,6 +405,7 @@ pub struct AdminConfig {
     // None = auth disabled; only allowed on a loopback listen_addr.
     pub keys: Option<Vec<AdminKey>>,
     pub session_ttl_ms: u64,
+    pub stats_history_ms: u64,
 }
 
 impl AdminConfig {
@@ -422,6 +423,7 @@ impl Default for AdminConfig {
             tls_key_path: None,
             keys: None,
             session_ttl_ms: 12 * 60 * 60 * 1000,
+            stats_history_ms: 60 * 60 * 1000,
         }
     }
 }
@@ -621,6 +623,16 @@ impl Config {
         if !(60_000..=31_536_000_000).contains(&self.admin.session_ttl_ms) {
             return Err(
                 "admin.session_ttl_ms must be between 60000 (1 minute) and 31536000000 (365 days)"
+                    .into(),
+            );
+        }
+
+        // The history ring holds one sample per second per queue and ships
+        // whole to every dashboard load; the ceiling keeps both memory and the
+        // SSE hello payload sane.
+        if !(60_000..=21_600_000).contains(&self.admin.stats_history_ms) {
+            return Err(
+                "admin.stats_history_ms must be between 60000 (1 minute) and 21600000 (6 hours)"
                     .into(),
             );
         }
@@ -990,6 +1002,19 @@ mod tests {
         assert!(cfg.validate().is_err(), "absurd TTL is rejected");
 
         cfg.admin.session_ttl_ms = 60_000;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn stats_history_is_bounded() {
+        let mut cfg = Config::default();
+        cfg.admin.stats_history_ms = 0;
+        assert!(cfg.validate().is_err(), "zero history is rejected");
+
+        cfg.admin.stats_history_ms = 86_400_000;
+        assert!(cfg.validate().is_err(), "a day of samples is rejected");
+
+        cfg.admin.stats_history_ms = 21_600_000;
         assert!(cfg.validate().is_ok());
     }
 

@@ -107,6 +107,7 @@ const sections: { table: SectionTable; fields: FieldSpec[] }[] = [
       { key: 'tls_cert_path', kind: 'string' },
       { key: 'tls_key_path', kind: 'string' },
       { key: 'session_ttl_ms', kind: 'number' },
+      { key: 'stats_history_ms', kind: 'number' },
     ],
   },
 ]

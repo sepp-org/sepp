@@ -39,6 +39,7 @@ The admin web UI listener, its keys, and session management. Admin TLS is indepe
 | `tls_key_path` | optional string | none | restart-only | TLS private key path for the admin listener. Both or neither. |
 | `keys` | optional array of tables | none | yes | Named API keys for admin authentication. Omit to disable auth (loopback bind required). |
 | `session_ttl_ms` | integer | `43200000` (12 h) | yes | Login session validity in milliseconds. Range: `60000` (1 minute) to `31536000000` (365 days). |
+| `stats_history_ms` | integer | `3600000` (1 h) | yes | Dashboard rate history retention in milliseconds, one sample per second per queue, held in memory. Range: `60000` (1 minute) to `21600000` (6 hours). |
 
 Each entry in `keys` is a table with three fields:
 
@@ -243,6 +244,7 @@ The following rules are checked when the config is loaded and on every hot-reloa
 | Admin UI on a non-loopback address requires `keys` to be set. | `[admin]` |
 | Admin `keys` entries must have non-empty, unique names and non-empty, unique secrets. | `[admin]` |
 | `session_ttl_ms` must be between `60000` and `31536000000`. | `[admin]` |
+| `stats_history_ms` must be between `60000` and `21600000`. | `[admin]` |
 | When `tracing.enabled` is true, `service_name` must be non-empty. | `[tracing]` |
 | When `metrics.enabled` is true, `otlp_endpoint` must be non-empty and `export_interval_ms` must be `> 0`. | `[metrics]` |
 

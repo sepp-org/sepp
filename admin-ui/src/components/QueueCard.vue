@@ -1,15 +1,30 @@
 <script setup lang="ts">
+import { computed } from 'vue'
 import type { QueueFrame, RateSample } from '../api/types'
+import { rangeMs, useSparkRange } from '../composables/useSparkRange'
 import { DEPTH_METRICS, RATE_METRICS, formatRate } from '../lib/metrics'
+import RangePicker from './RangePicker.vue'
 import Sparkline from './Sparkline.vue'
 import StatBadge from './StatBadge.vue'
 
-defineProps<{
+const props = defineProps<{
   name: string
   frame: QueueFrame
   samples: RateSample[]
   declared: boolean
 }>()
+
+const { overrides, effectiveKey } = useSparkRange()
+
+const override = computed<string | null>({
+  get: () => overrides[props.name] ?? null,
+  set: (v) => {
+    if (v === null) delete overrides[props.name]
+    else overrides[props.name] = v
+  },
+})
+
+const windowMs = computed(() => rangeMs(effectiveKey(props.name)))
 </script>
 
 <template>
@@ -50,7 +65,12 @@ defineProps<{
           {{ frame.totals[m.key].toLocaleString() }} total
         </span>
       </div>
-      <Sparkline class="self-end" :samples="samples" :height="72" />
+      <!-- min-w floor makes a crowded flex-wrap row push the chart onto its
+           own full-width line instead of crushing it to zero. -->
+      <div class="flex min-w-48 flex-1 flex-col gap-1.5 self-end">
+        <RangePicker v-model="override" auto class="self-end" />
+        <Sparkline :samples="samples" :range-ms="windowMs" :height="64" />
+      </div>
     </div>
   </div>
 </template>

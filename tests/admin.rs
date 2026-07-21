@@ -789,7 +789,11 @@ async fn auth_keys_add_and_revoke_round_trip() {
         Some(&dup),
     )
     .await;
-    assert_eq!(resp.status, 400, "duplicate name is rejected: {}", resp.body);
+    assert_eq!(
+        resp.status, 400,
+        "duplicate name is rejected: {}",
+        resp.body
+    );
 
     let dup_secret = json!({ "etag": etag, "name": "pool-4", "key": "fresh-secret" }).to_string();
     let resp = http_as(
@@ -827,7 +831,11 @@ async fn auth_keys_add_and_revoke_round_trip() {
         Some(&non_ascii),
     )
     .await;
-    assert_eq!(resp.status, 400, "non-ASCII keys are rejected: {}", resp.body);
+    assert_eq!(
+        resp.status, 400,
+        "non-ASCII keys are rejected: {}",
+        resp.body
+    );
 
     let stale = json!({ "etag": boot_etag, "name": "pool-4", "key": "another-one" }).to_string();
     let resp = http_as(
@@ -847,7 +855,14 @@ async fn auth_keys_add_and_revoke_round_trip() {
         "changes": [{ "path": "auth.api_keys", "value": null }],
     })
     .to_string();
-    let resp = http_as(port, "admin-key", "PUT", "/admin/api/v1/config", Some(&body)).await;
+    let resp = http_as(
+        port,
+        "admin-key",
+        "PUT",
+        "/admin/api/v1/config",
+        Some(&body),
+    )
+    .await;
     assert_eq!(resp.status, 400, "{}", resp.body);
     assert_eq!(resp.json()["code"], "api_keys_immutable");
 
@@ -931,10 +946,7 @@ async fn env_pinned_api_keys_reject_ui_management() {
     assert_eq!(resp.json()["code"], "env_pinned");
 
     let (auth_name, auth_value) = bearer("root-key");
-    for path in [
-        "/admin/api/v1/auth/keys/envkey",
-        "/admin/api/v1/auth/keys",
-    ] {
+    for path in ["/admin/api/v1/auth/keys/envkey", "/admin/api/v1/auth/keys"] {
         let resp = http(
             port,
             "DELETE",
@@ -1145,6 +1157,21 @@ async fn overview_and_queues_report_depths_and_totals() {
     let resp = http(port, "GET", "/admin/api/v1/queues/adm-ov-q", &[], None).await;
     assert_eq!(resp.status, 200);
     assert_eq!(resp.json()["depths"]["ready"], json!(3));
+
+    // history=false skips the rate rings for the light polling path.
+    let resp = http(
+        port,
+        "GET",
+        "/admin/api/v1/overview?history=false",
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(resp.status, 200);
+    let overview = resp.json();
+    // Omitted entirely, not present-but-null.
+    assert!(overview.get("history").is_none());
+    assert!(overview["frame"]["queues"].is_object());
 }
 
 // ---------------------------------------------------------------------------

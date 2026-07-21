@@ -45,7 +45,7 @@ docker run --rm \
 
 ## What you can do
 
-- **Watch queues live.** The dashboard shows a card per queue with its depths (ready, scheduled, in-flight, dead-lettered), per-second enqueue and ack rates and a sparkline of the last minute, streamed over SSE.
+- **Watch queues live.** The dashboard shows a card per queue with its depths (ready, scheduled, in-flight, dead-lettered), per-second enqueue and ack rates and a throughput sparkline, streamed over SSE. A global picker sets the sparkline window from 1 minute to 6 hours, each card can override it, and `admin.stats_history_ms` controls how much history the server keeps.
 - **Inspect jobs.** Open a queue and page through its jobs by state. A job's detail view shows every field, the custom map and the payload decoded by its encoding hint (pretty-printed JSON, text or a hex dump).
 - **Enqueue jobs.** Every queue has an enqueue form covering the full request: payload, priority, scheduling, idempotency key and custom fields. See [enqueue from the admin UI](/docs/producers/admin-ui).
 - **Manage dead letters.** List a queue's dead letters with their cause and last failure reason, then requeue the ones worth another go or delete the rest. Unlike a [drain](/docs/concepts/retries-and-dead-letter#retention-and-replay), looking is not destructive.

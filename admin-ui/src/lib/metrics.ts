@@ -9,11 +9,13 @@ export interface RateMetric {
   fill?: string
 }
 
+// Steps validated for the ink-900 surface (colorblind separation, >= 3:1
+// contrast, dark lightness band) in this order; keep order and hues together.
 export const RATE_METRICS: RateMetric[] = [
-  { key: 'enqueued', label: 'enqueued', stroke: '#ec6a2e', fill: 'rgba(236, 106, 46, 0.10)' },
-  { key: 'acked', label: 'acked', stroke: '#34d399', fill: 'rgba(52, 211, 153, 0.08)' },
-  { key: 'nacked', label: 'nacked', stroke: '#fbbf24' },
-  { key: 'dead_lettered', label: 'dead-lettered', stroke: '#f87171' },
+  { key: 'enqueued', label: 'enqueued', stroke: '#d95926', fill: 'rgba(217, 89, 38, 0.10)' },
+  { key: 'acked', label: 'acked', stroke: '#199e70', fill: 'rgba(25, 158, 112, 0.10)' },
+  { key: 'nacked', label: 'nacked', stroke: '#c98500' },
+  { key: 'dead_lettered', label: 'dead-lettered', stroke: '#d03b3b' },
 ]
 
 export function formatRate(n: number): string {

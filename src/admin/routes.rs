@@ -131,15 +131,22 @@ async fn resolve_blocking<T: Send + 'static>(
 // ---------------------------------------------------------------------------
 // Overview and server info
 
+#[derive(Deserialize)]
+pub(super) struct OverviewQuery {
+    // history=false skips the rate rings; the polling fallback and the header
+    // seed fetch only need the frame, and rings can run to hours of samples.
+    history: Option<bool>,
+}
+
 pub(super) async fn overview(
     _viewer: RequireViewer,
+    Query(query): Query<OverviewQuery>,
     State(state): State<Arc<AdminState>>,
 ) -> Json<Value> {
     let config = state.config.load();
     let frame = state.latest_frame.load_full();
-    let history = state.history.read().expect("history lock");
 
-    Json(json!({
+    let mut body = json!({
         "server": {
             "version": env!("CARGO_PKG_VERSION"),
             "started_at_ms": state.started_at_ms,
@@ -151,8 +158,12 @@ pub(super) async fn overview(
             "command_queue_len": state.storage.command_queue_depth(),
         },
         "frame": &*frame,
-        "history": &*history,
-    }))
+    });
+    if query.history.unwrap_or(true) {
+        let history = state.history.read().expect("history lock");
+        body["history"] = serde_json::to_value(&*history).expect("history serializes");
+    }
+    Json(body)
 }
 
 pub(super) async fn server_info(

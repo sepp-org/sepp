@@ -76,7 +76,8 @@ export interface OverviewServer {
 export interface Overview {
   server: OverviewServer
   frame: StatsFrame
-  history: RateHistory
+  // Absent when requested with ?history=false.
+  history?: RateHistory
 }
 
 // GET /queues, GET /queues/{name}
@@ -364,6 +365,7 @@ export interface AdminConfigView {
   // Redacted: names and roles only.
   keys: { name: string; role: Role }[] | null
   session_ttl_ms: number
+  stats_history_ms: number
 }
 
 export interface EffectiveConfig {

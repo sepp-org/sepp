@@ -5,8 +5,10 @@ import { useRoute, useRouter } from 'vue-router'
 import { api } from '../api/client'
 import NewQueueDialog from '../components/NewQueueDialog.vue'
 import QueueCard from '../components/QueueCard.vue'
+import RangePicker from '../components/RangePicker.vue'
 import StrictModeToggle from '../components/StrictModeToggle.vue'
 import { useSession } from '../composables/useSession'
+import { useSparkRange } from '../composables/useSparkRange'
 import { useStatsStream } from '../composables/useStatsStream'
 import { DEPTH_METRICS, RATE_METRICS, formatRate } from '../lib/metrics'
 import QueueDrawer from './queue/QueueDrawer.vue'
@@ -14,6 +16,15 @@ import QueueDrawer from './queue/QueueDrawer.vue'
 const route = useRoute()
 const router = useRouter()
 const { frame, history } = useStatsStream()
+const { globalRange } = useSparkRange()
+// RangePicker's model is nullable for the per-card auto option; the global
+// picker never emits null.
+const globalPick = computed<string | null>({
+  get: () => globalRange.value,
+  set: (v) => {
+    if (v !== null) globalRange.value = v
+  },
+})
 // Queue creation writes the config file, like the strict-mode toggle: admin.
 const { canAdmin } = useSession()
 
@@ -86,6 +97,7 @@ function open(name: string) {
         </span>
       </div>
       <div class="ml-auto flex items-center gap-5">
+        <RangePicker v-model="globalPick" title="Sparkline time range" />
         <StrictModeToggle v-if="canAdmin" />
         <button
           v-if="canAdmin"

@@ -20,8 +20,6 @@ use crate::storage::{AdminSnapshot, QueueTotals};
 
 use super::{AdminState, Event};
 
-const HISTORY_CAP: usize = 60;
-
 #[derive(Clone, Copy, Default, Serialize)]
 pub struct RateSample {
     pub ts_ms: i64,
@@ -120,7 +118,7 @@ pub(super) async fn run_hub(state: Arc<AdminState>, mut shutdown: watch::Receive
         let snapshot = state.stats.load_full();
         let names = queue_names(&state, &snapshot);
         let rate = |cur: u64, prev: Option<u64>| match prev {
-            Some(p) => cur.saturating_sub(p) as f64 / dt,
+            Some(p) => (cur.saturating_sub(p) as f64 / dt * 100.0).round() / 100.0,
             None => 0.0,
         };
 
@@ -142,12 +140,15 @@ pub(super) async fn run_hub(state: Arc<AdminState>, mut shutdown: watch::Receive
         prev = snapshot.totals.clone();
 
         {
+            // One sample per second, so the cap is the retention in seconds.
+            // Read per tick: shrinking on a hot reload trims rings right away.
+            let cap = (state.config.load().admin.stats_history_ms / 1000).max(1) as usize;
             let mut history = state.history.write().expect("history lock");
             history.retain(|name, _| names.contains(name));
             for (name, sample) in &rates {
                 let ring = history.entry(name.clone()).or_default();
                 ring.push_back(*sample);
-                if ring.len() > HISTORY_CAP {
+                while ring.len() > cap {
                     ring.pop_front();
                 }
             }

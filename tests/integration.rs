@@ -356,9 +356,14 @@ retry_delay_max_ms = 60000
         );
     }
 
-    let retried = reserve(&client, "smoke-retry-policy", LEASE, Duration::from_secs(15))
-        .await
-        .expect("a policy-delayed retry becomes reservable after its delay");
+    let retried = reserve(
+        &client,
+        "smoke-retry-policy",
+        LEASE,
+        Duration::from_secs(15),
+    )
+    .await
+    .expect("a policy-delayed retry becomes reservable after its delay");
     assert_eq!(retried.attempt, 2);
     ack(&client, &retried).await;
 }

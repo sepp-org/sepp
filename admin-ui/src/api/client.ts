@@ -80,7 +80,8 @@ function seg(part: string): string {
 }
 
 export const api = {
-  overview: () => request<Overview>('GET', '/overview'),
+  overview: (history = true) =>
+    request<Overview>('GET', history ? '/overview' : '/overview?history=false'),
   serverInfo: () => request<ServerInfo>('GET', '/server-info'),
 
   queues: () => request<QueueInfo[]>('GET', '/queues'),
