@@ -45,6 +45,7 @@
 ## Operational
 
 - Single static Rust binary, embedded storage.
+- Built-in web admin UI: live dashboards, job inspection, dead-letter management and an audit log.
 - Durable by default. If using the `sync_all` persist mode, all successful operations are guaranteed to be `fsync`-ed.
 - End-to-end distributed OpenTelemetry tracing across clients and server. The client SDKs inject trace context automatically.
 - OpenTelemetry/Prometheus metrics.

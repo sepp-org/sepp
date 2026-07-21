@@ -213,7 +213,7 @@ pub struct AuthConfig {
 }
 
 // A named gRPC API key. The name labels the client (worker pool, producer)
-// in the admin UI and audit trail; only the key is the secret.
+// in the admin UI and audit log; only the key is the secret.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApiKeyEntry {

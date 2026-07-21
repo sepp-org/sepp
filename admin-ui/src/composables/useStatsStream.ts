@@ -1,7 +1,14 @@
 import { useQueryClient, type QueryClient } from '@tanstack/vue-query'
-import { reactive, ref } from 'vue'
+import { reactive, ref, shallowRef } from 'vue'
 import { API_BASE, api } from '../api/client'
-import type { HelloEvent, OverviewServer, RateHistory, RateSample, StatsFrame } from '../api/types'
+import type {
+  AuditEntry,
+  HelloEvent,
+  OverviewServer,
+  RateHistory,
+  RateSample,
+  StatsFrame,
+} from '../api/types'
 
 export type StreamStatus = 'live' | 'polling' | 'connecting'
 
@@ -9,11 +16,26 @@ const HISTORY_CAP = 60
 const STALE_MS = 5_000
 const POLL_INTERVAL_MS = 5_000
 const SSE_RETRY_MS = 30_000
+const AUDIT_TAIL_CAP = 200
 
 const status = ref<StreamStatus>('connecting')
 const frame = ref<StatsFrame | null>(null)
 const history = reactive<RateHistory>({})
 const server = ref<OverviewServer | null>(null)
+
+// Audit entries seen live on the current SSE connection, newest first. Only
+// ever a contiguous suffix of the trail; whenever that stops being true
+// (reconnect, dropped events) the buffer is cleared and auditEpoch bumped so
+// consumers re-page instead of trusting what they hold.
+// shallowRef: entries hold recursive JsonValue details, which deep ref
+// unwrapping cannot type; the array is only ever replaced wholesale.
+const auditTail = shallowRef<AuditEntry[]>([])
+const auditEpoch = ref(0)
+
+function breakAuditContinuity() {
+  auditTail.value = []
+  auditEpoch.value++
+}
 
 let queryClient: QueryClient | null = null
 let es: EventSource | null = null
@@ -86,12 +108,21 @@ function connectSse() {
     lastFrameAt = Date.now()
     status.value = 'live'
     clearTimers()
+    // Anything that happened while disconnected is missing from the tail.
+    breakAuditContinuity()
   })
   es.addEventListener('stats', (ev) => {
     applyFrame(JSON.parse((ev as MessageEvent).data) as StatsFrame)
     status.value = 'live'
   })
   es.addEventListener('config', () => invalidateConfigQueries())
+  es.addEventListener('audit', (ev) => {
+    const entry = JSON.parse((ev as MessageEvent).data) as AuditEntry
+    auditTail.value = [entry, ...auditTail.value].slice(0, AUDIT_TAIL_CAP)
+  })
+  // Dropped events: stats recovers with the next full frame, but audit
+  // entries are never resent.
+  es.addEventListener('lagged', () => breakAuditContinuity())
 }
 
 async function pollOnce() {
@@ -147,5 +178,5 @@ export function useStatsStream() {
       queryClient = null
     }
   }
-  return { status, frame, history, server, start, stop }
+  return { status, frame, history, server, auditTail, auditEpoch, start, stop }
 }

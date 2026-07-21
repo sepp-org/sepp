@@ -90,7 +90,7 @@ RUST_LOG=debug ./sepp
 
 ### Audit logs
 
-As it currently stands, the actions performed via the admin UI are logged to the same output as the rest of the server. The `target` field is set to `sepp::audit` for these events, so you can filter them out or route them to a separate sink in your aggregator.
+Admin actions are logged to the same output as the rest of the server with the `target` field set to `sepp::audit`, so you can filter them out or route them to a separate sink in your aggregator. The same actions are also stored durably and browsable in the admin UI; see [the audit log](/docs/operations/security#audit-log).
 
 ## Health checks
 

@@ -351,18 +351,21 @@ pub struct PeekPage {
 pub struct RequeueOutcome {
     pub requeued: u64,
     pub missing: u64,
+    pub job_ids: Vec<String>,
 }
 
 #[derive(Debug)]
 pub struct DeadLetterJobsOutcome {
     pub dead_lettered: u64,
     pub missing: u64,
+    pub job_ids: Vec<String>,
 }
 
 #[derive(Debug)]
 pub struct DeleteOutcome {
     pub deleted: u64,
     pub missing: u64,
+    pub job_ids: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -1735,6 +1738,7 @@ fn apply_requeue_dead_letters(
 ) -> Result<RequeueOutcome, Status> {
     let mut requeued = 0u64;
     let mut missing = 0u64;
+    let mut job_ids = Vec::new();
 
     for key in keys {
         if DeadLetterKey::queue(&key) != Some(queue) {
@@ -1804,9 +1808,14 @@ fn apply_requeue_dead_letters(
         cycle.new_ready.insert(job_queue);
         cycle.dirty = true;
         requeued += 1;
+        job_ids.push(job.id);
     }
 
-    Ok(RequeueOutcome { requeued, missing })
+    Ok(RequeueOutcome {
+        requeued,
+        missing,
+        job_ids,
+    })
 }
 
 // The reverse of apply_requeue_dead_letters: moves live ready/scheduled jobs
@@ -1833,6 +1842,7 @@ fn apply_dead_letter_jobs(
 
     let mut dead_lettered = 0u64;
     let mut missing = 0u64;
+    let mut job_ids = Vec::new();
 
     for key in keys {
         // Peeked keys can be consumed (reserved, promoted, purged) between
@@ -1927,6 +1937,7 @@ fn apply_dead_letter_jobs(
             _ => unreachable!("state validated above"),
         }
         tx.remove(&store.jobs, job_id.clone());
+        job_ids.push(String::from_utf8_lossy(&job_id).into_owned());
         tx.remove(&store.payloads, job_id);
 
         cycle.dead_lettered(queue, "admin");
@@ -1937,6 +1948,7 @@ fn apply_dead_letter_jobs(
     Ok(DeadLetterJobsOutcome {
         dead_lettered,
         missing,
+        job_ids,
     })
 }
 
@@ -1950,11 +1962,15 @@ fn apply_delete_dead_letters(
 ) -> DeleteOutcome {
     let mut deleted = 0u64;
     let mut missing = 0u64;
+    let mut job_ids = Vec::new();
 
     for key in keys {
         match indexes.dead_letter.keys.get(&key) {
             Some(owner) if owner == queue => {
                 indexes.dead_letter.remove(&key);
+                if let Some(id) = DeadLetterKey::job_id(&key) {
+                    job_ids.push(id.to_string());
+                }
                 tx.remove(&store.dead_letter, key);
                 cycle.dirty = true;
                 deleted += 1;
@@ -1963,7 +1979,11 @@ fn apply_delete_dead_letters(
         }
     }
 
-    DeleteOutcome { deleted, missing }
+    DeleteOutcome {
+        deleted,
+        missing,
+        job_ids,
+    }
 }
 
 fn apply_close_queue(

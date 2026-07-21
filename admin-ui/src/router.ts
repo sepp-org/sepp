@@ -11,13 +11,14 @@ const router = createRouter({
       component: () => import('./views/DashboardView.vue'),
       meta: { drawer: true },
     },
+    { path: '/audit', name: 'audit', component: () => import('./views/AuditView.vue') },
     { path: '/config', name: 'config', component: () => import('./views/ConfigView.vue') },
     { path: '/login', name: 'login', component: () => import('./views/LoginView.vue') },
   ],
 })
 
 router.beforeEach(async (to) => {
-  const { loaded, authed, refresh } = useSession()
+  const { loaded, authed, refresh, canAdmin } = useSession()
   if (!loaded.value) {
     // A failed probe (server down) leaves `loaded` false and falls through
     // as auth-disabled: the dashboard renders offline, and the session is
@@ -30,6 +31,10 @@ router.beforeEach(async (to) => {
   }
   if (!authed.value) {
     return { name: 'login', query: to.fullPath !== '/' ? { next: to.fullPath } : {} }
+  }
+
+  if (to.name === 'audit' && !canAdmin.value) {
+    return '/'
   }
   return true
 })

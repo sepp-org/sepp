@@ -358,6 +358,27 @@ fn audit_events(body: &str) -> Vec<Value> {
     events
 }
 
+/// Polls GET /audit (auth-off servers only) until an entry with this action
+/// appears; appends are fire-and-forget.
+async fn wait_for_audit_entry(port: u16, action: &str) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let resp = http(port, "GET", "/admin/api/v1/audit", &[], None).await;
+        assert_eq!(resp.status, 200, "audit read failed: {}", resp.body);
+        let found = resp.json()["entries"]
+            .as_array()
+            .and_then(|entries| entries.iter().find(|e| e["action"] == action).cloned());
+        if let Some(entry) = found {
+            return entry;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no {action} audit entry appeared"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 0. Auth + roles
 // ---------------------------------------------------------------------------
@@ -1374,7 +1395,7 @@ async fn dead_letters_peek_requeue_and_delete() {
     );
 
     // Requeue moves it back to ready with the attempt reset.
-    let body = json!({ "keys_b64": [key_b64] }).to_string();
+    let body = json!({ "keys_b64": [key_b64], "reason": "worker bug fixed" }).to_string();
     let resp = http(
         port,
         "POST",
@@ -1387,6 +1408,15 @@ async fn dead_letters_peek_requeue_and_delete() {
     let outcome = resp.json();
     assert_eq!(outcome["requeued"], json!(1));
     assert_eq!(outcome["missing"], json!(0));
+
+    let entry = wait_for_audit_entry(port, "dead_letters.requeue").await;
+    assert_eq!(entry["details"]["queue"], "adm-dlq-q");
+    assert_eq!(
+        entry["details"]["job_ids"],
+        json!([job_id]),
+        "the trail names the requeued job"
+    );
+    assert_eq!(entry["details"]["reason"], "worker bug fixed");
 
     let page = http(port, "GET", &jobs_path("dead_letter"), &[], None)
         .await
@@ -1417,7 +1447,7 @@ async fn dead_letters_peek_requeue_and_delete() {
         .await
         .json();
     let key_b64 = page["jobs"][0]["key_b64"].as_str().unwrap().to_string();
-    let body = json!({ "keys_b64": [key_b64] }).to_string();
+    let body = json!({ "keys_b64": [key_b64], "reason": "not worth retrying" }).to_string();
     let resp = http(
         port,
         "POST",
@@ -1430,6 +1460,16 @@ async fn dead_letters_peek_requeue_and_delete() {
     let outcome = resp.json();
     assert_eq!(outcome["deleted"], json!(1));
     assert_eq!(outcome["missing"], json!(0));
+
+    // Asserted before the repeat delete below, whose no-op entry (empty
+    // job_ids) would otherwise be the newest match.
+    let entry = wait_for_audit_entry(port, "dead_letters.delete").await;
+    assert_eq!(
+        entry["details"]["job_ids"],
+        json!([job_id]),
+        "the trail names the deleted job"
+    );
+    assert_eq!(entry["details"]["reason"], "not worth retrying");
 
     // Deleting the same key again counts as missing, not an error.
     let resp = http(
@@ -1513,6 +1553,16 @@ async fn admin_dead_letters_ready_and_scheduled_jobs() {
     let outcome = resp.json();
     assert_eq!(outcome["dead_lettered"], json!(1));
     assert_eq!(outcome["missing"], json!(1));
+
+    let entry = wait_for_audit_entry(port, "jobs.dead_letter").await;
+    assert_eq!(entry["details"]["queue"], "adm-adl-q");
+    assert_eq!(entry["details"]["dead_lettered"], json!(1));
+    assert_eq!(
+        entry["details"]["job_ids"],
+        json!([victim_id]),
+        "the trail names the affected job, not the missing junk key"
+    );
+    assert_eq!(entry["details"]["reason"], "poison payload");
 
     let page = http(port, "GET", &jobs_path("ready"), &[], None)
         .await
@@ -2143,6 +2193,8 @@ async fn audited_actions_stream_audit_sse_events() {
 
     let (auth_name, auth_value) = bearer("admin-key");
     let mut sse = sse_connect_with(port, &[(auth_name, &auth_value)]).await;
+    let (viewer_name, viewer_value) = bearer("viewer-key");
+    let mut viewer_sse = sse_connect_with(port, &[(viewer_name, &viewer_value)]).await;
 
     let login = json!({ "name": "o", "key": "operator-key" }).to_string();
     let resp = http(port, "POST", "/admin/api/v1/session", &[], Some(&login)).await;
@@ -2215,10 +2267,31 @@ async fn audited_actions_stream_audit_sse_events() {
     seqs.sort_unstable();
     seqs.dedup();
     assert_eq!(seqs.len(), events.len(), "every entry gets a distinct seq");
+
+    // Broadcast delivery is ordered per receiver, so once the viewer stream
+    // has yielded a stats frame snapshotted after the audit events were sent
+    // (the admin saw them, so they were sent before `anchor`), it has already
+    // processed and dropped those events.
+    let anchor = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    viewer_sse
+        .wait_for(Instant::now() + Duration::from_secs(10), move |body| {
+            stats_frames(body)
+                .iter()
+                .any(|f| f["ts_ms"].as_i64().is_some_and(|ts| ts >= anchor))
+        })
+        .await;
+    assert!(
+        !viewer_sse.body.contains("event: audit"),
+        "audit events are admin-only: {}",
+        viewer_sse.body
+    );
 }
 
 #[tokio::test]
-async fn the_audit_trail_pages_and_filters_over_http() {
+async fn the_audit_log_pages_and_filters_over_http() {
     let (_guard, _client, port) = start_admin_server("audit-read", ROLES_CFG, &[]).await;
 
     // Three audited actions: an operator login and two admin enqueues.
@@ -2236,12 +2309,21 @@ async fn the_audit_trail_pages_and_filters_over_http() {
         assert_eq!(resp.status, 200, "enqueue failed: {}", resp.body);
     }
 
-    // Appends are fire-and-forget, so poll as the viewer until all three
-    // landed; viewer access is itself part of the contract under test.
+    // The trail is admin-only.
+    for key in ["viewer-key", "operator-key"] {
+        let resp = http_as(port, key, "GET", "/admin/api/v1/audit", None).await;
+        assert_eq!(
+            resp.status, 403,
+            "{key} cannot read the trail: {}",
+            resp.body
+        );
+    }
+
+    // Appends are fire-and-forget, so poll until all three landed.
     let deadline = Instant::now() + Duration::from_secs(10);
     let entries = loop {
-        let resp = http_as(port, "viewer-key", "GET", "/admin/api/v1/audit", None).await;
-        assert_eq!(resp.status, 200, "viewer reads the trail: {}", resp.body);
+        let resp = http_as(port, "admin-key", "GET", "/admin/api/v1/audit", None).await;
+        assert_eq!(resp.status, 200, "admin reads the trail: {}", resp.body);
         let page = resp.json();
         let entries = page["entries"].as_array().expect("entries array").clone();
         if entries.len() >= 3 {
@@ -2282,7 +2364,7 @@ async fn the_audit_trail_pages_and_filters_over_http() {
             Some(b) => format!("/admin/api/v1/audit?limit=1&before={b}"),
             None => "/admin/api/v1/audit?limit=1".to_string(),
         };
-        let resp = http_as(port, "viewer-key", "GET", &path, None).await;
+        let resp = http_as(port, "admin-key", "GET", &path, None).await;
         assert_eq!(resp.status, 200);
         let page = resp.json();
         for e in page["entries"].as_array().expect("entries array") {
@@ -2297,7 +2379,7 @@ async fn the_audit_trail_pages_and_filters_over_http() {
 
     let resp = http_as(
         port,
-        "viewer-key",
+        "admin-key",
         "GET",
         "/admin/api/v1/audit?actor=o",
         None,
@@ -2314,7 +2396,7 @@ async fn the_audit_trail_pages_and_filters_over_http() {
 
     let resp = http_as(
         port,
-        "viewer-key",
+        "admin-key",
         "GET",
         "/admin/api/v1/audit?action_prefix=job.",
         None,
@@ -2329,7 +2411,7 @@ async fn the_audit_trail_pages_and_filters_over_http() {
 
     let resp = http_as(
         port,
-        "viewer-key",
+        "admin-key",
         "GET",
         "/admin/api/v1/audit?before=abc",
         None,

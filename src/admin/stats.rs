@@ -15,6 +15,7 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 
+use crate::config::Role;
 use crate::storage::{AdminSnapshot, QueueTotals};
 
 use super::{AdminState, Event};
@@ -177,9 +178,10 @@ pub(super) async fn watch_reloads(state: Arc<AdminState>, mut shutdown: watch::R
 }
 
 pub(super) async fn events(
-    _viewer: super::authz::RequireViewer,
+    viewer: super::authz::RequireViewer,
     State(state): State<Arc<AdminState>>,
 ) -> impl IntoResponse {
+    let is_admin = viewer.0.role >= Role::Admin;
     let rx = state.hub.subscribe();
 
     let hello = {
@@ -191,12 +193,16 @@ pub(super) async fn events(
     let first = tokio_stream::once(Ok::<_, Infallible>(
         SseEvent::default().event("hello").data(hello),
     ));
-    let rest = BroadcastStream::new(rx).filter_map(|event| match event {
+    let rest = BroadcastStream::new(rx).filter_map(move |event| match event {
         Ok(Event::Stats(frame)) => Some(Ok(SseEvent::default().event("stats").data(&*frame))),
         Ok(Event::Config(seq)) => Some(Ok(SseEvent::default()
             .event("config")
             .data(seq.to_string()))),
-        Ok(Event::Audit(entry)) => Some(Ok(SseEvent::default().event("audit").data(&*entry))),
+        Ok(Event::Audit(entry)) if is_admin => {
+            Some(Ok(SseEvent::default().event("audit").data(&*entry)))
+        }
+        // The audit log is admin-only.
+        Ok(Event::Audit(_)) => None,
         Err(BroadcastStreamRecvError::Lagged(n)) => {
             Some(Ok(SseEvent::default().event("lagged").data(n.to_string())))
         }

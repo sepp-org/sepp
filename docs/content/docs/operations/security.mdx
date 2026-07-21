@@ -115,7 +115,6 @@ keys = [
 - **Omitting `keys` turns admin auth off**, which is only allowed when the listener is bound to a loopback address. A non-loopback bind with no keys is rejected at startup. The bound address is fixed at boot, so deleting the keys from a live, non-loopback server fails closed (requests return "restart required") rather than silently opening the UI to the network.
 - **Browser login** takes a name and key, which must match the same entry. On success the server sets an `HttpOnly`, `SameSite=Strict` session cookie that lasts `session_ttl_ms` (default 12 hours).
 - **Scripts** can skip the login and send the key directly as an `Authorization: Bearer <key>` header on each request.
-- **Failed logins** are delayed briefly and recorded in the [audit log](#audit-log).
 
 Serve the UI over HTTPS with `admin.tls_cert_path` and `admin.tls_key_path` (restart-only, independent of the gRPC certificates and free to point at the same files), or terminate TLS in a fronting proxy or SSH tunnel. The session cookie is marked `Secure` only when this listener terminates TLS itself; behind a proxy the final hop is plain HTTP, so the flag stays off. See [Deployment](/docs/operations/deployment) for the proxy setup.
 
@@ -129,13 +128,27 @@ Roles are strictly ordered: **viewer < operator < admin**. A key's `role` defaul
 | --- | --- |
 | `viewer` | Read-only: dashboards, queue and job inspection, the redacted config and the live SSE stream. |
 | `operator` | Everything a viewer can do, plus job-level mutations: enqueue, dead-letter, requeue and delete dead letters. |
-| `admin` | Everything an operator can do, plus config-level changes: create, update and delete queues, and edit the config. |
+| `admin` | Everything an operator can do, plus config-level changes (create, update and delete queues, edit the config) and reading the [audit log](#audit-log). |
 
 A request whose role is too low gets `403 Forbidden`; an unauthenticated one gets `401 Unauthorized`. Roles are read live from the config on every request, so changing a key's role applies immediately to existing sessions, with no re-login. Rotating a key's secret signs out any session that was established with the old value.
 
 ## Audit log
 
-Every successful admin mutation and every login attempt is written to the `sepp::audit` tracing target, one line each, carrying the actor (the key's name), its role and the action. The action labels are values like `job.enqueue`, `queue.put`, `queue.delete`, `config.put`, `auth_key.add`, `auth_key.revoke`, `auth.disable`, `session.login` and `session.login_failed`. When admin auth is off on a loopback bind, the actor is `local`.
+Every successful admin mutation and login is recorded twice: as a line on the `sepp::audit` tracing target for your log aggregator, and as a durable entry in the database. The stored log is shown on the UI's Audit page with a live tail and is kept forever.
 
-Only mutations and logins are audited, not reads. Key secrets never appear in the log. Because it is a dedicated tracing target, you can route `sepp::audit` to its own sink independent of the rest of the logs; see [Observability](/docs/observability).
+Reading the audit log requires the **admin** role, in the UI, over the API and on the live stream. Lower roles neither see the Audit page nor receive audit events.
 
+An entry carries a sequence number, a timestamp, the actor (the key's name, or `local` when admin auth is off on a loopback bind), its role, the action and a details object. Actions that touch jobs name them: `job.enqueue` records the job ID and `jobs.dead_letter`, `dead_letters.requeue` and `dead_letters.delete` record the IDs of every job actually affected. Those three also take an optional reason in their confirmation dialogs, recorded in the entry. The full set of action labels: `queue.put`, `queue.delete`, `job.enqueue`, `jobs.dead_letter`, `dead_letters.requeue`, `dead_letters.delete`, `config.put`, `auth_key.add`, `auth_key.revoke`, `auth.disable`, `session.login` and `session.logout`.
+
+Only mutations and logins are audited, not reads. Key secrets never appear in an entry. Failed logins are the one exception to the dual recording: they get a `session.login_failed` tracing line but are never stored, so an unauthenticated caller cannot bloat the database.
+
+Scripts can page through the trail with an admin bearer key:
+
+```bash
+curl -H "Authorization: Bearer <admin-key>" \
+  "http://localhost:9465/admin/api/v1/audit?limit=100&action_prefix=dead_letters."
+```
+
+Entries come newest-first. `actor` filters by exact name, `action_prefix` by label prefix. Follow `next_before` (pass it back as `before`) until it is `null`, which marks the oldest entry; a short page with `next_before` set means the server capped that scan, not that the trail ended.
+
+Storage changes nothing on the tracing side: `sepp::audit` remains a dedicated target you can route to its own sink; see [Observability](/docs/observability).

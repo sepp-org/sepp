@@ -51,6 +51,7 @@ docker run --rm \
 - **Manage dead letters.** List a queue's dead letters with their cause and last failure reason, then requeue the ones worth another go or delete the rest. Unlike a [drain](/docs/concepts/retries-and-dead-letter#retention-and-replay), looking is not destructive.
 - **Manage queues.** Create a queue, edit its per-queue overrides, and purge or delete it.
 - **Edit configuration.** The config editor writes `sepp.toml` through the same [hot-reload](/docs/operations/configuration) path you would use by hand, preserving comments. Fields that need a restart are flagged, and fields pinned by `SEPP_` environment variables are locked.
+- **Review the audit log.** Every admin action with who did it, when and which jobs it touched, streamed live and pageable back to the first entry, with actor and action filters. Admin role only. See [the audit log](/docs/operations/security#audit-log).
 
 ## See also
 

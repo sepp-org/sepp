@@ -1,5 +1,6 @@
 import type {
   ApiErrorBody,
+  AuditPage,
   ConfigResponse,
   ConfigUpdateRequest,
   ConfigWriteResult,
@@ -116,14 +117,26 @@ export const api = {
       keys_b64: keysB64,
       reason,
     }),
-  requeueDeadLetters: (name: string, keysB64: string[]) =>
+  requeueDeadLetters: (name: string, keysB64: string[], reason?: string) =>
     request<RequeueResult>('POST', `/queues/${seg(name)}/dead-letters:requeue`, {
       keys_b64: keysB64,
+      reason,
     }),
-  deleteDeadLetters: (name: string, keysB64: string[]) =>
+  deleteDeadLetters: (name: string, keysB64: string[], reason?: string) =>
     request<DeleteResult>('POST', `/queues/${seg(name)}/dead-letters:delete`, {
       keys_b64: keysB64,
+      reason,
     }),
+
+  audit: (opts: { before?: number; limit?: number; actor?: string; actionPrefix?: string } = {}) => {
+    const params = new URLSearchParams()
+    if (opts.before !== undefined) params.set('before', String(opts.before))
+    if (opts.limit !== undefined) params.set('limit', String(opts.limit))
+    if (opts.actor) params.set('actor', opts.actor)
+    if (opts.actionPrefix) params.set('action_prefix', opts.actionPrefix)
+    const qs = params.toString()
+    return request<AuditPage>('GET', qs ? `/audit?${qs}` : '/audit')
+  },
 
   config: () => request<ConfigResponse>('GET', '/config'),
   updateConfig: (body: ConfigUpdateRequest) => request<ConfigWriteResult>('PUT', '/config', body),

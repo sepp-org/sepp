@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query'
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { api } from '../../api/client'
 import type { JobState, JobSummary } from '../../api/types'
 import ConfirmDialog from '../../components/ConfirmDialog.vue'
@@ -37,6 +37,11 @@ const canRequeue = computed(() => canOperate.value && props.state === 'dead_lett
 const retentionOff = computed(() => server.value?.dead_letter_retention_ms === 0)
 const confirm = ref<'dead_letter' | 'requeue' | null>(null)
 const actionError = ref('')
+// Optional justification typed into the confirm dialog; audit-only.
+const actionReason = ref('')
+watch(confirm, (open) => {
+  if (open) actionReason.value = ''
+})
 
 function finish(notice: string) {
   confirm.value = null
@@ -51,7 +56,12 @@ function fail(e: unknown, fallback: string) {
 
 const { mutate: deadLetter, isPending: deadLettering } = useMutation({
   mutationFn: () =>
-    api.deadLetterJobs(props.queue, props.state as 'ready' | 'scheduled', [props.job.key_b64]),
+    api.deadLetterJobs(
+      props.queue,
+      props.state as 'ready' | 'scheduled',
+      [props.job.key_b64],
+      actionReason.value.trim() || undefined,
+    ),
   onSuccess: (res) => {
     finish(
       res.dead_lettered === 1
@@ -65,7 +75,8 @@ const { mutate: deadLetter, isPending: deadLettering } = useMutation({
 })
 
 const { mutate: requeue, isPending: requeueing } = useMutation({
-  mutationFn: () => api.requeueDeadLetters(props.queue, [props.job.key_b64]),
+  mutationFn: () =>
+    api.requeueDeadLetters(props.queue, [props.job.key_b64], actionReason.value.trim() || undefined),
   onSuccess: (res) => {
     finish(res.requeued === 1 ? 'Job requeued to ready' : 'Job was already gone')
   },
@@ -226,6 +237,13 @@ function relTime(ms: number): string {
         (<span class="font-mono">dead_letter_retention_ms = 0</span>), so the job is dropped
         permanently instead of kept for replay.
       </p>
+      <textarea
+        v-model="actionReason"
+        rows="3"
+        placeholder="reason (optional, recorded in the audit log)"
+        spellcheck="false"
+        class="mt-3 w-full rounded border border-ink-800 bg-ink-950 px-2 py-1.5 text-sm text-ink-100 placeholder:text-ink-500 focus:border-ink-600 focus:outline-none"
+      ></textarea>
     </ConfirmDialog>
     <ConfirmDialog
       v-else-if="confirm === 'requeue'"
@@ -238,6 +256,13 @@ function relTime(ms: number): string {
       <p>
         Requeue this dead-lettered job back to ready with the attempt counter reset?
       </p>
+      <textarea
+        v-model="actionReason"
+        rows="3"
+        placeholder="reason (optional, recorded in the audit log)"
+        spellcheck="false"
+        class="mt-3 w-full rounded border border-ink-800 bg-ink-950 px-2 py-1.5 text-sm text-ink-100 placeholder:text-ink-500 focus:border-ink-600 focus:outline-none"
+      ></textarea>
     </ConfirmDialog>
   </div>
 </template>

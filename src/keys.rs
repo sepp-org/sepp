@@ -297,6 +297,14 @@ impl DeadLetterKey<'_> {
 
         read_queue(r.tail())
     }
+
+    pub fn job_id(key: &[u8]) -> Option<&str> {
+        let mut r = KeyReader::new(key);
+        r.i64()?;
+        r.prefixed_str()?;
+
+        std::str::from_utf8(r.tail()).ok()
+    }
 }
 
 // Value in the `jobs` keyspace: `queue | protobuf(job)`.
@@ -508,6 +516,7 @@ mod tests {
         .encode();
         assert_eq!(deadline_of(&k), 777);
         assert_eq!(DeadLetterKey::queue(&k), Some("orders"));
+        assert_eq!(DeadLetterKey::job_id(&k), Some("job-9"));
 
         let mk = |failed_at, queue, job_id| {
             DeadLetterKey {

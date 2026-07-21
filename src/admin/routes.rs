@@ -601,7 +601,7 @@ pub(super) async fn get_dead_letter(
 }
 
 // ---------------------------------------------------------------------------
-// Audit trail
+// Audit log
 
 #[derive(Deserialize)]
 pub struct AuditQuery {
@@ -625,7 +625,7 @@ pub(super) fn audit_json(e: &AuditEntry) -> Value {
 }
 
 pub(super) async fn list_audit(
-    _viewer: RequireViewer,
+    _admin: RequireAdmin,
     State(state): State<Arc<AdminState>>,
     Query(query): Query<AuditQuery>,
 ) -> ApiResult<Json<Value>> {
@@ -838,6 +838,8 @@ fn rejected_error(rejection: &pb::JobRejection) -> ApiError {
 #[derive(Deserialize)]
 pub struct DeadLetterKeysBody {
     keys_b64: Vec<String>,
+    // Lands in the audit log entry, not on the jobs.
+    reason: Option<String>,
 }
 
 fn decode_keys(keys_b64: &[String]) -> Result<Vec<Vec<u8>>, ApiError> {
@@ -876,14 +878,17 @@ pub(super) async fn dead_letter_jobs(
     let keys = decode_keys(&body.keys_b64)?;
     let outcome = state
         .storage
-        .dead_letter_jobs(name.clone(), peek_state, keys, body.reason)
+        .dead_letter_jobs(name.clone(), peek_state, keys, body.reason.clone())
         .await?;
-    audit(
-        &state,
-        &ctx,
-        "jobs.dead_letter",
-        json!({ "queue": name, "dead_lettered": outcome.dead_lettered }),
-    );
+    let mut details = json!({
+        "queue": name,
+        "dead_lettered": outcome.dead_lettered,
+        "job_ids": outcome.job_ids,
+    });
+    if let Some(reason) = body.reason.filter(|r| !r.is_empty()) {
+        details["reason"] = Value::String(reason);
+    }
+    audit(&state, &ctx, "jobs.dead_letter", details);
     Ok(Json(json!({
         "dead_lettered": outcome.dead_lettered,
         "missing": outcome.missing,
@@ -901,12 +906,15 @@ pub(super) async fn requeue_dead_letters(
         .storage
         .requeue_dead_letters(name.clone(), keys)
         .await?;
-    audit(
-        &state,
-        &ctx,
-        "dead_letters.requeue",
-        json!({ "queue": name, "requeued": outcome.requeued }),
-    );
+    let mut details = json!({
+        "queue": name,
+        "requeued": outcome.requeued,
+        "job_ids": outcome.job_ids,
+    });
+    if let Some(reason) = body.reason.filter(|r| !r.is_empty()) {
+        details["reason"] = Value::String(reason);
+    }
+    audit(&state, &ctx, "dead_letters.requeue", details);
     Ok(Json(
         json!({ "requeued": outcome.requeued, "missing": outcome.missing }),
     ))
@@ -923,12 +931,15 @@ pub(super) async fn delete_dead_letters(
         .storage
         .delete_dead_letters(name.clone(), keys)
         .await?;
-    audit(
-        &state,
-        &ctx,
-        "dead_letters.delete",
-        json!({ "queue": name, "deleted": outcome.deleted }),
-    );
+    let mut details = json!({
+        "queue": name,
+        "deleted": outcome.deleted,
+        "job_ids": outcome.job_ids,
+    });
+    if let Some(reason) = body.reason.filter(|r| !r.is_empty()) {
+        details["reason"] = Value::String(reason);
+    }
+    audit(&state, &ctx, "dead_letters.delete", details);
     Ok(Json(
         json!({ "deleted": outcome.deleted, "missing": outcome.missing }),
     ))

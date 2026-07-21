@@ -126,6 +126,14 @@ const pill: Record<StreamStatus, { label: string; classes: string }> = {
           Queues
         </RouterLink>
         <RouterLink
+          v-if="session.canAdmin.value"
+          to="/audit"
+          class="rounded px-2 py-1.5 text-sm text-ink-300 hover:bg-ink-800 hover:text-ink-100"
+          active-class="bg-ink-800 text-ink-100"
+        >
+          Audit
+        </RouterLink>
+        <RouterLink
           to="/config"
           class="rounded px-2 py-1.5 text-sm text-ink-300 hover:bg-ink-800 hover:text-ink-100"
           active-class="bg-ink-800 text-ink-100"

@@ -22,9 +22,9 @@ use super::auth::AuthCtx;
 use super::routes::ApiError;
 use super::{AdminState, Event};
 
-// Read-only handlers take RequireViewer purely for the access check, so its
-// identity field is intentionally unread.
-pub(crate) struct RequireViewer(#[allow(dead_code)] pub AuthCtx);
+// Most read-only handlers take RequireViewer purely for the access check;
+// the SSE stream also reads the role to gate audit events.
+pub(crate) struct RequireViewer(pub AuthCtx);
 pub(crate) struct RequireOperator(pub AuthCtx);
 pub(crate) struct RequireAdmin(pub AuthCtx);
 

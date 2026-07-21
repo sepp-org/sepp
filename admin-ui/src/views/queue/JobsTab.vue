@@ -26,6 +26,11 @@ const selected = ref<JobSummary | null>(null)
 const checked = ref(new Set<string>())
 const confirmAction = ref<'requeue' | 'delete' | 'dead_letter' | null>(null)
 const actionNotice = ref('')
+// Optional justification typed into the confirm dialog; audit-only.
+const actionReason = ref('')
+watch(confirmAction, (open) => {
+  if (open) actionReason.value = ''
+})
 
 const { server } = useStatsStream()
 const { canOperate } = useSession()
@@ -110,7 +115,8 @@ const {
   isPending: requeueing,
   error: requeueError,
 } = useMutation({
-  mutationFn: (keys: string[]) => api.requeueDeadLetters(props.queue, keys),
+  mutationFn: (keys: string[]) =>
+    api.requeueDeadLetters(props.queue, keys, actionReason.value.trim() || undefined),
   onSuccess: (res) => {
     actionNotice.value =
       `Requeued ${res.requeued} job${res.requeued === 1 ? '' : 's'}` +
@@ -127,7 +133,8 @@ const {
   isPending: removing,
   error: removeError,
 } = useMutation({
-  mutationFn: (keys: string[]) => api.deleteDeadLetters(props.queue, keys),
+  mutationFn: (keys: string[]) =>
+    api.deleteDeadLetters(props.queue, keys, actionReason.value.trim() || undefined),
   onSuccess: (res) => {
     actionNotice.value =
       `Deleted ${res.deleted} job${res.deleted === 1 ? '' : 's'}` +
@@ -145,7 +152,12 @@ const {
   error: deadLetterError,
 } = useMutation({
   mutationFn: (keys: string[]) =>
-    api.deadLetterJobs(props.queue, state.value as 'ready' | 'scheduled', keys),
+    api.deadLetterJobs(
+      props.queue,
+      state.value as 'ready' | 'scheduled',
+      keys,
+      actionReason.value.trim() || undefined,
+    ),
   onSuccess: (res) => {
     const n = res.dead_lettered
     actionNotice.value =
@@ -386,5 +398,12 @@ function relTime(ms: number): string {
     <p v-if="checked.size > MAX_KEYS_PER_ACTION" class="mt-1 text-xs text-ink-500">
       Capped at {{ MAX_KEYS_PER_ACTION }} per request; repeat for the rest.
     </p>
+    <textarea
+      v-model="actionReason"
+      rows="3"
+      placeholder="reason (optional, recorded in the audit log)"
+      spellcheck="false"
+      class="mt-3 w-full rounded border border-ink-800 bg-ink-950 px-2 py-1.5 text-sm text-ink-100 placeholder:text-ink-500 focus:border-ink-600 focus:outline-none"
+    ></textarea>
   </ConfirmDialog>
 </template>

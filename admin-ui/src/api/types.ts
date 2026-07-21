@@ -399,6 +399,25 @@ export interface ConfigUpdateRequest {
   changes: ConfigChange[]
 }
 
+// GET /audit; entries match the SSE `audit` event payload exactly, so live
+// tail and pages merge keyed by seq.
+export interface AuditEntry {
+  seq: number
+  ts_ms: number
+  actor: string
+  role: string
+  action: string
+  details: JsonValue
+}
+
+export interface AuditPage {
+  entries: AuditEntry[]
+  // Resume cursor: pass as `before` to keep walking. null only when the scan
+  // reached the oldest entry; a short page with a cursor means the server's
+  // scan cap was hit, not the end of the trail.
+  next_before: number | null
+}
+
 // GET /server-info
 export interface ServerInfo {
   version: string
