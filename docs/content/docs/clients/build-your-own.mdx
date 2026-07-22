@@ -7,10 +7,10 @@ Sepp speaks standard gRPC over a single proto file. If your language has a proto
 
 ## Get the proto
 
-The canonical proto lives on the [Buf Schema Registry](https://buf.build/sepp-org/sepp-proto). Pin a version and vendor the file:
+The canonical proto lives on the [Buf Schema Registry](https://buf.build/sepp-org/sepp-proto). Vendor the file:
 
 ```bash
-buf export buf.build/sepp-org/sepp-proto:v1.2.0 -o proto
+buf export buf.build/sepp-org/sepp-proto:main -o proto
 ```
 
 This drops `proto/sepp/v1/queue.proto` into your tree. The file is plain proto3 — no custom options, imports only `google/protobuf/duration.proto`, `timestamp.proto`, and `empty.proto`. The service is `sepp.v1.QueueService` with eight unary RPCs. How you compile it is up to your toolchain: `prost`/`tonic` at build time (Rust), `buf generate` with language plugins committed into the repo (Python, TypeScript), or `protoc` directly (Go, Java, C#, etc.).
