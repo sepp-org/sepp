@@ -7,6 +7,8 @@ Producers are usually code but they don't have to be. The [admin UI](/docs/get-s
 
 Open a queue on the dashboard and pick the **Enqueue** tab. The form is the [`EnqueueRequest`](/docs/producers#the-producer-surface) laid out field by field:
 
+![The enqueue form](/admin_job_enqueue.png)
+
 - **Job type**: the type tag the worker dispatches on.
 - **Payload**: an editor with JSON, text and base64 modes plus the encoding field. The encoding suggestions come from the queue's effective `allowed_encodings`.
 - **Priority** (a 0 to 9 slider) and **max attempts**, overriding the queue's defaults.

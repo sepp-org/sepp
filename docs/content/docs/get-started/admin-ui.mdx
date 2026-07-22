@@ -5,8 +5,7 @@ description: "The built-in web UI: watch queues in real time, inspect and enqueu
 
 Sepp ships with a web admin UI embedded in the binary. It streams a live dashboard of every queue and lets you inspect jobs, enqueue new ones, requeue dead letters and edit the server configuration, all from the browser. There is nothing extra to install or deploy.
 
-{/* TODO(media): hero capture of the dashboard. Prefer a static WebP screenshot in public/admin-ui/, or a short <video autoPlay loop muted playsInline> WebM clip; avoid GIF (huge, 256 colors). Markdown image syntax below resolves size + basePath at build: */}
-{/* ![The admin UI dashboard](/admin-ui/dashboard.webp) */}
+![The admin UI dashboard](/admin_home.png)
 
 ## Open it
 
@@ -45,13 +44,41 @@ docker run --rm \
 
 ## What you can do
 
-- **Watch queues live.** The dashboard shows a card per queue with its depths (ready, scheduled, in-flight, dead-lettered), per-second enqueue and ack rates and a throughput sparkline, streamed over SSE. A global picker sets the sparkline window from 1 minute to 6 hours, each card can override it, and `admin.stats_history_ms` controls how much history the server keeps.
-- **Inspect jobs.** Open a queue and page through its jobs by state. A job's detail view shows every field, the custom map and the payload decoded by its encoding hint (pretty-printed JSON, text or a hex dump).
-- **Enqueue jobs.** Every queue has an enqueue form covering the full request: payload, priority, scheduling, idempotency key and custom fields. See [enqueue from the admin UI](/docs/producers/admin-ui).
-- **Manage dead letters.** List a queue's dead letters with their cause and last failure reason, then requeue the ones worth another go or delete the rest. Unlike a [drain](/docs/concepts/retries-and-dead-letter#retention-and-replay), looking is not destructive.
-- **Manage queues.** Create a queue, edit its per-queue overrides, and purge or delete it.
-- **Edit configuration.** The config editor writes `sepp.toml` through the same [hot-reload](/docs/operations/configuration) path you would use by hand, preserving comments. Fields that need a restart are flagged, and fields pinned by `SEPP_` environment variables are locked.
-- **Review the audit log.** Every admin action with who did it, when and which jobs it touched, streamed live and pageable back to the first entry, with actor and action filters. Admin role only. See [the audit log](/docs/operations/security#audit-log).
+### Watch queues live
+
+The dashboard shows a card per queue with its depths (ready, scheduled, in-flight, dead-lettered), per-second enqueue and ack rates and a throughput sparkline, streamed over SSE. A global picker sets the sparkline window from 1 minute to 6 hours, each card can override it, and `admin.stats_history_ms` controls how much history the server keeps.
+
+### Inspect jobs
+
+Open a queue and page through its jobs by state. A job's detail view shows every field, the custom map and the payload decoded by its encoding hint (pretty-printed JSON, text or a hex dump).
+
+![A job's detail view](/admin_job_view.png)
+
+### Enqueue jobs
+
+Every queue has an enqueue form covering the full request: payload, priority, scheduling, idempotency key and custom fields. See [enqueue from the admin UI](/docs/producers/admin-ui).
+
+### Manage dead letters
+
+List a queue's dead letters with their cause and last failure reason, then requeue the ones worth another go or delete the rest. Unlike a [drain](/docs/concepts/retries-and-dead-letter#retention-and-replay), looking is not destructive.
+
+### Manage queues
+
+Create a queue, edit its per-queue overrides, and purge or delete it.
+
+![Per-queue overrides in a queue's settings tab](/admin_queue_config.png)
+
+### Edit configuration
+
+The config editor writes `sepp.toml` through the same [hot-reload](/docs/operations/configuration) path you would use by hand, preserving comments. Fields that need a restart are flagged, and fields pinned by `SEPP_` environment variables are locked.
+
+![The config editor](/admin_config.png)
+
+### Review the audit log
+
+Every admin action with who did it, when and which jobs it touched, streamed live and pageable back to the first entry, with actor and action filters. Admin role only. See [the audit log](/docs/operations/security#audit-log).
+
+![The audit log](/admin_audit.png)
 
 ## See also
 

@@ -134,7 +134,7 @@ function toggle(e: AuditEntry) {
 </script>
 
 <template>
-  <div class="mx-auto max-w-5xl p-6">
+  <div class="p-6">
     <div class="mb-4 flex items-center gap-2">
       <h1 class="text-lg font-semibold text-ink-100">Audit log</h1>
       <span
@@ -168,10 +168,10 @@ function toggle(e: AuditEntry) {
       <table class="w-full border-collapse text-left text-sm">
         <thead>
           <tr class="border-b border-ink-800 text-xs text-ink-400">
-            <th class="py-1.5 pr-3 font-normal">Time</th>
-            <th class="py-1.5 pr-3 font-normal">Actor</th>
-            <th class="py-1.5 pr-3 font-normal">Action</th>
-            <th class="py-1.5 font-normal">Details</th>
+            <th class="py-2 pr-8 font-medium">Time</th>
+            <th class="py-2 pr-8 font-medium">Actor</th>
+            <th class="py-2 pr-8 font-medium">Action</th>
+            <th class="w-full py-2 font-medium">Details</th>
           </tr>
         </thead>
         <tbody>
@@ -181,20 +181,20 @@ function toggle(e: AuditEntry) {
               :class="detailsText(e) ? 'cursor-pointer hover:bg-ink-900/60' : ''"
               @click="toggle(e)"
             >
-              <td class="py-1.5 pr-3 text-xs whitespace-nowrap text-ink-400">
+              <td class="py-2 pr-8 whitespace-nowrap text-ink-300">
                 {{ when(e.ts_ms) }}
               </td>
-              <td class="py-1.5 pr-3 whitespace-nowrap">
+              <td class="py-2 pr-8 whitespace-nowrap">
                 <span class="text-ink-200">{{ e.actor }}</span>
-                <span class="ml-1.5 rounded-full bg-ink-800 px-1.5 py-0.5 text-[10px] text-ink-400">
+                <span class="ml-1.5 rounded-full bg-ink-800 px-1.5 py-0.5 text-xs text-ink-400">
                   {{ e.role }}
                 </span>
               </td>
-              <td class="py-1.5 pr-3 font-mono text-xs whitespace-nowrap text-ink-100">
+              <td class="py-2 pr-8 font-mono text-sm whitespace-nowrap text-ink-100">
                 {{ e.action }}
               </td>
-              <td class="max-w-0 py-1.5">
-                <code class="block truncate font-mono text-xs text-ink-400">
+              <td class="w-full max-w-0 py-2">
+                <code class="block truncate font-mono text-sm text-ink-400">
                   {{ detailsText(e) }}
                 </code>
               </td>
