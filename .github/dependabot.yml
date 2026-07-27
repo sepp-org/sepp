@@ -28,3 +28,35 @@ updates:
     directory: /
     schedule:
       interval: weekly
+
+  - package-ecosystem: npm
+    directory: /admin-ui
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      vue:
+        patterns:
+          - "vue"
+          - "vue-*"
+          - "@vitejs/plugin-vue"
+      codemirror:
+        patterns:
+          - "@codemirror/*"
+          - "@lezer/*"
+
+  - package-ecosystem: npm
+    directory: /docs
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      fumadocs:
+        patterns:
+          - "fumadocs-*"
+      react:
+        patterns:
+          - "react"
+          - "react-dom"
+          - "@types/react"
+          - "@types/react-dom"
