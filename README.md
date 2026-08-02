@@ -13,11 +13,10 @@
   </p>
 
   <p>
-    <a href="https://github.com/sepp-org/sepp/actions"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/sepp-org/sepp/ci.yml?branch=master&labelColor=181512"></a>
-    <a href="https://crates.io/crates/sepp"><img alt="crates.io" src="https://img.shields.io/crates/v/sepp?labelColor=181512"></a>
-    <a href="https://crates.io/crates/sepp"><img alt="downloads" src="https://img.shields.io/crates/d/sepp?labelColor=181512"></a>
-    <a href="LICENSE"><img alt="license" src="https://img.shields.io/github/license/sepp-org/sepp?color=ec6a2e&labelColor=181512"></a>
-    <a href="https://github.com/sepp-org/sepp/stargazers"><img alt="stars" src="https://img.shields.io/github/stars/sepp-org/sepp?style=flat&color=ec6a2e&labelColor=181512"></a>
+    <a href="https://github.com/sepp-org/sepp/actions"><img alt="CI" src="https://badgers.space/github/checks/sepp-org/sepp/master?label=CI&label_color=181512"></a>
+    <a href="https://crates.io/crates/sepp"><img alt="crates.io" src="https://badgers.space/crates/version/sepp?label_color=181512"></a>
+    <a href="https://crates.io/crates/sepp"><img alt="downloads" src="https://badgers.space/crates/downloads/sepp?label_color=181512"></a>
+    <a href="LICENSE"><img alt="license" src="https://badgers.space/github/license/sepp-org/sepp?label_color=181512&color=ec6a2e"></a>
   </p>
 
   <p>
