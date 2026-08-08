@@ -9,6 +9,7 @@ pub mod op;
 pub mod pb;
 pub mod queue_server;
 pub mod queues;
+pub mod raft;
 pub mod storage;
 pub mod telemetry;
 pub mod validate;

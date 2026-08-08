@@ -28,6 +28,7 @@ mod store;
 
 pub(crate) use apply::*;
 pub(crate) use committer::*;
+pub use committer::OpOutcome;
 pub(crate) use indexes::*;
 pub use read::*;
 pub use store::*;

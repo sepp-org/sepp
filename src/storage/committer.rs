@@ -38,7 +38,7 @@ pub(crate) enum ReadCommand {
 }
 
 #[derive(Debug)]
-pub(crate) enum OpOutcome {
+pub enum OpOutcome {
     Enqueue(Vec<EnqueueResult>),
     EnqueueAtomic(AtomicEnqueueOutcome),
     Reserve(Vec<Job>),
