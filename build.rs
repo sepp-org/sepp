@@ -6,8 +6,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let includes = &["proto"];
     let protos = &[
         "proto/sepp/v1/queue.proto",
-        // Repo-local, not in the published contract; see its header comment.
+        // Repo-local, not in the published contract; see their header comments.
         "proto/sepp/storage/v1/op.proto",
+        "proto/sepp/raft/v1/raft.proto",
     ];
 
     for proto in protos {

@@ -1,0 +1,133 @@
+syntax = "proto3";
+
+package sepp.raft.v1;
+
+import "sepp/storage/v1/op.proto";
+
+// Wire and on-disk format for the raft layer: log entries, vote, membership
+// and the peer RPC envelopes.
+//
+// Messages map openraft 0.9.25 types 1:1.
+
+// openraft LogId: the proposing leader's id plus the log index.
+message LogId {
+  uint64 term = 1;
+  uint64 node_id = 2;
+  uint64 index = 3;
+}
+
+// openraft Vote. `committed` means the leader this vote elects has been
+// established (vote requests carry committed = false).
+message Vote {
+  uint64 term = 1;
+  uint64 node_id = 2;
+  bool committed = 3;
+}
+
+// A cluster member as stored in replicated membership. client_addr rides
+// here because the leader hint and discovery answers are served from
+// membership, not from any node's local config.
+message Node {
+  uint64 node_id = 1;
+
+  // host:port peers dial for raft RPCs.
+  string peer_addr = 2;
+
+  // host:port clients dial for the queue API.
+  string client_addr = 3;
+}
+
+message NodeIdSet {
+  // Sorted ascending (openraft BTreeSet order).
+  repeated uint64 node_ids = 1;
+}
+
+// openraft Membership.
+message Membership {
+  // Voter sets; more than one entry while a joint-consensus transition is
+  // in flight.
+  repeated NodeIdSet configs = 1;
+
+  // Every member including learners, sorted by node_id (BTreeMap order).
+  repeated Node nodes = 2;
+}
+
+// openraft StoredMembership: the `meta/membership` row and part of
+// SnapshotMeta. Absent log_id = the pre-initialize membership.
+message StoredMembership {
+  LogId log_id = 1;
+  Membership membership = 2;
+}
+
+message Blank {}
+
+// One replicated log entry: the value stored in the `raft_log` keyspace and
+// carried by AppendEntries. Blank entries are the leader's no-op commit
+// probe; every payload kind must apply and advance last_applied.
+message Entry {
+  LogId log_id = 1;
+
+  oneof payload {
+    sepp.storage.v1.Op op = 2;
+    Membership membership = 3;
+    Blank blank = 4;
+  }
+}
+
+message AppendEntriesRequest {
+  Vote vote = 1;
+
+  // Absent = sending from log start.
+  LogId prev_log_id = 2;
+
+  // Empty for heartbeats.
+  repeated Entry entries = 3;
+
+  // Absent = leader has no commit index yet.
+  LogId leader_commit = 4;
+
+  // The op format the leader emits, gated on the cluster minimum.
+  uint32 op_format_version = 5;
+}
+
+message PartialSuccess {
+  // The follower's matching log id, which must be >= the request's
+  // prev_log_id (equal when no new entries were accepted). Absent is legal
+  // only when prev_log_id was also absent; the leader debug-asserts this.
+  LogId matched = 1;
+}
+
+message AppendEntriesResponse {
+  oneof result {
+    Blank success = 1;
+    PartialSuccess partial_success = 2;
+    Blank conflict = 3;
+    Vote higher_vote = 4;
+  }
+}
+
+message VoteRequest {
+  Vote vote = 1;
+  LogId last_log_id = 2;
+}
+
+message VoteResponse {
+  Vote vote = 1;
+
+  // True if the receiver accepted and persisted this vote.
+  bool vote_granted = 2;
+
+  LogId last_log_id = 3;
+}
+
+// openraft SnapshotMeta, written durably with the snapshot-install marker
+// and carried by the snapshot transfer.
+message SnapshotMeta {
+  // Snapshot covers the log up to here, inclusive.
+  LogId last_log_id = 1;
+
+  StoredMembership last_membership = 2;
+
+  // Distinguishes rebuilds with the same last_log_id during transfer.
+  string snapshot_id = 3;
+}
