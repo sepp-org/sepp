@@ -1,5 +1,9 @@
 use std::{
     collections::BTreeSet,
+    sync::{
+        Arc,
+        atomic::{AtomicI64, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -19,6 +23,24 @@ pub fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::ZERO)
         .as_millis() as i64
+}
+
+// Propose-time clock: wall time clamped to never regress below the highest
+// stamp already issued, so op stamps are non-decreasing across concurrent
+// proposers even when the wall clock steps backward. Raft leadership
+// acquisition later seeds the floor from the replicated stamp high-water.
+#[derive(Clone)]
+pub(crate) struct StampClamp(Arc<AtomicI64>);
+
+impl StampClamp {
+    pub(crate) fn new(floor: i64) -> Self {
+        Self(Arc::new(AtomicI64::new(floor)))
+    }
+
+    pub(crate) fn now_ms(&self) -> i64 {
+        let wall = now_ms();
+        wall.max(self.0.fetch_max(wall, Ordering::Relaxed))
+    }
 }
 
 pub(crate) struct StorageParams {

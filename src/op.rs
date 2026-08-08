@@ -86,10 +86,6 @@ pub enum Op {
 }
 
 impl Op {
-    // Every time-dependent apply decision reads the op's now_ms. The committer
-    // stamps it here with one drain-time clock read shared by the whole cycle,
-    // immediately before apply, so stamp ≈ apply time even under channel
-    // backlog. Handle methods build ops with now_ms = 0.
     pub fn stamp(&mut self, now: i64) {
         match self {
             Op::Enqueue { now_ms, .. }

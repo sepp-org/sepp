@@ -292,10 +292,16 @@ pub(crate) struct ApplyCore {
     indexes: Indexes,
     notifiers: QueueNotifiers,
     deadline: watch::Sender<Option<i64>>,
+    stamp: StampClamp,
 }
 
 impl ApplyCore {
-    pub(crate) fn new(store: Store, indexes: Indexes, notifiers: QueueNotifiers) -> Self {
+    pub(crate) fn new(
+        store: Store,
+        indexes: Indexes,
+        notifiers: QueueNotifiers,
+        stamp: StampClamp,
+    ) -> Self {
         let (deadline, _) = watch::channel(next_deadline(
             &indexes,
             store.params.dead_letter_retention_ms,
@@ -306,6 +312,7 @@ impl ApplyCore {
             indexes,
             notifiers,
             deadline,
+            stamp,
         }
     }
 
@@ -430,12 +437,8 @@ impl ApplyCore {
         let mut tx = store.db.write_tx();
         let mut cycle = Cycle::new(store.metrics.is_enabled() || store.params.admin_enabled);
         let mut responders: Vec<PendingReply> = Vec::with_capacity(batch.len());
-
-        // One clock read per cycle: every op applies under the same stamp.
-        let now = now_ms();
         let mut batch = batch.into_iter();
-        let fatal = batch.by_ref().find_map(|OpCommand { mut op, resp }| {
-            op.stamp(now);
+        let fatal = batch.by_ref().find_map(|OpCommand { op, resp }| {
             match apply_op(store, indexes, &mut tx, &mut cycle, op) {
                 Ok(outcome) => {
                     responders.push(PendingReply { resp, outcome });
@@ -501,13 +504,14 @@ impl ApplyCore {
             store,
             indexes,
             notifiers,
+            stamp,
             ..
         } = self;
         let started = Instant::now();
         let mut tx = store.db.write_tx();
         let mut cycle = Cycle::new(store.metrics.is_enabled() || store.params.admin_enabled);
 
-        let now = now_ms();
+        let now = stamp.now_ms();
         let retention_ms = store.params.dead_letter_retention_ms;
         let op = Op::Sweep {
             now_ms: now,

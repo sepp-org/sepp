@@ -146,6 +146,7 @@ pub enum AtomicEnqueueOutcome {
 pub struct Storage {
     ops: flume::Sender<OpCommand>,
     reads: flume::Sender<ReadCommand>,
+    stamp: StampClamp,
     notifiers: QueueNotifiers,
     read: ReadHandle,
     admin_stats: Arc<ArcSwap<AdminSnapshot>>,
@@ -289,7 +290,10 @@ impl Storage {
         let (reads, reads_rx) = flume::bounded(config.storage.command_queue_capacity);
         let notifiers = QueueNotifiers::default();
         let max_sweep_interval = Duration::from_millis(config.storage.sweep_interval_ms);
-        let core = ApplyCore::new(store, indexes, notifiers.clone());
+        // Floor 0 until raft: leadership acquisition will seed it from the
+        // replicated stamp high-water.
+        let stamp = StampClamp::new(0);
+        let core = ApplyCore::new(store, indexes, notifiers.clone(), stamp.clone());
         let admin = AdminFold::new(config.admin.enabled, Arc::clone(&admin_stats));
         std::thread::Builder::new()
             .name("sepp-committer".to_string())
@@ -317,6 +321,7 @@ impl Storage {
         Ok(Self {
             ops,
             reads,
+            stamp,
             notifiers,
             read,
             admin_stats,
@@ -345,7 +350,8 @@ impl Storage {
         }
     }
 
-    async fn send_op(&self, op: Op) -> Result<OpOutcome, Status> {
+    async fn send_op(&self, mut op: Op) -> Result<OpOutcome, Status> {
+        op.stamp(self.stamp.now_ms());
         let (resp, resp_rx) = oneshot::channel();
         self.ops
             .send_async(OpCommand { op, resp })
@@ -386,8 +392,8 @@ impl Storage {
 
     pub async fn enqueue(&self, jobs: Vec<EnqueueRequest>) -> Result<Vec<EnqueueResult>, Status> {
         let jobs = self.prepare_jobs(jobs);
-        // now_ms: 0 on every op built here; the committer stamps the real
-        // drain time (see Op::stamp).
+        // now_ms: 0 on every op built here; send_op stamps propose time
+        // through the monotonic clamp (see Op::stamp).
         match self.send_op(Op::Enqueue { jobs, now_ms: 0 }).await? {
             OpOutcome::Enqueue(results) => Ok(results),
             _ => Err(Self::mismatched_outcome()),

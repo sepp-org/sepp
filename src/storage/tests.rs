@@ -1048,22 +1048,27 @@ fn dedup_window_is_pinned_at_boot() {
 fn apply_core_publishes_next_deadline_on_change() {
     let store = open_test_store();
     let indexes = rebuild_indexes(&store).expect("rebuild");
-    let mut core = ApplyCore::new(store, indexes, QueueNotifiers::default());
+    let mut core = ApplyCore::new(
+        store,
+        indexes,
+        QueueNotifiers::default(),
+        StampClamp::new(0),
+    );
     let mut rx = core.subscribe_deadline();
     assert_eq!(*rx.borrow_and_update(), None, "empty store has no deadline");
 
-    let before = now_ms();
+    let stamped_at = now_ms();
     let (resp, mut resp_rx) = oneshot::channel();
     let op = Op::CloseQueue {
         queue: "q".into(),
-        now_ms: 0,
+        now_ms: stamped_at,
         grace_ms: 30_000,
     };
     core.apply_batch(vec![OpCommand { op, resp }]);
 
     assert!(rx.has_changed().unwrap());
     let deadline = (*rx.borrow_and_update()).expect("a close tombstone arms a deadline");
-    assert!(deadline >= before + 30_000);
+    assert_eq!(deadline, stamped_at + 30_000);
     assert!(matches!(resp_rx.try_recv(), Ok(Ok(OpOutcome::CloseQueue))));
 
     // A rejected op leaves the indexes alone, so nothing is republished.
@@ -1081,7 +1086,12 @@ fn apply_core_publishes_next_deadline_on_change() {
 fn committer_applies_queued_ops_after_disconnect() {
     let store = open_test_store();
     let indexes = rebuild_indexes(&store).expect("rebuild");
-    let core = ApplyCore::new(store, indexes, QueueNotifiers::default());
+    let core = ApplyCore::new(
+        store,
+        indexes,
+        QueueNotifiers::default(),
+        StampClamp::new(0),
+    );
     let admin = AdminFold::new(false, Arc::new(ArcSwap::from_pointee(AdminSnapshot::default())));
     let (ops_tx, ops_rx) = flume::bounded(16);
     let (reads_tx, reads_rx) = flume::bounded::<ReadCommand>(16);
@@ -1091,7 +1101,7 @@ fn committer_applies_queued_ops_after_disconnect() {
     let (resp, mut resp_rx) = oneshot::channel();
     let op = Op::CloseQueue {
         queue: "q".into(),
-        now_ms: 0,
+        now_ms: now_ms(),
         grace_ms: 1_000,
     };
     ops_tx.send(OpCommand { op, resp }).expect("queue the op");
@@ -1101,4 +1111,59 @@ fn committer_applies_queued_ops_after_disconnect() {
     core.run(ops_rx, reads_rx, Duration::from_millis(10), admin);
 
     assert!(matches!(resp_rx.try_recv(), Ok(Ok(OpOutcome::CloseQueue))));
+}
+
+#[test]
+fn stamp_clamp_never_regresses() {
+    let clamp = StampClamp::new(0);
+    let a = clamp.now_ms();
+    let b = clamp.now_ms();
+    assert!(b >= a);
+
+    // A wall clock behind the floor is clamped up until it catches up.
+    let future = now_ms() + 60_000;
+    let clamp = StampClamp::new(future);
+    assert_eq!(clamp.now_ms(), future);
+    assert_eq!(clamp.now_ms(), future);
+}
+
+#[test]
+fn saturated_channel_shortens_leases_by_at_most_the_wait() {
+    let store = open_test_store();
+    let indexes = rebuild_indexes(&store).expect("rebuild");
+    let clamp = StampClamp::new(0);
+    let mut core = ApplyCore::new(store, indexes, QueueNotifiers::default(), clamp.clone());
+
+    let (resp, _enqueue_rx) = oneshot::channel();
+    let mut op = Op::Enqueue {
+        jobs: vec![test_job("q")],
+        now_ms: 0,
+    };
+    op.stamp(clamp.now_ms());
+    core.apply_batch(vec![OpCommand { op, resp }]);
+
+    // The reserve is stamped at propose time, then sits queued behind a
+    // saturated committer before it applies.
+    const LEASE_MS: u64 = 30_000;
+    let stamped_at = clamp.now_ms();
+    let mut op = Op::Reserve {
+        queues: vec!["q".into()],
+        lease_ms: LEASE_MS,
+        max_jobs: 1,
+        now_ms: 0,
+    };
+    op.stamp(stamped_at);
+    let (resp, mut resp_rx) = oneshot::channel();
+    let queued = vec![OpCommand { op, resp }];
+    std::thread::sleep(Duration::from_millis(60));
+    core.apply_batch(queued);
+
+    let jobs = match resp_rx.try_recv() {
+        Ok(Ok(OpOutcome::Reserve(jobs))) => jobs,
+        other => panic!("expected reserved jobs, got {other:?}"),
+    };
+    let expires = crate::pb::timestamp_to_millis(jobs[0].lease_expires_at.as_ref().unwrap());
+    // The lease runs from the propose stamp, not apply time: the caller
+    // loses exactly the queue wait, never more.
+    assert_eq!(expires, stamped_at + LEASE_MS as i64);
 }
