@@ -6,10 +6,8 @@ use crate::pb::sepp::v1::{EnqueueRequest, ExtendRequest, NackRequest};
 use crate::queues::QueueRegistry;
 use crate::storage::PeekState;
 
-// A mutating committer operation: the future replicated-log entry. Carries no
-// channels or handles; response delivery stays in the Command envelope. The
-// serialized form is proto/sepp/storage/v1/op.proto, pinned by the golden test
-// below.
+// A mutating committer operation.
+// The serialized form is proto/sepp/storage/v1/op.proto, pinned by the golden test below.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Op {
     Enqueue {

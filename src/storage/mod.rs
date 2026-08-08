@@ -144,7 +144,8 @@ pub enum AtomicEnqueueOutcome {
 
 #[derive(Clone)]
 pub struct Storage {
-    tx: flume::Sender<Command>,
+    ops: flume::Sender<OpCommand>,
+    reads: flume::Sender<ReadCommand>,
     notifiers: QueueNotifiers,
     read: ReadHandle,
     admin_stats: Arc<ArcSwap<AdminSnapshot>>,
@@ -284,29 +285,21 @@ impl Storage {
             warn_on_undeclared_persisted_queues(&store, &registry.load());
         }
 
-        let (tx, rx) = flume::bounded(config.storage.command_queue_capacity);
+        let (ops, ops_rx) = flume::bounded(config.storage.command_queue_capacity);
+        let (reads, reads_rx) = flume::bounded(config.storage.command_queue_capacity);
         let notifiers = QueueNotifiers::default();
         let max_sweep_interval = Duration::from_millis(config.storage.sweep_interval_ms);
+        let core = ApplyCore::new(store, indexes, notifiers.clone());
+        let admin = AdminFold::new(config.admin.enabled, Arc::clone(&admin_stats));
         std::thread::Builder::new()
             .name("sepp-committer".to_string())
-            .spawn({
-                let notifiers = notifiers.clone();
-                let admin_stats = Arc::clone(&admin_stats);
-                move || {
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        run_committer(
-                            store,
-                            indexes,
-                            rx,
-                            notifiers,
-                            max_sweep_interval,
-                            admin_stats,
-                        )
-                    }));
-                    if result.is_err() {
-                        error!("committer thread panicked; aborting the process");
-                        std::process::abort();
-                    }
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    core.run(ops_rx, reads_rx, max_sweep_interval, admin)
+                }));
+                if result.is_err() {
+                    error!("committer thread panicked; aborting the process");
+                    std::process::abort();
                 }
             })
             .expect("failed to spawn committer thread");
@@ -322,7 +315,8 @@ impl Storage {
         );
 
         Ok(Self {
-            tx,
+            ops,
+            reads,
             notifiers,
             read,
             admin_stats,
@@ -334,7 +328,7 @@ impl Storage {
     }
 
     pub fn command_queue_depth(&self) -> usize {
-        self.tx.len()
+        self.ops.len()
     }
 
     pub fn read_handle(&self) -> ReadHandle {
@@ -351,19 +345,29 @@ impl Storage {
         }
     }
 
-    async fn send<T>(&self, make: impl FnOnce(oneshot::Sender<T>) -> Command) -> Result<T, Status> {
+    async fn send_op(&self, op: Op) -> Result<OpOutcome, Status> {
+        let (resp, resp_rx) = oneshot::channel();
+        self.ops
+            .send_async(OpCommand { op, resp })
+            .await
+            .map_err(|_| Status::internal("storage unavailable"))?;
+        resp_rx
+            .await
+            .map_err(|_| Status::internal("storage unavailable"))?
+    }
+
+    async fn send_read<T>(
+        &self,
+        make: impl FnOnce(oneshot::Sender<Result<T, Status>>) -> ReadCommand,
+    ) -> Result<T, Status> {
         let (resp_tx, resp_rx) = oneshot::channel();
-        self.tx
+        self.reads
             .send_async(make(resp_tx))
             .await
             .map_err(|_| Status::internal("storage unavailable"))?;
         resp_rx
             .await
-            .map_err(|_| Status::internal("storage unavailable"))
-    }
-
-    async fn send_op(&self, op: Op) -> Result<OpOutcome, Status> {
-        self.send(|resp| Command::Op { op, resp }).await?
+            .map_err(|_| Status::internal("storage unavailable"))?
     }
 
     // Each op kind produces exactly the outcome variant its handle method
@@ -542,19 +546,19 @@ impl Storage {
         cursor: Option<Vec<u8>>,
         limit: usize,
     ) -> Result<PeekPage, Status> {
-        self.send(|resp| Command::PeekKeys {
+        self.send_read(|resp| ReadCommand::PeekKeys {
             state,
             queue,
             cursor,
             limit,
             resp,
         })
-        .await?
+        .await
     }
 
     pub async fn queue_depths(&self, queue: String) -> Result<QueueDepthCounts, Status> {
-        self.send(|resp| Command::QueueDepths { queue, resp })
-            .await?
+        self.send_read(|resp| ReadCommand::QueueDepths { queue, resp })
+            .await
     }
 
     // Durably tombstone a queue (refreshable) so enqueues to it are rejected

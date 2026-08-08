@@ -1043,3 +1043,62 @@ fn dedup_window_is_pinned_at_boot() {
     );
     assert_ne!(second.job_id, first.job_id);
 }
+
+#[test]
+fn apply_core_publishes_next_deadline_on_change() {
+    let store = open_test_store();
+    let indexes = rebuild_indexes(&store).expect("rebuild");
+    let mut core = ApplyCore::new(store, indexes, QueueNotifiers::default());
+    let mut rx = core.subscribe_deadline();
+    assert_eq!(*rx.borrow_and_update(), None, "empty store has no deadline");
+
+    let before = now_ms();
+    let (resp, mut resp_rx) = oneshot::channel();
+    let op = Op::CloseQueue {
+        queue: "q".into(),
+        now_ms: 0,
+        grace_ms: 30_000,
+    };
+    core.apply_batch(vec![OpCommand { op, resp }]);
+
+    assert!(rx.has_changed().unwrap());
+    let deadline = (*rx.borrow_and_update()).expect("a close tombstone arms a deadline");
+    assert!(deadline >= before + 30_000);
+    assert!(matches!(resp_rx.try_recv(), Ok(Ok(OpOutcome::CloseQueue))));
+
+    // A rejected op leaves the indexes alone, so nothing is republished.
+    let (resp, mut resp_rx) = oneshot::channel();
+    let op = Op::Ack {
+        job_id: "missing".into(),
+        attempt: 1,
+    };
+    core.apply_batch(vec![OpCommand { op, resp }]);
+    assert!(!rx.has_changed().unwrap());
+    assert!(matches!(resp_rx.try_recv(), Ok(Err(_))));
+}
+
+#[test]
+fn committer_applies_queued_ops_after_disconnect() {
+    let store = open_test_store();
+    let indexes = rebuild_indexes(&store).expect("rebuild");
+    let core = ApplyCore::new(store, indexes, QueueNotifiers::default());
+    let admin = AdminFold::new(false, Arc::new(ArcSwap::from_pointee(AdminSnapshot::default())));
+    let (ops_tx, ops_rx) = flume::bounded(16);
+    let (reads_tx, reads_rx) = flume::bounded::<ReadCommand>(16);
+
+    // The op is already queued when every sender drops; the loop must apply
+    // it on the way out instead of exiting on the disconnect.
+    let (resp, mut resp_rx) = oneshot::channel();
+    let op = Op::CloseQueue {
+        queue: "q".into(),
+        now_ms: 0,
+        grace_ms: 1_000,
+    };
+    ops_tx.send(OpCommand { op, resp }).expect("queue the op");
+    drop(ops_tx);
+    drop(reads_tx);
+
+    core.run(ops_rx, reads_rx, Duration::from_millis(10), admin);
+
+    assert!(matches!(resp_rx.try_recv(), Ok(Ok(OpOutcome::CloseQueue))));
+}
