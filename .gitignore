@@ -5,3 +5,5 @@
 /observability
 sepp.toml
 admin-ui/node_modules
+/openraft-0.9.25
+openraft.tar.gz

@@ -138,6 +138,12 @@ pub fn restart_only_changes(old: &Config, new: &Config) -> Vec<&'static str> {
         changed.push("server.tls_key_path");
     }
 
+    // Every [cluster] key is boot-only: identity is stamped and the raft
+    // engine wired once at startup.
+    if old.cluster != new.cluster {
+        changed.push("cluster");
+    }
+
     // This applies to the actual gRPC server
     if old.limits.max_message_bytes != new.limits.max_message_bytes {
         changed.push("limits.max_message_bytes");
@@ -314,6 +320,24 @@ mod tests {
         assert!(changed.contains(&"admin.listen_addr"));
         assert!(changed.contains(&"admin.tls_cert_path"));
         assert!(changed.contains(&"admin.tls_key_path"));
+    }
+
+    #[test]
+    fn every_cluster_key_is_restart_only() {
+        let mut new = Config::default();
+        new.cluster.node_id += 1;
+        assert_eq!(
+            restart_only_changes(&Config::default(), &new),
+            vec!["cluster"]
+        );
+
+        let mut new = Config::default();
+        new.cluster.heartbeat_interval_ms += 1;
+        new.cluster.peer_auth_keys = Some(vec!["k".into()]);
+        assert_eq!(
+            restart_only_changes(&Config::default(), &new),
+            vec!["cluster"]
+        );
     }
 
     #[test]

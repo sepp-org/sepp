@@ -38,6 +38,7 @@ const RESTART_ONLY: &[&str] = &[
     "server.db_path",
     "server.tls_cert_path",
     "server.tls_key_path",
+    "cluster",
     "limits.max_message_bytes",
     "storage.persist_mode",
     "storage.sweep_interval_ms",

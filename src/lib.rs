@@ -1,5 +1,6 @@
 pub mod admin;
 pub mod auth;
+pub mod cluster;
 pub mod config;
 pub mod config_watch;
 pub mod keys;

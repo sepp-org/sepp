@@ -61,6 +61,81 @@ pub enum RetryBackoff {
     Exponential,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Validate)]
+#[serde(default)]
+#[garde(allow_unvalidated)]
+pub struct ClusterConfig {
+    pub enabled: bool,
+    #[garde(range(min = 1))]
+    pub node_id: u64,
+    pub bootstrap_single: bool,
+    pub peer_listen_addr: SocketAddr,
+    #[garde(inner(custom(host_port)))]
+    pub peer_advertise_addr: Option<String>,
+    #[garde(inner(custom(host_port)))]
+    pub client_advertise_addr: Option<String>,
+    #[garde(inner(length(min = 1)))]
+    pub peer_tls_cert_path: Option<String>,
+    #[garde(inner(length(min = 1)))]
+    pub peer_tls_key_path: Option<String>,
+    #[garde(inner(length(min = 1)))]
+    pub peer_tls_ca_path: Option<String>,
+    #[garde(inner(length(min = 1), inner(length(min = 1))))]
+    pub peer_auth_keys: Option<Vec<String>>, // First element is sender key, for rolling rotation.
+    #[garde(range(min = 1))]
+    pub heartbeat_interval_ms: u64,
+    #[garde(range(min = 1))]
+    pub election_timeout_min_ms: u64,
+    #[garde(range(min = 1))]
+    pub election_timeout_max_ms: u64,
+}
+
+fn host_port(value: &str, _: &()) -> garde::Result {
+    // IP literals, incl. bracketed IPv6 like [::1]:50052.
+    if let Ok(addr) = value.parse::<SocketAddr>() {
+        return if addr.port() != 0 {
+            Ok(())
+        } else {
+            Err(garde::Error::new("port must be 1-65535"))
+        };
+    }
+
+    let Some((host, port)) = value.rsplit_once(':') else {
+        return Err(garde::Error::new("must be host:port"));
+    };
+
+    if host.is_empty() || host.contains(':') {
+        return Err(garde::Error::new(
+            "must be host:port; bracket IPv6 addresses like [::1]:50052",
+        ));
+    }
+
+    match port.parse::<u16>() {
+        Ok(p) if p != 0 => Ok(()),
+        _ => Err(garde::Error::new("port must be 1-65535")),
+    }
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            node_id: 1,
+            bootstrap_single: false,
+            peer_listen_addr: SocketAddr::from(([0, 0, 0, 0], 50052)),
+            peer_advertise_addr: None,
+            client_advertise_addr: None,
+            peer_tls_cert_path: None,
+            peer_tls_key_path: None,
+            peer_tls_ca_path: None,
+            peer_auth_keys: None,
+            heartbeat_interval_ms: 250,
+            election_timeout_min_ms: 1500,
+            election_timeout_max_ms: 3000,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct QueueConfig {
@@ -460,6 +535,7 @@ impl std::fmt::Display for Role {
 #[serde(default)]
 pub struct Config {
     pub server: ServerConfig,
+    pub cluster: ClusterConfig,
     pub auth: AuthConfig,
     pub limits: LimitsConfig,
     pub storage: StorageConfig,
@@ -504,6 +580,9 @@ impl Config {
 
     fn validate(&self) -> Result<(), Box<dyn Error>> {
         self.server.validate().map_err(|e| format!("server: {e}"))?;
+        self.cluster
+            .validate()
+            .map_err(|e| format!("cluster: {e}"))?;
         self.auth.validate().map_err(|e| format!("auth: {e}"))?;
         self.limits.validate().map_err(|e| format!("limits: {e}"))?;
         self.storage
@@ -517,18 +596,86 @@ impl Config {
             .map_err(|e| format!("metrics: {e}"))?;
 
         // Cross-field rules that garde can't express declaratively.
-        match (&self.server.tls_cert_path, &self.server.tls_key_path) {
-            (Some(_), None) => {
+        validate_tls_config(
+            &self.server.tls_cert_path,
+            &self.server.tls_key_path,
+            "server.tls",
+        )?;
+        validate_tls_config(
+            &self.cluster.peer_tls_cert_path,
+            &self.cluster.peer_tls_key_path,
+            "cluster.peer_tls",
+        )?;
+        validate_tls_config(
+            &self.admin.tls_cert_path,
+            &self.admin.tls_key_path,
+            "admin.tls",
+        )?;
+
+        if self.cluster.peer_tls_ca_path.is_some() && self.cluster.peer_tls_cert_path.is_none() {
+            return Err(
+                "cluster.peer_tls_ca_path is set but peer TLS is not enabled; set \
+                 cluster.peer_tls_cert_path and peer_tls_key_path"
+                    .into(),
+            );
+        }
+
+        if self.cluster.enabled {
+            if self.storage.persist_mode == PersistMode::Buffer {
                 return Err(
-                    "server.tls_cert_path is set but server.tls_key_path is not; set both or neither".into(),
+                    "storage.persist_mode = \"buffer\" is invalid in cluster mode; use sync_data or sync_all".into(),
                 );
             }
-            (None, Some(_)) => {
+
+            if self.cluster.client_advertise_addr.is_none() {
                 return Err(
-                    "server.tls_key_path is set but server.tls_cert_path is not; set both or neither".into(),
+                    "cluster.enabled requires cluster.client_advertise_addr to be set".into(),
                 );
             }
-            _ => {}
+
+            if self.cluster.peer_listen_addr.ip().is_unspecified()
+                && self.cluster.peer_advertise_addr.is_none()
+            {
+                return Err(
+                    "cluster.peer_listen_addr is a wildcard address; set cluster.peer_advertise_addr".into(),
+                );
+            }
+
+            if self.cluster.election_timeout_min_ms >= self.cluster.election_timeout_max_ms {
+                return Err(
+                    "cluster.election_timeout_min_ms must be less than election_timeout_max_ms"
+                        .into(),
+                );
+            }
+
+            if self.cluster.heartbeat_interval_ms >= self.cluster.election_timeout_min_ms {
+                return Err(
+                    "cluster.heartbeat_interval_ms must be less than election_timeout_min_ms"
+                        .into(),
+                );
+            }
+
+            if let Some(keys) = &self.cluster.peer_auth_keys {
+                let mut seen_keys: HashSet<&str> = HashSet::new();
+                for (i, k) in keys.iter().enumerate() {
+                    if !k.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
+                        return Err(
+                            format!("cluster.peer_auth_keys[{i}] must be visible ASCII").into()
+                        );
+                    }
+
+                    if !seen_keys.insert(k.as_str()) {
+                        return Err(format!(
+                            "cluster.peer_auth_keys[{i}] duplicates an earlier key"
+                        )
+                        .into());
+                    }
+                }
+            }
+        } else {
+            if self.cluster.bootstrap_single {
+                return Err("cluster.bootstrap_single requires cluster.enabled to be true".into());
+            }
         }
 
         if self.tracing.enabled && self.tracing.service_name.is_empty() {
@@ -544,22 +691,6 @@ impl Config {
             }
         }
 
-        match (&self.admin.tls_cert_path, &self.admin.tls_key_path) {
-            (Some(_), None) => {
-                return Err(
-                    "admin.tls_cert_path is set but admin.tls_key_path is not; set both or neither"
-                        .into(),
-                );
-            }
-            (None, Some(_)) => {
-                return Err(
-                    "admin.tls_key_path is set but admin.tls_cert_path is not; set both or neither"
-                        .into(),
-                );
-            }
-            _ => {}
-        }
-
         if self.admin.enabled
             && !self.admin.listen_addr.ip().is_loopback()
             && self.admin.keys.is_none()
@@ -570,6 +701,7 @@ impl Config {
                     .into(),
             );
         }
+
         if let Some(keys) = &self.admin.keys {
             let mut names: HashSet<&str> = HashSet::new();
             let mut secrets: HashSet<&str> = HashSet::new();
@@ -594,6 +726,7 @@ impl Config {
                 }
             }
         }
+
         if let Some(keys) = &self.auth.api_keys {
             let mut names: HashSet<&str> = HashSet::new();
             let mut secrets: HashSet<&str> = HashSet::new();
@@ -672,6 +805,30 @@ impl Config {
 
         Ok(())
     }
+}
+
+fn validate_tls_config(
+    cert_path: &Option<String>,
+    key_path: &Option<String>,
+    prefix: &str,
+) -> Result<(), Box<dyn Error>> {
+    match (cert_path, key_path) {
+        (Some(_), None) => {
+            return Err(format!(
+                "{prefix}_cert_path is set but {prefix}_key_path is not; set both or neither"
+            )
+            .into());
+        }
+        (None, Some(_)) => {
+            return Err(format!(
+                "{prefix}_key_path is set but {prefix}_cert_path is not; set both or neither"
+            )
+            .into());
+        }
+        _ => {}
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1065,5 +1222,201 @@ mod tests {
             ..Default::default()
         };
         assert!(cfg.validate().is_ok());
+    }
+
+    // A minimal valid enabled [cluster]: the advertise addrs are the only
+    // keys without workable defaults.
+    fn enabled_cluster() -> Config {
+        let mut cfg = Config::default();
+        cfg.cluster.enabled = true;
+        cfg.cluster.client_advertise_addr = Some("sepp-1.example.com:50051".into());
+        cfg.cluster.peer_advertise_addr = Some("sepp-1.internal:50052".into());
+        cfg
+    }
+
+    #[test]
+    fn cluster_section_round_trips_from_toml() {
+        let cfg = Config::from_toml_str(
+            r#"
+            [cluster]
+            enabled = true
+            node_id = 2
+            peer_listen_addr = "0.0.0.0:50052"
+            peer_advertise_addr = "sepp-2.internal:50052"
+            client_advertise_addr = "sepp-2.example.com:50051"
+            peer_tls_cert_path = "/tls/peer.crt"
+            peer_tls_key_path = "/tls/peer.key"
+            peer_tls_ca_path = "/tls/ca.crt"
+            peer_auth_keys = ["key-one", "key-two"]
+            heartbeat_interval_ms = 100
+            election_timeout_min_ms = 1000
+            election_timeout_max_ms = 2000
+            "#,
+        )
+        .expect("a full cluster section parses and validates");
+        assert!(cfg.cluster.enabled);
+        assert_eq!(cfg.cluster.node_id, 2);
+        assert_eq!(
+            cfg.cluster.peer_advertise_addr.as_deref(),
+            Some("sepp-2.internal:50052")
+        );
+        assert_eq!(
+            cfg.cluster.peer_auth_keys.as_deref(),
+            Some(["key-one".to_string(), "key-two".to_string()].as_slice())
+        );
+
+        let cfg = Config::from_toml_str("").expect("empty config");
+        assert!(!cfg.cluster.enabled, "cluster defaults to disabled");
+    }
+
+    #[test]
+    fn cluster_mode_bans_buffer_persist_mode() {
+        let mut cfg = enabled_cluster();
+        cfg.storage.persist_mode = PersistMode::Buffer;
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("buffer"),
+            "unexpected error: {err}"
+        );
+
+        // Buffer stays valid outside cluster mode.
+        let mut cfg = Config::default();
+        cfg.storage.persist_mode = PersistMode::Buffer;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn enabled_cluster_needs_client_advertise_addr() {
+        assert!(enabled_cluster().validate().is_ok());
+
+        let mut cfg = enabled_cluster();
+        cfg.cluster.client_advertise_addr = None;
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("client_advertise_addr"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn wildcard_peer_bind_needs_an_advertise_addr() {
+        let mut cfg = enabled_cluster();
+        cfg.cluster.peer_advertise_addr = None;
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("peer_advertise_addr"),
+            "unexpected error: {err}"
+        );
+
+        // A concrete bind is dialable as-is.
+        let mut cfg = enabled_cluster();
+        cfg.cluster.peer_advertise_addr = None;
+        cfg.cluster.peer_listen_addr = "10.0.0.5:50052".parse().unwrap();
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn cluster_timer_ordering_is_enforced() {
+        let mut cfg = enabled_cluster();
+        cfg.cluster.election_timeout_min_ms = cfg.cluster.election_timeout_max_ms;
+        assert!(cfg.validate().is_err(), "min must stay below max");
+
+        let mut cfg = enabled_cluster();
+        cfg.cluster.heartbeat_interval_ms = cfg.cluster.election_timeout_min_ms;
+        assert!(cfg.validate().is_err(), "heartbeat must stay below min");
+    }
+
+    #[test]
+    fn peer_tls_pairing_and_orphan_ca_are_rejected() {
+        let mut cfg = Config::default();
+        cfg.cluster.peer_tls_cert_path = Some("/tls/peer.crt".into());
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("cluster.peer_tls"),
+            "unexpected error: {err}"
+        );
+
+        let mut cfg = Config::default();
+        cfg.cluster.peer_tls_ca_path = Some("/tls/ca.crt".into());
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("peer_tls_ca_path"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn peer_auth_keys_are_shape_checked() {
+        let mut cfg = Config::default();
+        cfg.cluster.peer_auth_keys = Some(vec![]);
+        assert!(
+            cfg.validate().is_err(),
+            "an empty list authenticates nothing"
+        );
+
+        let mut cfg = Config::default();
+        cfg.cluster.peer_auth_keys = Some(vec!["".into()]);
+        assert!(cfg.validate().is_err(), "empty entries are rejected");
+
+        let mut cfg = enabled_cluster();
+        cfg.cluster.peer_auth_keys = Some(vec!["kü".into()]);
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("ASCII"), "unexpected error: {err}");
+
+        let mut cfg = enabled_cluster();
+        cfg.cluster.peer_auth_keys = Some(vec!["dup".into(), "dup".into()]);
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("duplicates"),
+            "unexpected error: {err}"
+        );
+
+        let mut cfg = enabled_cluster();
+        cfg.cluster.peer_auth_keys = Some(vec!["key-one".into(), "key-two".into()]);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn bootstrap_single_needs_cluster_enabled() {
+        let mut cfg = Config::default();
+        cfg.cluster.bootstrap_single = true;
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("bootstrap_single"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn cluster_node_id_zero_is_rejected() {
+        let mut cfg = Config::default();
+        cfg.cluster.node_id = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn host_port_accepts_dialable_shapes_only() {
+        for ok in [
+            "sepp-1.internal:50052",
+            "10.0.0.5:50051",
+            "[::1]:50052",
+            "localhost:1",
+            "host:65535",
+        ] {
+            assert!(host_port(ok, &()).is_ok(), "{ok:?} should be accepted");
+        }
+        for bad in [
+            "",
+            "sepp-1.internal",
+            ":50052",
+            "::1:50052",
+            "[::1]",
+            "10.0.0.5:0",
+            "host:0",
+            "host:70000",
+            "host:52/path",
+        ] {
+            assert!(host_port(bad, &()).is_err(), "{bad:?} should be rejected");
+        }
     }
 }

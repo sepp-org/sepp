@@ -3017,6 +3017,10 @@ impl Storage {
             }
         }
 
+        if config.cluster.enabled {
+            crate::cluster::verify_or_stamp_identity(&db, &config.cluster, &config.server.db_path)?;
+        }
+
         let params = StorageParams {
             persist_mode: match config.storage.persist_mode {
                 crate::config::PersistMode::SyncAll => PersistMode::SyncAll,
@@ -3919,6 +3923,59 @@ mod tests {
             err.to_string().contains("format version"),
             "unexpected error: {err}"
         );
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    // Stamps a cluster identity the way a first cluster-enabled boot would.
+    fn stamp_identity(path: &std::path::Path, node_id: u64) {
+        let db = TxDatabase::builder(path).open().expect("open db");
+        let raft = db
+            .keyspace("raft", KeyspaceCreateOptions::default)
+            .expect("create raft keyspace");
+        let mut tx = db.write_tx();
+        tx.insert(&raft, b"node_id".to_vec(), node_id.to_be_bytes().to_vec());
+        tx.insert(
+            &raft,
+            b"instance_uuid".to_vec(),
+            Uuid::new_v4().as_bytes().to_vec(),
+        );
+        tx.commit().expect("commit identity");
+        db.persist(PersistMode::SyncAll).expect("persist");
+    }
+
+    #[test]
+    fn open_refuses_a_cluster_node_id_mismatch() {
+        let path = std::env::temp_dir().join(format!("sepp-storage-test-{}", Uuid::new_v4()));
+        stamp_identity(&path, 7);
+
+        let mut config = Config::default();
+        config.server.db_path = path.to_str().expect("utf-8 temp path").to_string();
+        config.cluster.enabled = true;
+        let registry = crate::queues::QueueRegistry::from_config(&config).into_shared();
+        let err = Storage::open(&config, registry, Metrics::new(false))
+            .err()
+            .expect("open must refuse a node_id mismatch");
+        assert!(
+            err.to_string().contains("node_id"),
+            "unexpected error: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn cluster_identity_is_ignored_when_cluster_is_disabled() {
+        let path = std::env::temp_dir().join(format!("sepp-storage-test-{}", Uuid::new_v4()));
+        stamp_identity(&path, 7);
+
+        // Disabled cluster mode never reads the raft keyspace, so the
+        // mismatched stamp is invisible: exactly today's behavior.
+        let mut config = Config::default();
+        config.server.db_path = path.to_str().expect("utf-8 temp path").to_string();
+        let registry = crate::queues::QueueRegistry::from_config(&config).into_shared();
+        let _storage = Storage::open(&config, registry, Metrics::new(false))
+            .expect("disabled cluster mode ignores identity stamps");
 
         let _ = std::fs::remove_dir_all(&path);
     }

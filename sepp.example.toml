@@ -24,6 +24,47 @@ db_path = "./sepp-data"
 # effect regardless of this flag; strict only gates rejection of unknown names.
 strict_queues = false
 
+# Raft clustering. In development.
+#[cluster]
+#enabled = false
+
+# This node's raft id: a stable integer, unique within the cluster.
+# Stamped into the data dir on first cluster-enabled start; a later
+# config/disk mismatch refuses to boot.
+#node_id = 1
+
+# Self-initialize a cluster of one on first boot. For unattended
+# single-node deployments; multi-node clusters use `sepp cluster init`.
+#bootstrap_single = false
+
+# host:port the raft peer listener binds to.
+#peer_listen_addr = "0.0.0.0:50052"
+
+# host:port other cluster nodes dial to reach this node's peer listener.
+# Required when peer_listen_addr is a wildcard address.
+#peer_advertise_addr = "sepp-1.internal:50052"
+
+# host:port clients dial for this node. Rides in replicated membership,
+# feeds the leader redirect and discovery. Required when enabled.
+#client_advertise_addr = "sepp-1.example.com:50051"
+
+# TLS for the peer listener and peer dials. Set cert and key both or
+# neither. ca_path is the trust root used to verify other nodes.
+#peer_tls_cert_path = "/etc/sepp/tls/peer.crt"
+#peer_tls_key_path = "/etc/sepp/tls/peer.key"
+#peer_tls_ca_path = "/etc/sepp/tls/peer-ca.crt"
+
+# Keys accepted from peers; the first entry is the key this node sends.
+# A list so rotation never drops fault tolerance: add the new key
+# everywhere, promote it to first everywhere, then drop the old one.
+#peer_auth_keys = ["generate-a-long-random-secret"]
+
+# Raft timers. Election timeouts are drawn per cycle from [min, max];
+# the heartbeat must stay well below election_timeout_min_ms.
+#heartbeat_interval_ms = 250
+#election_timeout_min_ms = 1500
+#election_timeout_max_ms = 3000
+
 [admin]
 # Serve the admin web UI on its own HTTP listener, separate from the gRPC
 # server and the metrics endpoints. On by default; set false to disable.
