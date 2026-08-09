@@ -58,8 +58,6 @@ impl StoreBuilder<TypeConfig, RaftLogStore, StateMachine> for FjallStoreBuilder 
             }
         });
 
-        // The full apply stack: Store and Indexes owned by a committer
-        // thread running the raft loop, exactly as PR 8 will wire it.
         let store = Store::new(
             db.clone(),
             Keyspaces::open(&db).map_err(fjall_err)?,
@@ -91,8 +89,8 @@ impl StoreBuilder<TypeConfig, RaftLogStore, StateMachine> for FjallStoreBuilder 
             .spawn(move || core.run_raft(sm_rx, reads_rx, admin))
             .expect("spawn committer thread");
 
-        let sm =
-            StateMachine::new(db, sm_tx, path.to_str().expect("utf-8 temp path")).map_err(err)?;
+        let sm = StateMachine::new(db, sm_tx, path.to_str().expect("utf-8 temp path"), 16 << 20)
+            .map_err(err)?;
 
         Ok(((), log_store, sm))
     }

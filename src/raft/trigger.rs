@@ -2,8 +2,7 @@
 // the full database every few seconds at sepp's entry rates, so the engine
 // runs with snapshotting disabled and this task calls trigger().snapshot()
 // when BOTH hold: enough entries since the last snapshot AND enough wall
-// time since the last build. Constants in v1, config keys only if demand
-// appears.
+// time since the last build.
 
 use std::future::Future;
 use std::time::Duration;
@@ -18,7 +17,6 @@ pub const SNAPSHOT_ENTRY_THRESHOLD: u64 = 2_000_000;
 pub const SNAPSHOT_TIME_FLOOR: Duration = Duration::from_secs(15 * 60);
 
 // Applied and snapshot-covered log indexes, as the trigger task sees them
-// (folded down from RaftMetrics by the caller).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LogProgress {
     pub applied: Option<u64>,
@@ -36,14 +34,11 @@ impl SnapshotCadence {
         Self {
             entry_threshold,
             time_floor,
-            // Boot counts as a build: a floor's worth of quiet before the
-            // first snapshot, so restarts never stampede.
+            // Boot counts as a build
             last_built: Instant::now(),
         }
     }
 
-    // Time left until the floor stops gating; zero means only the entry
-    // threshold gates.
     pub fn floor_remaining(&self, now: Instant) -> Duration {
         self.time_floor
             .saturating_sub(now.duration_since(self.last_built))
@@ -55,6 +50,7 @@ impl SnapshotCadence {
             (Some(applied), None) => applied.saturating_add(1),
             (None, _) => 0,
         };
+
         entries_since >= self.entry_threshold && self.floor_remaining(now).is_zero()
     }
 
@@ -63,9 +59,6 @@ impl SnapshotCadence {
     }
 }
 
-// Drives the cadence against live progress. `trigger` requests one snapshot
-// build and returns false when the engine is gone; PR 8 passes a closure
-// over Raft::trigger().snapshot(). Exits when either side shuts down.
 pub async fn run_snapshot_trigger<F, Fut>(
     mut progress: watch::Receiver<LogProgress>,
     mut cadence: SnapshotCadence,
@@ -75,23 +68,22 @@ pub async fn run_snapshot_trigger<F, Fut>(
     Fut: Future<Output = bool>,
 {
     loop {
-        // Wait out the time floor first: no metrics churn can force a build
-        // inside it.
         let remaining = cadence.floor_remaining(Instant::now());
         if !remaining.is_zero() {
             tokio::time::sleep(remaining).await;
         }
 
-        // Then wait for the entry threshold. A closed progress channel means
-        // shutdown, checked even while the threshold holds.
         loop {
             if progress.has_changed().is_err() {
                 return;
             }
+
             let current = *progress.borrow_and_update();
             if cadence.should_build(Instant::now(), current) {
                 break;
             }
+
+            // Parks the task until the next update
             if progress.changed().await.is_err() {
                 return;
             }
@@ -101,6 +93,7 @@ pub async fn run_snapshot_trigger<F, Fut>(
         if !trigger().await {
             return;
         }
+
         cadence.built(Instant::now());
     }
 }

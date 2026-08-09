@@ -20,7 +20,7 @@ use prost::Message;
 use tokio::sync::oneshot;
 
 use super::snapshot::{
-    SnapshotDir, build_snapshot_file, clear_install_marker, verify_snapshot_file,
+    SnapshotDir, build_snapshot_file, clear_install_marker, frame_cap, verify_snapshot_file,
     write_install_marker,
 };
 use super::{
@@ -50,16 +50,15 @@ pub struct StateMachine {
 }
 
 impl StateMachine {
-    // Dead-code allowance: constructed only by tests until PR 8 wires the
-    // engine into boot.
     #[allow(dead_code)]
     pub(crate) fn new(
         db: TxDatabase,
         sm_tx: flume::Sender<SmCommand>,
         db_path: &str,
+        max_message_bytes: u64,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let raft = db.keyspace("raft", KeyspaceCreateOptions::default)?;
-        let dir = SnapshotDir::open(db_path)?;
+        let dir = SnapshotDir::open(db_path, frame_cap(max_message_bytes))?;
 
         Ok(Self {
             sm_tx,
@@ -157,9 +156,10 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
             let source = snapshot.path.clone();
             let staged_path = staged_path.clone();
             let in_dir = self.dir.contains(&source);
+            let cap = self.dir.frame_cap();
             let expect_last = meta.last_log_id;
             tokio::task::spawn_blocking(move || -> Result<(), super::snapshot::SnapshotError> {
-                let header = verify_snapshot_file(&source)?;
+                let header = verify_snapshot_file(&source, cap)?;
                 if header.last_log_id != expect_last {
                     return Err(format!(
                         "snapshot file covers {:?}, the engine is installing {:?}",
@@ -167,6 +167,7 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
                     )
                     .into());
                 }
+
                 if source != staged_path {
                     // The transport writes into this node's dir (rename); the
                     // in-process Suite hands over another node's file (copy).
@@ -176,6 +177,7 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
                     } else {
                         std::fs::copy(&source, &staged_path)?;
                     }
+
                     // Write access: Windows refuses to flush a file opened
                     // read-only.
                     std::fs::OpenOptions::new()
@@ -212,10 +214,12 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
         self.sm_tx
             .send_async(SmCommand::Install {
                 path: staged_path.clone(),
+                frame_cap: self.dir.frame_cap(),
                 resp,
             })
             .await
             .map_err(|_| sm_msg_err("the committer thread is gone"))?;
+
         rx.await
             .map_err(|_| sm_msg_err("the committer thread died mid-install"))?
             .map_err(|e| sm_msg_err(format!("snapshot install failed: {e}")))?;

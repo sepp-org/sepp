@@ -52,9 +52,7 @@ pub(crate) struct StorageParams {
     pub(crate) admin_enabled: bool,
 }
 
-// The state machine keyspaces in canonical snapshot order. `raft` and
-// `raft_log` are deliberately absent: vote, identity and the log must never
-// ride in snapshots.
+// The state machine keyspaces in canonical snapshot order.
 pub(crate) const SM_KEYSPACES: [&str; 11] = [
     "jobs",
     "payloads",
@@ -69,9 +67,6 @@ pub(crate) const SM_KEYSPACES: [&str; 11] = [
     "audit",
 ];
 
-// Handles to the state machine keyspaces. Snapshot install replaces the
-// keyspaces on disk (delete + recreate gives them fresh internal ids), so
-// everything that holds these handles must swap them afterwards.
 pub(crate) struct Keyspaces {
     pub(crate) jobs: TxKeyspace,
     pub(crate) payloads: TxKeyspace,
@@ -172,8 +167,7 @@ impl Store {
     }
 
     // Snapshot install replaced the keyspaces on disk; the old handles are
-    // marked deleted and would error on every access. Dead-code allowance:
-    // reachable only through the raft path until PR 8 wires the engine in.
+    // marked deleted and would error on every access.
     #[allow(dead_code)]
     pub(crate) fn swap_keyspaces(&mut self, ks: Keyspaces) {
         self.jobs = ks.jobs;
@@ -205,8 +199,6 @@ impl<'a> ApplyTx<'a> {
         Self { tx, digest: None }
     }
 
-    // Dead-code allowance on the digest scope: reachable only through the
-    // raft path until PR 8 wires the engine in.
     #[allow(dead_code)]
     pub(crate) fn begin_entry(&mut self, prev: &[u8; 32], entry_bytes: &[u8]) {
         let mut hasher = Sha256::new();
@@ -306,6 +298,7 @@ fn record_write(
     hasher.update(name.as_bytes());
     hasher.update((key.len() as u32).to_be_bytes());
     hasher.update(key);
+
     if let Some(value) = value {
         hasher.update((value.len() as u32).to_be_bytes());
         hasher.update(value);

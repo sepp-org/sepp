@@ -106,8 +106,8 @@ impl Op {
         }
     }
 
-    // The stamp `stamp` would set, None for the five stampless variants. The
-    // raft apply path folds this into the replicated stamp high-water mark.
+    // The stamp `stamp` would set.
+    // The raft apply path folds this into the replicated stamp high-water mark.
     pub fn stamp_ms(&self) -> Option<i64> {
         match self {
             Op::Enqueue { now_ms, .. }

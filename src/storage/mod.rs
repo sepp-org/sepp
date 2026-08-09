@@ -186,7 +186,11 @@ impl Storage {
             crate::cluster::verify_or_stamp_identity(&db, &config.cluster, &config.server.db_path)?;
             // An unfinished snapshot install fences boot: redo it from the
             // retained file before anything reads the state machine keyspaces.
-            crate::raft::snapshot::roll_forward_pending_install(&db, &config.server.db_path)?;
+            crate::raft::snapshot::roll_forward_pending_install(
+                &db,
+                &config.server.db_path,
+                config.limits.max_message_bytes,
+            )?;
         } else {
             // Disabling [cluster] must not bypass the fence: the keyspaces
             // may be half-destroyed and would silently reopen empty.

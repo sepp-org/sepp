@@ -40,9 +40,19 @@ pub(crate) type SnapshotError = Box<dyn std::error::Error + Send + Sync>;
 const SNAPSHOT_FORMAT_VERSION: u32 = 1;
 const SNAPSHOT_INSTALLING_KEY: &[u8] = b"snapshot_installing";
 
-// One frame must fit in memory on both ends; a single job payload is capped
-// far below this (limits.max_message_bytes).
-const MAX_FRAME_BYTES: u32 = 64 * 1024 * 1024;
+// One frame must fit in memory on both ends.
+const FRAME_CAP_FLOOR_BYTES: u32 = 64 * 1024 * 1024;
+const FRAME_SLACK_BYTES: u64 = 1024 * 1024;
+
+// The largest limits.max_message_bytes cluster mode accepts: one message
+// plus slack must stay u32-frame-encodable.
+pub(crate) const MAX_CLUSTER_MESSAGE_BYTES: u64 = u32::MAX as u64 - FRAME_SLACK_BYTES;
+
+pub(crate) fn frame_cap(max_message_bytes: u64) -> u32 {
+    max_message_bytes
+        .saturating_add(FRAME_SLACK_BYTES)
+        .clamp(u64::from(FRAME_CAP_FLOOR_BYTES), u64::from(u32::MAX)) as u32
+}
 
 // The snapshot data type the engine moves between builder, sender and
 // installer. Self-describing: the file's header carries the SnapshotMeta.
@@ -57,13 +67,18 @@ pub struct SnapshotFile {
 #[derive(Clone)]
 pub(crate) struct SnapshotDir {
     dir: PathBuf,
+    frame_cap: u32,
 }
 
 impl SnapshotDir {
-    pub(crate) fn open(db_path: &str) -> std::io::Result<Self> {
+    pub(crate) fn open(db_path: &str, frame_cap: u32) -> std::io::Result<Self> {
         let dir = Path::new(db_path).join("snapshots");
         fs::create_dir_all(&dir)?;
-        Ok(Self { dir })
+        Ok(Self { dir, frame_cap })
+    }
+
+    pub(crate) fn frame_cap(&self) -> u32 {
+        self.frame_cap
     }
 
     pub(crate) fn file_path(&self, snapshot_id: &str) -> PathBuf {
@@ -97,13 +112,15 @@ impl SnapshotDir {
             if path.extension().is_none_or(|ext| ext != "snap") {
                 continue;
             }
-            let meta = match read_snapshot_header(&path) {
+
+            let meta = match read_snapshot_header(&path, self.frame_cap) {
                 Ok(meta) => meta,
                 Err(e) => {
                     warn!(path = %path.display(), error = %e, "skipping unreadable snapshot file");
                     continue;
                 }
             };
+
             if best
                 .as_ref()
                 .is_none_or(|(b, _)| b.last_log_id < meta.last_log_id)
@@ -120,6 +137,7 @@ impl SnapshotDir {
         let Ok(entries) = fs::read_dir(&self.dir) else {
             return;
         };
+
         for path in entries.flatten().map(|d| d.path()) {
             if path != keep && path.extension().is_some_and(|ext| ext == "snap") {
                 let _ = fs::remove_file(&path);
@@ -158,13 +176,15 @@ impl<W: Write> Write for HashingWriter<W> {
     }
 }
 
-fn write_frame(w: &mut impl Write, frame: pb::snapshot_frame::Frame) -> std::io::Result<()> {
+fn write_frame(
+    w: &mut impl Write,
+    frame: pb::snapshot_frame::Frame,
+    frame_cap: u32,
+) -> std::io::Result<()> {
     let bytes = pb::SnapshotFrame { frame: Some(frame) }.encode_to_vec();
-    // Enforced on write as well as read, so a raised payload limit fails the
-    // build loudly instead of producing snapshots every reader rejects.
-    if bytes.len() > MAX_FRAME_BYTES as usize {
+    if bytes.len() > frame_cap as usize {
         return Err(std::io::Error::other(format!(
-            "snapshot frame of {} bytes exceeds the frame cap",
+            "snapshot frame of {} bytes exceeds the {frame_cap}-byte cap",
             bytes.len()
         )));
     }
@@ -173,8 +193,7 @@ fn write_frame(w: &mut impl Write, frame: pb::snapshot_frame::Frame) -> std::io:
 }
 
 // Builds a snapshot of the current applied state into `dir` and returns its
-// meta and path. Runs against an MVCC read snapshot, so writes continue; the
-// fjall snapshot pin lasts only for the build.
+// meta and path. Runs against an MVCC read snapshot, so writes continue.
 pub(crate) fn build_snapshot_file(
     db: &TxDatabase,
     dir: &SnapshotDir,
@@ -215,6 +234,7 @@ pub(crate) fn build_snapshot_file(
             format_version: SNAPSHOT_FORMAT_VERSION,
             meta: Some(super::snapshot_meta_to_proto(&meta)),
         }),
+        dir.frame_cap,
     )?;
 
     for name in SM_KEYSPACES {
@@ -222,7 +242,9 @@ pub(crate) fn build_snapshot_file(
         write_frame(
             &mut w,
             pb::snapshot_frame::Frame::Keyspace(pb::SnapshotKeyspace { name: name.into() }),
+            dir.frame_cap,
         )?;
+
         for guard in snap.iter(keyspace) {
             let (key, value) = guard.into_inner()?;
             write_frame(
@@ -231,6 +253,7 @@ pub(crate) fn build_snapshot_file(
                     key: key.to_vec(),
                     value: value.to_vec(),
                 }),
+                dir.frame_cap,
             )?;
         }
     }
@@ -239,14 +262,14 @@ pub(crate) fn build_snapshot_file(
     write_frame(
         &mut w,
         pb::snapshot_frame::Frame::Trailer(pb::SnapshotTrailer { sha256 }),
+        dir.frame_cap,
     )?;
+
     let file = w.inner.into_inner().map_err(|e| e.into_error())?;
     file.sync_all()?;
     drop(file);
 
-    // The read snapshot can include apply txs still riding the journal
-    // buffer (apply-only cycles defer persist by design). A published
-    // snapshot must never claim state the state machine can lose to a
+    // A published snapshot must never claim state the state machine can lose to a
     // crash, so make the claimed state durable before advertising the file.
     db.persist(PersistMode::SyncData)?;
 
@@ -289,10 +312,11 @@ struct SnapshotStream {
     sections: Vec<String>,
     last_key: Option<Vec<u8>>,
     done: bool,
+    frame_cap: u32,
 }
 
 impl SnapshotStream {
-    fn open(path: &Path) -> Result<Self, SnapshotError> {
+    fn open(path: &Path, frame_cap: u32) -> Result<Self, SnapshotError> {
         let mut stream = Self {
             reader: BufReader::new(File::open(path)?),
             hasher: Sha256::new(),
@@ -300,6 +324,7 @@ impl SnapshotStream {
             sections: Vec::new(),
             last_key: None,
             done: false,
+            frame_cap,
         };
 
         match stream.read_frame()? {
@@ -334,9 +359,15 @@ impl SnapshotStream {
         let mut len_bytes = [0u8; 4];
         self.reader.read_exact(&mut len_bytes).map_err(truncated)?;
         let len = u32::from_be_bytes(len_bytes);
-        if len > MAX_FRAME_BYTES {
-            return Err(format!("snapshot frame of {len} bytes exceeds the frame cap").into());
+        if len > self.frame_cap {
+            return Err(format!(
+                "snapshot frame of {len} bytes exceeds this node's cap of {} (is \
+                 limits.max_message_bytes lower than the builder's?)",
+                self.frame_cap
+            )
+            .into());
         }
+
         let mut frame_bytes = vec![0u8; len as usize];
         self.reader
             .read_exact(&mut frame_bytes)
@@ -382,6 +413,7 @@ impl SnapshotStream {
                     )
                     .into());
                 }
+
                 self.last_key = Some(kv.key.clone());
                 Ok(Some(SnapshotEvent::Kv(kv.key, kv.value)))
             }
@@ -390,9 +422,11 @@ impl SnapshotStream {
                 if computed.as_slice() != trailer.sha256.as_slice() {
                     return Err("snapshot checksum mismatch".into());
                 }
+
                 if self.reader.read(&mut [0u8; 1])? != 0 {
                     return Err("snapshot file has data after the trailer".into());
                 }
+
                 if self.sections != SM_KEYSPACES {
                     return Err(format!(
                         "snapshot keyspaces {:?} do not match the state machine set",
@@ -400,6 +434,7 @@ impl SnapshotStream {
                     )
                     .into());
                 }
+
                 self.done = true;
                 Ok(None)
             }
@@ -407,16 +442,17 @@ impl SnapshotStream {
     }
 }
 
-// Reads only the header frame: enough for `current()` to name and order
-// files without scanning gigabytes.
-fn read_snapshot_header(path: &Path) -> Result<SnapshotMeta, SnapshotError> {
-    Ok(SnapshotStream::open(path)?.meta)
+fn read_snapshot_header(path: &Path, frame_cap: u32) -> Result<SnapshotMeta, SnapshotError> {
+    Ok(SnapshotStream::open(path, frame_cap)?.meta)
 }
 
-// Full-file verification: framing, checksum, section set and key order.
-pub(crate) fn verify_snapshot_file(path: &Path) -> Result<SnapshotMeta, SnapshotError> {
-    let mut stream = SnapshotStream::open(path)?;
+pub(crate) fn verify_snapshot_file(
+    path: &Path,
+    frame_cap: u32,
+) -> Result<SnapshotMeta, SnapshotError> {
+    let mut stream = SnapshotStream::open(path, frame_cap)?;
     while stream.next()?.is_some() {}
+
     Ok(stream.meta)
 }
 
@@ -427,8 +463,9 @@ pub(crate) fn verify_snapshot_file(path: &Path) -> Result<SnapshotMeta, Snapshot
 pub(crate) fn ingest_snapshot_file(
     db: &TxDatabase,
     path: &Path,
+    frame_cap: u32,
 ) -> Result<Keyspaces, SnapshotError> {
-    let mut stream = SnapshotStream::open(path)?;
+    let mut stream = SnapshotStream::open(path, frame_cap)?;
 
     // Delete before recreate: the fresh internal ids make stale journal
     // records for the old keyspaces unresolvable on replay.
@@ -457,17 +494,17 @@ pub(crate) fn ingest_snapshot_file(
                 ingestion.write(key, value)?;
                 next = stream.next()?;
             }
+
             // Each finish is independently durable: fsynced tables plus the
             // version manifest.
             ingestion.finish()?;
         }
+
         pending = next;
     }
 
     Ok(keyspaces)
 }
-
-// --- The install fence -----------------------------------------------------
 
 pub(crate) fn read_install_marker(
     db: &TxDatabase,
@@ -476,6 +513,7 @@ pub(crate) fn read_install_marker(
     let Some(bytes) = db.read_tx().get(raft, SNAPSHOT_INSTALLING_KEY)? else {
         return Ok(None);
     };
+
     Ok(Some(pb::SnapshotInstallMarker::decode(bytes.as_ref())?))
 }
 
@@ -492,6 +530,7 @@ pub(crate) fn write_install_marker(
         meta: Some(super::snapshot_meta_to_proto(meta)),
         file_name: file_name.into(),
     };
+
     let mut tx = db.write_tx();
     tx.insert(
         raft,
@@ -504,6 +543,7 @@ pub(crate) fn write_install_marker(
 
 pub(crate) fn clear_install_marker(db: &TxDatabase, raft: &TxKeyspace) -> Result<(), fjall::Error> {
     let mut tx = db.write_tx();
+
     tx.remove(raft, SNAPSHOT_INSTALLING_KEY.to_vec());
     tx.commit()?;
     db.persist(PersistMode::SyncAll)
@@ -521,6 +561,7 @@ pub fn refuse_pending_install(
     if !db.keyspace_exists("raft") {
         return Ok(());
     }
+
     let raft = db.keyspace("raft", KeyspaceCreateOptions::default)?;
     match read_install_marker(db, &raft) {
         Ok(None) => Ok(()),
@@ -540,12 +581,11 @@ pub fn refuse_pending_install(
 // Boot-time roll-forward: a present marker means an install did not finish.
 // Redo it from the retained file before anything reads the state machine
 // keyspaces. Never rolls back: the snapshot is committed state and the
-// local log may already be purged below it. The file may still sit under
-// its staged name (crash before the post-ingest publish rename), so try the
-// final name first, then the staged one, and finish the publish here.
+// local log may already be purged below it.
 pub fn roll_forward_pending_install(
     db: &TxDatabase,
     db_path: &str,
+    max_message_bytes: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Return-position coercion drops the Send + Sync markers `?` cannot.
     fn erase(e: SnapshotError) -> Box<dyn std::error::Error> {
@@ -557,7 +597,7 @@ pub fn roll_forward_pending_install(
         return Ok(());
     };
 
-    let dir = SnapshotDir::open(db_path)?;
+    let dir = SnapshotDir::open(db_path, frame_cap(max_message_bytes))?;
     let final_path = dir.dir.join(&marker.file_name);
     let staged = dir.dir.join(format!("{}.staged", marker.file_name));
     let source = if final_path.exists() {
@@ -565,7 +605,8 @@ pub fn roll_forward_pending_install(
     } else {
         staged.clone()
     };
-    verify_snapshot_file(&source).map_err(|e| {
+
+    verify_snapshot_file(&source, dir.frame_cap).map_err(|e| {
         format!(
             "boot found an unfinished snapshot install and its file {:?} is unusable ({e}); \
              wipe the data dir and re-add this node",
@@ -574,7 +615,8 @@ pub fn roll_forward_pending_install(
     })?;
 
     info!(file = %source.display(), "rolling an unfinished snapshot install forward");
-    ingest_snapshot_file(db, &source).map_err(erase)?;
+    ingest_snapshot_file(db, &source, dir.frame_cap).map_err(erase)?;
+
     if source == staged {
         let _ = fs::remove_file(&final_path);
         fs::rename(&staged, &final_path)?;
@@ -605,6 +647,10 @@ mod tests {
 
     fn temp_path() -> PathBuf {
         std::env::temp_dir().join(format!("sepp-snapshot-test-{}", Uuid::new_v4()))
+    }
+
+    fn cap() -> u32 {
+        frame_cap(16 << 20)
     }
 
     fn open_core(db: &TxDatabase) -> ApplyCore {
@@ -694,7 +740,7 @@ mod tests {
         populate(&mut core);
         let source_contents = logical_contents(core.store());
 
-        let dir = SnapshotDir::open(source_path.to_str().unwrap()).expect("snapshot dir");
+        let dir = SnapshotDir::open(source_path.to_str().unwrap(), cap()).expect("snapshot dir");
         let (meta, path) = build_snapshot_file(&db, &dir).expect("build");
         assert_eq!(
             meta.last_log_id.map(|l| l.index),
@@ -703,7 +749,9 @@ mod tests {
         );
 
         assert_eq!(
-            verify_snapshot_file(&path).expect("verify").snapshot_id,
+            verify_snapshot_file(&path, cap())
+                .expect("verify")
+                .snapshot_id,
             meta.snapshot_id
         );
         let (current_meta, current_path) = dir.current().expect("scan").expect("current");
@@ -727,7 +775,7 @@ mod tests {
         )]);
         drop(doomed);
 
-        let keyspaces = ingest_snapshot_file(&dest, &path).expect("ingest");
+        let keyspaces = ingest_snapshot_file(&dest, &path, cap()).expect("ingest");
         let installed = Store::new(
             dest.clone(),
             keyspaces,
@@ -756,7 +804,7 @@ mod tests {
             .expect("open db");
         let mut core = open_core(&db);
         populate(&mut core);
-        let dir = SnapshotDir::open(path.to_str().unwrap()).expect("snapshot dir");
+        let dir = SnapshotDir::open(path.to_str().unwrap(), cap()).expect("snapshot dir");
         let (_, file) = build_snapshot_file(&db, &dir).expect("build");
 
         // Flip one byte mid-file.
@@ -777,7 +825,7 @@ mod tests {
         }
         // The exact failure depends on where the flip lands (checksum,
         // framing or decode); rejection is the contract.
-        verify_snapshot_file(&corrupt).expect_err("corruption must fail");
+        verify_snapshot_file(&corrupt, cap()).expect_err("corruption must fail");
 
         // Cut the trailer off.
         let truncated = file.with_extension("truncated.snap");
@@ -789,7 +837,7 @@ mod tests {
             .expect("open");
         f.set_len(len - 20).expect("truncate");
         drop(f);
-        let err = verify_snapshot_file(&truncated).expect_err("truncation must fail");
+        let err = verify_snapshot_file(&truncated, cap()).expect_err("truncation must fail");
         assert!(
             format!("{err}").contains("truncated"),
             "unexpected error: {err}"
@@ -809,7 +857,7 @@ mod tests {
         let mut core = open_core(&source_db);
         populate(&mut core);
         let source_contents = logical_contents(core.store());
-        let source_dir = SnapshotDir::open(source_path.to_str().unwrap()).expect("dir");
+        let source_dir = SnapshotDir::open(source_path.to_str().unwrap(), cap()).expect("dir");
         let (meta, file) = build_snapshot_file(&source_db, &source_dir).expect("build");
 
         // The victim: different pre-install state, persistent so it can
@@ -833,7 +881,7 @@ mod tests {
             // The install's steps up to the fence: file parked under its
             // STAGED name (never advertised), marker naming the final file,
             // durable. Crash before any ingest.
-            let dir = SnapshotDir::open(&victim_str).expect("dir");
+            let dir = SnapshotDir::open(&victim_str, cap()).expect("dir");
             fs::copy(&file, dir.staged_path(&meta.snapshot_id)).expect("stage file");
             let raft = db
                 .keyspace("raft", KeyspaceCreateOptions::default)
@@ -846,7 +894,7 @@ mod tests {
         // under the staged name.
         {
             let db = TxDatabase::builder(&victim_path).open().expect("reopen");
-            roll_forward_pending_install(&db, &victim_str).expect("roll forward");
+            roll_forward_pending_install(&db, &victim_str, 16 << 20).expect("roll forward");
             let raft = db
                 .keyspace("raft", KeyspaceCreateOptions::default)
                 .expect("raft ks");
@@ -857,7 +905,7 @@ mod tests {
 
             // Roll-forward finishes the publish: the file now carries the
             // final name and is this node's current snapshot.
-            let dir = SnapshotDir::open(&victim_str).expect("dir");
+            let dir = SnapshotDir::open(&victim_str, cap()).expect("dir");
             assert!(!dir.staged_path(&meta.snapshot_id).exists());
             let (current, _) = dir.current().expect("scan").expect("current");
             assert_eq!(current.snapshot_id, meta.snapshot_id);
@@ -878,7 +926,7 @@ mod tests {
         // Second reboot: marker present over half-destroyed keyspaces.
         {
             let db = TxDatabase::builder(&victim_path).open().expect("reopen 2");
-            roll_forward_pending_install(&db, &victim_str).expect("roll forward again");
+            roll_forward_pending_install(&db, &victim_str, 16 << 20).expect("roll forward again");
 
             let store = Store::new(
                 db.clone(),
@@ -899,7 +947,7 @@ mod tests {
             rebuild_indexes(&store).expect("boot index rebuild");
 
             // And with no marker, roll-forward is a no-op.
-            roll_forward_pending_install(&db, &victim_str).expect("idempotent");
+            roll_forward_pending_install(&db, &victim_str, 16 << 20).expect("idempotent");
         }
 
         let _ = fs::remove_dir_all(&victim_path);
@@ -916,14 +964,52 @@ mod tests {
         let raft = db
             .keyspace("raft", KeyspaceCreateOptions::default)
             .expect("raft ks");
-        SnapshotDir::open(&path_str).expect("dir");
+        SnapshotDir::open(&path_str, cap()).expect("dir");
         write_install_marker(&db, &raft, &SnapshotMeta::default(), "missing.snap").expect("marker");
 
-        let err = roll_forward_pending_install(&db, &path_str)
+        let err = roll_forward_pending_install(&db, &path_str, 16 << 20)
             .expect_err("a lost file leaves the node unrecoverable");
         assert!(
             err.to_string().contains("wipe the data dir"),
             "the error must name the fix: {err}"
+        );
+    }
+
+    #[test]
+    fn frame_cap_floors_and_tracks_the_config() {
+        assert_eq!(frame_cap(0), FRAME_CAP_FLOOR_BYTES);
+        assert_eq!(frame_cap(16 << 20), FRAME_CAP_FLOOR_BYTES);
+        let big = 256u64 << 20;
+        assert_eq!(u64::from(frame_cap(big)), big + FRAME_SLACK_BYTES);
+        assert_eq!(frame_cap(MAX_CLUSTER_MESSAGE_BYTES), u32::MAX);
+        assert_eq!(frame_cap(u64::MAX), u32::MAX);
+    }
+
+    #[test]
+    fn caps_are_enforced_on_both_ends() {
+        let path = temp_path();
+        let db = TxDatabase::builder(&path)
+            .temporary(true)
+            .open()
+            .expect("open db");
+        let mut core = open_core(&db);
+        populate(&mut core);
+
+        // A writer refuses to produce a frame its own cap rejects.
+        let tiny = SnapshotDir::open(path.to_str().unwrap(), 16).expect("dir");
+        let err = build_snapshot_file(&db, &tiny).expect_err("tiny cap must fail the build");
+        assert!(
+            err.to_string().contains("exceeds"),
+            "unexpected error: {err}"
+        );
+
+        // A reader with a smaller cap than the builder names the suspect.
+        let dir = SnapshotDir::open(path.to_str().unwrap(), cap()).expect("dir");
+        let (_, file) = build_snapshot_file(&db, &dir).expect("build");
+        let err = verify_snapshot_file(&file, 8).expect_err("small cap must refuse");
+        assert!(
+            err.to_string().contains("max_message_bytes"),
+            "the error must name the likely drift: {err}"
         );
     }
 }

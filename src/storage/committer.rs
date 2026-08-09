@@ -297,7 +297,7 @@ impl AdminFold {
 
 // A command from the raft state machine adapter to the committer thread.
 // Dead-code allowance: reachable only through the raft path, which nothing
-// in the server constructs until PR 8 wires the engine into boot.
+// in the server constructs at the moment.
 #[allow(dead_code)]
 pub(crate) enum SmCommand {
     Apply {
@@ -306,9 +306,11 @@ pub(crate) enum SmCommand {
     },
     // The install steps that need exclusive Store ownership: delete +
     // recreate + ingest, handle swap, index rebuild. The durable marker
-    // protocol around them belongs to the adapter.
+    // protocol around them belongs to the adapter, as does the frame cap
+    // (derived from config by the adapter's SnapshotDir).
     Install {
         path: PathBuf,
+        frame_cap: u32,
         resp: oneshot::Sender<Result<(), Status>>,
     },
 }
@@ -323,7 +325,6 @@ pub(crate) struct ApplyCore {
     stamp: StampClamp,
     // Raft bookkeeping mirrored from `meta`: the divergence digest chain
     // head, the replicated stamp high-water mark and the applied log index.
-    // Idle on the direct path (dead-code allowance as on SmCommand).
     #[allow(dead_code)]
     digest: [u8; 32],
     #[allow(dead_code)]
@@ -463,7 +464,6 @@ impl ApplyCore {
     }
 }
 
-// The raft apply path (dead-code allowance as on SmCommand).
 #[allow(dead_code)]
 impl ApplyCore {
     // The cluster-mode committer loop: committed entries and snapshot
@@ -490,6 +490,7 @@ impl ApplyCore {
             let mut selector = flume::Selector::new().recv(&sm_rx, |r| {
                 r.map(Input::Sm).unwrap_or(Input::SmDisconnected)
             });
+
             if reads_open {
                 selector = selector.recv(&reads_rx, |r| {
                     r.map(Input::Read).unwrap_or(Input::ReadsDisconnected)
@@ -503,8 +504,7 @@ impl ApplyCore {
                 Input::Sm(cmd) => self.handle_sm(cmd, &mut admin),
                 Input::Read(read) => self.answer(read),
                 Input::Timeout => {}
-                // The engine dropped the adapter: shutdown. The read channel
-                // closing first (Storage dropped) only removes its arm.
+                // The engine dropped the adapter: shutdown.
                 Input::SmDisconnected => break,
                 Input::ReadsDisconnected => reads_open = false,
             }
@@ -529,17 +529,24 @@ impl ApplyCore {
                 let swept = entries
                     .iter()
                     .any(|e| matches!(&e.payload, EntryPayload::Normal(Op::Sweep { .. })));
+
                 let (outcomes, metrics) = self.apply_entries(entries);
                 if let Some(m) = metrics {
                     admin.fold(&m);
                 }
+
                 if swept {
                     admin.evict(&self.indexes);
                 }
+
                 let _ = resp.send(outcomes);
             }
-            SmCommand::Install { path, resp } => {
-                let _ = resp.send(self.install_snapshot(&path));
+            SmCommand::Install {
+                path,
+                frame_cap,
+                resp,
+            } => {
+                let _ = resp.send(self.install_snapshot(&path, frame_cap));
             }
         }
     }
@@ -615,8 +622,6 @@ impl ApplyCore {
             };
             *digest = tx.finish_entry();
 
-            // Adapter bookkeeping stays outside the recorded scope so the
-            // digest is batch-split-invariant; see ApplyTx.
             if let EntryPayload::Membership(m) = &entry.payload {
                 let stored = StoredMembership::new(Some(entry.log_id), m.clone());
                 tx.insert(
@@ -633,6 +638,7 @@ impl ApplyCore {
             LAST_APPLIED_KEY.to_vec(),
             log_id_to_proto(&last).encode_to_vec(),
         );
+
         tx.insert(&store.meta, APPLY_DIGEST_KEY.to_vec(), digest.to_vec());
         if *stamp_high_water != high_water_before {
             tx.insert(
@@ -642,9 +648,8 @@ impl ApplyCore {
             );
         }
 
-        // Unconditional commit: every entry advances last_applied, overriding
-        // the direct path's cycle.dirty gate. No persist here: an apply tx
-        // rides the next append-carrying IO cycle's persist and is re-derived
+        // No persist here: an apply tx rides the next append-carrying
+        // IO cycle's persist and is re-derived
         // from the durable log after a crash.
         if let Err(e) = tx.commit() {
             error!(error = %e, "raft apply commit failed");
@@ -679,14 +684,13 @@ impl ApplyCore {
         &self.indexes
     }
 
-    fn install_snapshot(&mut self, path: &Path) -> Result<(), Status> {
-        let keyspaces = crate::raft::snapshot::ingest_snapshot_file(&self.store.db, path)
-            .map_err(|e| Status::internal(format!("snapshot install failed: {e}")))?;
+    fn install_snapshot(&mut self, path: &Path, frame_cap: u32) -> Result<(), Status> {
+        let keyspaces =
+            crate::raft::snapshot::ingest_snapshot_file(&self.store.db, path, frame_cap)
+                .map_err(|e| Status::internal(format!("snapshot install failed: {e}")))?;
         self.store.swap_keyspaces(keyspaces);
         self.indexes = rebuild_indexes(&self.store).map_err(stg_err)?;
 
-        // The installed meta carries the snapshot's digest, high-water and
-        // applied index.
         let raft_state = load_raft_apply_state(&self.store)
             .map_err(|e| Status::internal(format!("installed meta is unreadable: {e}")))?;
         self.digest = raft_state.digest;
@@ -883,12 +887,14 @@ fn load_raft_apply_state(
         Some(v) => <[u8; 32]>::try_from(v.as_ref())
             .map_err(|_| format!("corrupt meta apply_digest row of {} bytes", v.len()))?,
     };
+
     let stamp_high_water = match snap.get(&store.meta, STAMP_HIGH_WATER_KEY)? {
         None => 0,
         Some(v) => <[u8; 8]>::try_from(v.as_ref())
             .map(i64::from_be_bytes)
             .map_err(|_| format!("corrupt meta stamp_high_water row of {} bytes", v.len()))?,
     };
+
     let last_applied_index = snap
         .get(&store.meta, LAST_APPLIED_KEY)?
         .map(|v| crate::pb::sepp::raft::v1::LogId::decode(v.as_ref()))

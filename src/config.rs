@@ -627,6 +627,18 @@ impl Config {
                 );
             }
 
+            // Snapshot frames are u32-length-prefixed; one message plus
+            // slack must stay encodable. The frame cap itself follows the
+            // config (raft::snapshot::frame_cap), this is only the physical
+            // ceiling.
+            if self.limits.max_message_bytes > crate::raft::snapshot::MAX_CLUSTER_MESSAGE_BYTES {
+                return Err(format!(
+                    "limits.max_message_bytes must be at most {} in cluster mode",
+                    crate::raft::snapshot::MAX_CLUSTER_MESSAGE_BYTES,
+                )
+                .into());
+            }
+
             if self.cluster.client_advertise_addr.is_none() {
                 return Err(
                     "cluster.enabled requires cluster.client_advertise_addr to be set".into(),
@@ -1282,6 +1294,24 @@ mod tests {
         // Buffer stays valid outside cluster mode.
         let mut cfg = Config::default();
         cfg.storage.persist_mode = PersistMode::Buffer;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn cluster_mode_caps_max_message_bytes() {
+        let over = crate::raft::snapshot::MAX_CLUSTER_MESSAGE_BYTES + 1;
+
+        let mut cfg = enabled_cluster();
+        cfg.limits.max_message_bytes = over;
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("max_message_bytes"),
+            "unexpected error: {err}"
+        );
+
+        // Standalone mode stays unbounded.
+        let mut cfg = Config::default();
+        cfg.limits.max_message_bytes = over;
         assert!(cfg.validate().is_ok());
     }
 
