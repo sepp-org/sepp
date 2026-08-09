@@ -131,3 +131,47 @@ message SnapshotMeta {
   // Distinguishes rebuilds with the same last_log_id during transfer.
   string snapshot_id = 3;
 }
+
+// Value of the `snapshot_installing` row in the `raft` keyspace: the fence
+// made durable before any destructive install step. Present at boot means an
+// install did not finish; boot rolls it forward from the retained file.
+message SnapshotInstallMarker {
+  SnapshotMeta meta = 1;
+
+  // Snapshot file name inside the node's snapshot directory.
+  string file_name = 2;
+}
+
+// Snapshot file framing. A file is a sequence of length-prefixed (u32 BE)
+// SnapshotFrame messages: one Header, then per state machine keyspace a
+// Keyspace frame followed by its Kv frames in ascending key order, then a
+// Trailer whose checksum covers every preceding file byte.
+message SnapshotHeader {
+  // Snapshot file format, bumped on incompatible framing changes.
+  uint32 format_version = 1;
+
+  SnapshotMeta meta = 2;
+}
+
+message SnapshotKeyspace {
+  string name = 1;
+}
+
+message SnapshotKv {
+  bytes key = 1;
+  bytes value = 2;
+}
+
+message SnapshotTrailer {
+  // SHA-256 over all file bytes before this frame's length prefix.
+  bytes sha256 = 1;
+}
+
+message SnapshotFrame {
+  oneof frame {
+    SnapshotHeader header = 1;
+    SnapshotKeyspace keyspace = 2;
+    SnapshotKv kv = 3;
+    SnapshotTrailer trailer = 4;
+  }
+}

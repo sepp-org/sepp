@@ -175,6 +175,15 @@ pub(crate) fn closing_queue(key: &[u8]) -> Option<&str> {
 
 pub(crate) const AUDIT_SEQ_KEY: &[u8] = b"audit_seq";
 
+// Replicated raft bookkeeping rows in `meta`, written by the apply adapter in
+// the same tx as the entries they describe. `meta` rides in snapshots, so
+// these self-describe an installed state machine; node-local raft identity
+// lives in the `raft` keyspace instead.
+pub(crate) const LAST_APPLIED_KEY: &[u8] = b"last_applied"; // protobuf(LogId)
+pub(crate) const MEMBERSHIP_KEY: &[u8] = b"membership"; // protobuf(StoredMembership)
+pub(crate) const STAMP_HIGH_WATER_KEY: &[u8] = b"stamp_high_water"; // i64 BE
+pub(crate) const APPLY_DIGEST_KEY: &[u8] = b"apply_digest"; // 32-byte SHA-256
+
 // Value in the `audit` keyspace: `ts_ms | protobuf(AuditRecord)`. The key is
 // the entry's seq (u64 BE), allocated from the meta `audit_seq` row so entries
 // sort in insertion order regardless of clock steps.

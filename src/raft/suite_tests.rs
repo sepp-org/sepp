@@ -1,126 +1,50 @@
-use std::io::Cursor;
-use std::sync::{Arc, Mutex};
+// openraft's storage compliance suite over the fjall log store and the real
+// sepp state machine: log/vote round-trips, apply contracts, snapshot build
+// and transfer at the SM level. Op-carrying entries and the crash paths are
+// covered by the replay-harness extension and the snapshot tests; the suite
+// cannot construct `C::D` values itself.
 
+use std::sync::Arc;
+
+use arc_swap::ArcSwap;
 use fjall::{PersistMode, SingleWriterTxDatabase as TxDatabase};
-use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine, Snapshot};
+use openraft::StorageIOError;
 use openraft::testing::{StoreBuilder, Suite};
-use openraft::{EntryPayload, OptionalSend, SnapshotMeta, StorageIOError};
-use prost::Message;
 use uuid::Uuid;
 
 use super::*;
-use crate::pb::sepp::raft::v1 as pb;
-use crate::storage::OpOutcome;
-
-type Meta = SnapshotMeta<NodeId, ClusterNode>;
-
-#[derive(Debug, Clone, Default)]
-struct MemStateMachine {
-    inner: Arc<Mutex<MemInner>>,
-}
-
-#[derive(Debug, Default)]
-struct MemInner {
-    last_applied: Option<LogId>,
-    membership: StoredMembership,
-    snapshot: Option<(Meta, Vec<u8>)>,
-    snapshot_idx: u64,
-}
-
-impl RaftStateMachine<TypeConfig> for MemStateMachine {
-    type SnapshotBuilder = Self;
-
-    async fn applied_state(&mut self) -> Result<(Option<LogId>, StoredMembership), StorageError> {
-        let inner = self.inner.lock().unwrap();
-        Ok((inner.last_applied, inner.membership.clone()))
-    }
-
-    async fn apply<I>(&mut self, entries: I) -> Result<Vec<OpOutcome>, StorageError>
-    where
-        I: IntoIterator<Item = Entry> + OptionalSend,
-        I::IntoIter: OptionalSend,
-    {
-        let mut inner = self.inner.lock().unwrap();
-        let mut replies = Vec::new();
-        for entry in entries {
-            inner.last_applied = Some(entry.log_id);
-            if let EntryPayload::Membership(m) = &entry.payload {
-                inner.membership = StoredMembership::new(Some(entry.log_id), m.clone());
-            }
-            replies.push(OpOutcome::CloseQueue);
-        }
-        Ok(replies)
-    }
-
-    async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
-        self.clone()
-    }
-
-    async fn begin_receiving_snapshot(&mut self) -> Result<Box<Cursor<Vec<u8>>>, StorageError> {
-        Ok(Box::new(Cursor::new(Vec::new())))
-    }
-
-    async fn install_snapshot(
-        &mut self,
-        meta: &Meta,
-        snapshot: Box<Cursor<Vec<u8>>>,
-    ) -> Result<(), StorageError> {
-        let mut inner = self.inner.lock().unwrap();
-        inner.last_applied = meta.last_log_id;
-        inner.membership = meta.last_membership.clone();
-        inner.snapshot = Some((meta.clone(), snapshot.into_inner()));
-        Ok(())
-    }
-
-    async fn get_current_snapshot(&mut self) -> Result<Option<Snapshot<TypeConfig>>, StorageError> {
-        let inner = self.inner.lock().unwrap();
-        Ok(inner.snapshot.clone().map(|(meta, data)| Snapshot {
-            meta,
-            snapshot: Box::new(Cursor::new(data)),
-        }))
-    }
-}
-
-impl RaftSnapshotBuilder<TypeConfig> for MemStateMachine {
-    async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError> {
-        let mut inner = self.inner.lock().unwrap();
-        inner.snapshot_idx += 1;
-        let meta = Meta {
-            last_log_id: inner.last_applied,
-            last_membership: inner.membership.clone(),
-            snapshot_id: format!("ss-{}", inner.snapshot_idx),
-        };
-        let data = pb::SnapshotMeta {
-            last_log_id: meta.last_log_id.as_ref().map(log_id_to_proto),
-            last_membership: Some(pb::StoredMembership {
-                log_id: meta.last_membership.log_id().as_ref().map(log_id_to_proto),
-                membership: Some(membership_to_proto(meta.last_membership.membership())),
-            }),
-            snapshot_id: meta.snapshot_id.clone(),
-        }
-        .encode_to_vec();
-        inner.snapshot = Some((meta.clone(), data.clone()));
-        Ok(Snapshot {
-            meta,
-            snapshot: Box::new(Cursor::new(data)),
-        })
-    }
-}
+use crate::metrics::Metrics;
+use crate::storage::{
+    AdminFold, AdminSnapshot, ApplyCore, Keyspaces, QueueNotifiers, StampClamp, StorageParams,
+    Store, rebuild_indexes,
+};
 
 struct FjallStoreBuilder;
 
-impl StoreBuilder<TypeConfig, RaftLogStore, MemStateMachine> for FjallStoreBuilder {
-    async fn build(&self) -> Result<((), RaftLogStore, MemStateMachine), StorageError> {
+impl StoreBuilder<TypeConfig, RaftLogStore, StateMachine> for FjallStoreBuilder {
+    async fn build(&self) -> Result<((), RaftLogStore, StateMachine), StorageError> {
+        let err = |e: Box<dyn std::error::Error>| {
+            StorageError::from(StorageIOError::write_state_machine(
+                anyerror::AnyError::error(e),
+            ))
+        };
+        let fjall_err = |e: fjall::Error| {
+            StorageError::from(StorageIOError::write_state_machine(
+                anyerror::AnyError::new(&e),
+            ))
+        };
+
         let path = std::env::temp_dir().join(format!("sepp-raft-suite-{}", Uuid::new_v4()));
-        let db = TxDatabase::builder(path)
+        let db = TxDatabase::builder(&path)
             .temporary(true)
             .open()
-            .map_err(|e| StorageIOError::read_logs(anyerror::AnyError::new(&e)))?;
-        let store = RaftLogStore::open(db, PersistMode::Buffer)?;
+            .map_err(fjall_err)?;
+
+        let log_store = RaftLogStore::open(db.clone(), PersistMode::Buffer)?;
 
         // The suite's append helper blocks on the flush callback, so a pump
         // stands in for the IO loop that drives flush() in the real server.
-        let pump = store.clone();
+        let pump = log_store.clone();
         tokio::spawn(async move {
             loop {
                 pump.flush_wanted().await;
@@ -134,13 +58,49 @@ impl StoreBuilder<TypeConfig, RaftLogStore, MemStateMachine> for FjallStoreBuild
             }
         });
 
-        Ok(((), store, MemStateMachine::default()))
+        // The full apply stack: Store and Indexes owned by a committer
+        // thread running the raft loop, exactly as PR 8 will wire it.
+        let store = Store::new(
+            db.clone(),
+            Keyspaces::open(&db).map_err(fjall_err)?,
+            StorageParams {
+                persist_mode: PersistMode::Buffer,
+                sweep_limit: 100,
+                dead_letter_retention_ms: 0,
+                admin_enabled: false,
+            },
+            Metrics::new(false),
+        );
+        let indexes = rebuild_indexes(&store).map_err(fjall_err)?;
+        let core = ApplyCore::new(
+            store,
+            indexes,
+            QueueNotifiers::default(),
+            StampClamp::new(0),
+        )
+        .map_err(|e| err(e))?;
+
+        let (sm_tx, sm_rx) = flume::bounded(4);
+        let (_reads_tx, reads_rx) = flume::bounded(4);
+        let admin = AdminFold::new(
+            false,
+            Arc::new(ArcSwap::from_pointee(AdminSnapshot::default())),
+        );
+        std::thread::Builder::new()
+            .name("sepp-suite-committer".into())
+            .spawn(move || core.run_raft(sm_rx, reads_rx, admin))
+            .expect("spawn committer thread");
+
+        let sm =
+            StateMachine::new(db, sm_tx, path.to_str().expect("utf-8 temp path")).map_err(err)?;
+
+        Ok(((), log_store, sm))
     }
 }
 
 #[test]
 fn openraft_storage_suite() {
-    Suite::<TypeConfig, RaftLogStore, MemStateMachine, FjallStoreBuilder, ()>::test_all(
+    Suite::<TypeConfig, RaftLogStore, StateMachine, FjallStoreBuilder, ()>::test_all(
         FjallStoreBuilder,
     )
     .expect("openraft storage suite");

@@ -3,7 +3,6 @@ use std::{
     hash::{DefaultHasher, Hash, Hasher},
 };
 
-use fjall::{Readable, SingleWriterWriteTx as WriteTransaction};
 use prost::Message;
 use tonic::Status;
 use tracing::{debug, error, warn};
@@ -28,7 +27,7 @@ use super::*;
 pub(crate) fn apply_op(
     store: &Store,
     indexes: &mut Indexes,
-    tx: &mut WriteTransaction<'_>,
+    tx: &mut ApplyTx<'_>,
     cycle: &mut Cycle,
     op: Op,
 ) -> Result<OpOutcome, Status> {
@@ -168,7 +167,7 @@ pub(crate) enum DedupCheck {
 
 pub(crate) fn check_dedup(
     store: &Store,
-    tx: &mut WriteTransaction<'_>,
+    tx: &mut ApplyTx<'_>,
     cycle: &mut Cycle,
     req: &EnqueueRequest,
     now: i64,
@@ -211,7 +210,7 @@ pub(crate) fn check_dedup(
 pub(crate) fn apply_enqueue(
     store: &Store,
     indexes: &mut Indexes,
-    tx: &mut WriteTransaction<'_>,
+    tx: &mut ApplyTx<'_>,
     cycle: &mut Cycle,
     jobs: Vec<PreparedJob>,
     now: i64,
@@ -263,7 +262,7 @@ pub(crate) fn apply_enqueue(
 pub(crate) fn apply_enqueue_atomic(
     store: &Store,
     indexes: &mut Indexes,
-    tx: &mut WriteTransaction<'_>,
+    tx: &mut ApplyTx<'_>,
     cycle: &mut Cycle,
     jobs: Vec<PreparedJob>,
     now: i64,
@@ -334,7 +333,7 @@ pub(crate) fn apply_enqueue_atomic(
 pub(crate) fn insert_job(
     store: &Store,
     indexes: &mut Indexes,
-    tx: &mut WriteTransaction<'_>,
+    tx: &mut ApplyTx<'_>,
     cycle: &mut Cycle,
     job: PreparedJob,
     now: i64,
@@ -452,7 +451,7 @@ pub(crate) fn insert_job(
 pub(crate) fn apply_reserve(
     store: &Store,
     indexes: &mut Indexes,
-    tx: &mut WriteTransaction<'_>,
+    tx: &mut ApplyTx<'_>,
     cycle: &mut Cycle,
     queues: &[String],
     lease_ms: u64,
@@ -578,7 +577,7 @@ pub(crate) fn apply_reserve(
 pub(crate) fn apply_ack(
     store: &Store,
     indexes: &mut Indexes,
-    tx: &mut WriteTransaction<'_>,
+    tx: &mut ApplyTx<'_>,
     cycle: &mut Cycle,
     job_id: &str,
     attempt: u32,
@@ -615,7 +614,7 @@ pub(crate) fn apply_ack(
 
 pub(crate) fn read_dead_letter_job(
     store: &Store,
-    tx: &mut WriteTransaction<'_>,
+    tx: &mut ApplyTx<'_>,
     job_id: &[u8],
 ) -> Result<Option<Job>, Status> {
     let Some(stored) = tx.get(&store.jobs, job_id).map_err(stg_err)? else {
@@ -653,7 +652,7 @@ pub(crate) struct DeadLetterMeta {
 pub(crate) fn maybe_store_dead_letter(
     store: &Store,
     indexes: &mut Indexes,
-    tx: &mut WriteTransaction<'_>,
+    tx: &mut ApplyTx<'_>,
     job_id: &[u8],
     meta: DeadLetterMeta,
     dead_letter_enabled: bool,
@@ -691,7 +690,7 @@ pub(crate) fn maybe_store_dead_letter(
 pub(crate) fn apply_drain(
     store: &Store,
     indexes: &mut Indexes,
-    tx: &mut WriteTransaction<'_>,
+    tx: &mut ApplyTx<'_>,
     cycle: &mut Cycle,
     queue: Option<String>,
     max: usize,
@@ -819,7 +818,7 @@ pub(crate) fn peek_keys(
 pub(crate) fn apply_requeue_dead_letters(
     store: &Store,
     indexes: &mut Indexes,
-    tx: &mut WriteTransaction<'_>,
+    tx: &mut ApplyTx<'_>,
     cycle: &mut Cycle,
     queue: &str,
     keys: Vec<Vec<u8>>,
@@ -914,7 +913,7 @@ pub(crate) fn apply_requeue_dead_letters(
 pub(crate) fn apply_dead_letter_jobs(
     store: &Store,
     indexes: &mut Indexes,
-    tx: &mut WriteTransaction<'_>,
+    tx: &mut ApplyTx<'_>,
     cycle: &mut Cycle,
     queue: &str,
     state: PeekState,
@@ -1044,7 +1043,7 @@ pub(crate) fn apply_dead_letter_jobs(
 pub(crate) fn apply_delete_dead_letters(
     store: &Store,
     indexes: &mut Indexes,
-    tx: &mut WriteTransaction<'_>,
+    tx: &mut ApplyTx<'_>,
     cycle: &mut Cycle,
     queue: &str,
     keys: Vec<Vec<u8>>,
@@ -1078,7 +1077,7 @@ pub(crate) fn apply_delete_dead_letters(
 pub(crate) fn apply_close_queue(
     store: &Store,
     indexes: &mut Indexes,
-    tx: &mut WriteTransaction<'_>,
+    tx: &mut ApplyTx<'_>,
     cycle: &mut Cycle,
     queue: String,
     now: i64,
@@ -1097,7 +1096,7 @@ pub(crate) fn apply_close_queue(
 pub(crate) fn apply_open_queue(
     store: &Store,
     indexes: &mut Indexes,
-    tx: &mut WriteTransaction<'_>,
+    tx: &mut ApplyTx<'_>,
     cycle: &mut Cycle,
     queue: &str,
 ) {
@@ -1112,7 +1111,7 @@ pub(crate) fn apply_open_queue(
 pub(crate) fn apply_purge_queue_chunk(
     store: &Store,
     indexes: &mut Indexes,
-    tx: &mut WriteTransaction<'_>,
+    tx: &mut ApplyTx<'_>,
     cycle: &mut Cycle,
     queue: &str,
     max: usize,
@@ -1237,7 +1236,7 @@ pub(crate) fn policy_retry_delay_ms(policy: &RetryPolicy, attempt: u32, job_id: 
 pub(crate) fn apply_nack(
     store: &Store,
     indexes: &mut Indexes,
-    tx: &mut WriteTransaction<'_>,
+    tx: &mut ApplyTx<'_>,
     cycle: &mut Cycle,
     req: NackRequest,
     retry_delay_ms: u64,
@@ -1343,7 +1342,7 @@ pub(crate) fn apply_nack(
 pub(crate) fn apply_extend(
     store: &Store,
     indexes: &mut Indexes,
-    tx: &mut WriteTransaction<'_>,
+    tx: &mut ApplyTx<'_>,
     cycle: &mut Cycle,
     req: ExtendRequest,
     lease_ms: u64,
@@ -1399,7 +1398,7 @@ pub(crate) fn apply_extend(
 pub(crate) fn apply_sweep(
     store: &Store,
     indexes: &mut Indexes,
-    tx: &mut WriteTransaction<'_>,
+    tx: &mut ApplyTx<'_>,
     cycle: &mut Cycle,
     now: i64,
     budget: usize,
@@ -1651,7 +1650,7 @@ pub(crate) fn apply_sweep(
 
 pub(crate) fn apply_audit_append(
     store: &Store,
-    tx: &mut WriteTransaction<'_>,
+    tx: &mut ApplyTx<'_>,
     cycle: &mut Cycle,
     record: &AuditRecord,
     now_ms: i64,

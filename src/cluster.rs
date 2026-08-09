@@ -238,6 +238,18 @@ mod raft_proto_tests {
         }
     }
 
+    fn snapshot_meta() -> pb::SnapshotMeta {
+        pb::SnapshotMeta {
+            last_log_id: Some(log_id(3, 2, 9)),
+            last_membership: Some(stored_membership()),
+            snapshot_id: "3-2-9-1".into(),
+        }
+    }
+
+    fn snapshot_frame(frame: pb::snapshot_frame::Frame) -> Vec<u8> {
+        pb::SnapshotFrame { frame: Some(frame) }.encode_to_vec()
+    }
+
     fn sample_messages() -> Vec<(&'static str, Vec<u8>)> {
         let ack_op = op_pb::Op {
             op: Some(op_pb::op::Op::Ack(op_pb::AckOp {
@@ -342,6 +354,40 @@ mod raft_proto_tests {
                 }
                 .encode_to_vec(),
             ),
+            (
+                "snapshot_install_marker",
+                pb::SnapshotInstallMarker {
+                    meta: Some(snapshot_meta()),
+                    file_name: "3-2-9-1.snap".into(),
+                }
+                .encode_to_vec(),
+            ),
+            (
+                "snapshot_frame_header",
+                snapshot_frame(pb::snapshot_frame::Frame::Header(pb::SnapshotHeader {
+                    format_version: 1,
+                    meta: Some(snapshot_meta()),
+                })),
+            ),
+            (
+                "snapshot_frame_keyspace",
+                snapshot_frame(pb::snapshot_frame::Frame::Keyspace(pb::SnapshotKeyspace {
+                    name: "jobs".into(),
+                })),
+            ),
+            (
+                "snapshot_frame_kv",
+                snapshot_frame(pb::snapshot_frame::Frame::Kv(pb::SnapshotKv {
+                    key: b"k1".to_vec(),
+                    value: b"v1".to_vec(),
+                })),
+            ),
+            (
+                "snapshot_frame_trailer",
+                snapshot_frame(pb::snapshot_frame::Frame::Trailer(pb::SnapshotTrailer {
+                    sha256: vec![0xab; 32],
+                })),
+            ),
         ]
     }
 
@@ -373,6 +419,20 @@ mod raft_proto_tests {
             (
                 "snapshot_meta",
                 "0a0608031002180912ed010a0608031002180912e2010a050a030102030a050a03020304123308011215736570702d312e696e7465726e616c3a35303035321a18736570702d312e6578616d706c652e636f6d3a3530303531123308021215736570702d322e696e7465726e616c3a35303035321a18736570702d322e6578616d706c652e636f6d3a3530303531123308031215736570702d332e696e7465726e616c3a35303035321a18736570702d332e6578616d706c652e636f6d3a3530303531123308041215736570702d342e696e7465726e616c3a35303035321a18736570702d342e6578616d706c652e636f6d3a35303035311a07332d322d392d31",
+            ),
+            (
+                "snapshot_install_marker",
+                "0a81020a0608031002180912ed010a0608031002180912e2010a050a030102030a050a03020304123308011215736570702d312e696e7465726e616c3a35303035321a18736570702d312e6578616d706c652e636f6d3a3530303531123308021215736570702d322e696e7465726e616c3a35303035321a18736570702d322e6578616d706c652e636f6d3a3530303531123308031215736570702d332e696e7465726e616c3a35303035321a18736570702d332e6578616d706c652e636f6d3a3530303531123308041215736570702d342e696e7465726e616c3a35303035321a18736570702d342e6578616d706c652e636f6d3a35303035311a07332d322d392d31120c332d322d392d312e736e6170",
+            ),
+            (
+                "snapshot_frame_header",
+                "0a860208011281020a0608031002180912ed010a0608031002180912e2010a050a030102030a050a03020304123308011215736570702d312e696e7465726e616c3a35303035321a18736570702d312e6578616d706c652e636f6d3a3530303531123308021215736570702d322e696e7465726e616c3a35303035321a18736570702d322e6578616d706c652e636f6d3a3530303531123308031215736570702d332e696e7465726e616c3a35303035321a18736570702d332e6578616d706c652e636f6d3a3530303531123308041215736570702d342e696e7465726e616c3a35303035321a18736570702d342e6578616d706c652e636f6d3a35303035311a07332d322d392d31",
+            ),
+            ("snapshot_frame_keyspace", "12060a046a6f6273"),
+            ("snapshot_frame_kv", "1a080a026b3112027631"),
+            (
+                "snapshot_frame_trailer",
+                "22220a20abababababababababababababababababababababababababababababababab",
             ),
         ];
 
@@ -422,6 +482,10 @@ mod raft_proto_tests {
                 "vote_request" => assert_reencodes::<pb::VoteRequest>(&bytes),
                 "vote_response" => assert_reencodes::<pb::VoteResponse>(&bytes),
                 "snapshot_meta" => assert_reencodes::<pb::SnapshotMeta>(&bytes),
+                "snapshot_install_marker" => assert_reencodes::<pb::SnapshotInstallMarker>(&bytes),
+                name if name.starts_with("snapshot_frame") => {
+                    assert_reencodes::<pb::SnapshotFrame>(&bytes)
+                }
                 other => panic!("sample {other} has no round-trip arm"),
             }
         }

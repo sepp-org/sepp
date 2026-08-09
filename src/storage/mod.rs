@@ -1,10 +1,7 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use arc_swap::ArcSwap;
-use fjall::{
-    KeyspaceCreateOptions, KvSeparationOptions, PersistMode, Readable,
-    SingleWriterTxDatabase as TxDatabase,
-};
+use fjall::{PersistMode, Readable, SingleWriterTxDatabase as TxDatabase};
 use tokio::sync::oneshot;
 use tonic::Status;
 use tracing::{error, info, warn};
@@ -27,8 +24,8 @@ mod read;
 mod store;
 
 pub(crate) use apply::*;
-pub(crate) use committer::*;
 pub use committer::OpOutcome;
+pub(crate) use committer::*;
 pub(crate) use indexes::*;
 pub use read::*;
 pub use store::*;
@@ -185,10 +182,21 @@ impl Storage {
         let started = std::time::Instant::now();
         let db = builder.open()?;
 
+        if config.cluster.enabled {
+            crate::cluster::verify_or_stamp_identity(&db, &config.cluster, &config.server.db_path)?;
+            // An unfinished snapshot install fences boot: redo it from the
+            // retained file before anything reads the state machine keyspaces.
+            crate::raft::snapshot::roll_forward_pending_install(&db, &config.server.db_path)?;
+        } else {
+            // Disabling [cluster] must not bypass the fence: the keyspaces
+            // may be half-destroyed and would silently reopen empty.
+            crate::raft::snapshot::refuse_pending_install(&db, &config.server.db_path)?;
+        }
+
         const FORMAT_VERSION: u64 = 1;
         const FORMAT_VERSION_KEY: &[u8] = b"format_version";
-        let meta = db.keyspace("meta", KeyspaceCreateOptions::default)?;
-        match db.read_tx().get(&meta, FORMAT_VERSION_KEY)? {
+        let ks = Keyspaces::open(&db)?;
+        match db.read_tx().get(&ks.meta, FORMAT_VERSION_KEY)? {
             Some(v) if v.as_ref() == FORMAT_VERSION.to_be_bytes().as_slice() => {}
             Some(v) => {
                 let found = <[u8; 8]>::try_from(v.as_ref())
@@ -204,17 +212,13 @@ impl Storage {
             None => {
                 let mut tx = db.write_tx();
                 tx.insert(
-                    &meta,
+                    &ks.meta,
                     FORMAT_VERSION_KEY.to_vec(),
                     FORMAT_VERSION.to_be_bytes().to_vec(),
                 );
                 tx.commit()?;
                 db.persist(PersistMode::SyncAll)?;
             }
-        }
-
-        if config.cluster.enabled {
-            crate::cluster::verify_or_stamp_identity(&db, &config.cluster, &config.server.db_path)?;
         }
 
         let params = StorageParams {
@@ -238,30 +242,7 @@ impl Storage {
             );
         }
 
-        // Most reads we make in the hot path will have a match
-        let hits = || KeyspaceCreateOptions::default().expect_point_read_hits(true);
-        let store = Store {
-            jobs: db.keyspace("jobs", hits)?,
-            // Payloads ≥1 KiB land in blob files outside the LSM tree, so
-            // compaction only rewrites references rather than payload bytes.
-            payloads: db.keyspace("payloads", || {
-                hits().with_kv_separation(Some(KvSeparationOptions::default()))
-            })?,
-            inflight: db.keyspace("inflight", hits)?,
-            ready: db.keyspace("ready", hits)?,
-            dedup: db.keyspace("dedup", KeyspaceCreateOptions::default)?,
-            dedup_timers: db.keyspace("dedup_timers", hits)?,
-            scheduled: db.keyspace("scheduled", hits)?,
-            leases: db.keyspace("leases", hits)?,
-            dead_letter: db.keyspace("dead_letter", || {
-                hits().with_kv_separation(Some(KvSeparationOptions::default()))
-            })?,
-            meta,
-            audit: db.keyspace("audit", KeyspaceCreateOptions::default)?,
-            db,
-            params,
-            metrics,
-        };
+        let store = Store::new(db, ks, params, metrics);
         let read = ReadHandle {
             db: store.db.clone(),
             jobs: store.jobs.clone(),
@@ -294,7 +275,8 @@ impl Storage {
         // Floor 0 until raft: leadership acquisition will seed it from the
         // replicated stamp high-water.
         let stamp = StampClamp::new(0);
-        let core = ApplyCore::new(store, indexes, notifiers.clone(), stamp.clone());
+        let core = ApplyCore::new(store, indexes, notifiers.clone(), stamp.clone())
+            .map_err(|e| -> Box<dyn std::error::Error> { e })?;
         let admin = AdminFold::new(config.admin.enabled, Arc::clone(&admin_stats));
         std::thread::Builder::new()
             .name("sepp-committer".to_string())

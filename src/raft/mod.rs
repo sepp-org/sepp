@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Cursor;
 
 use tonic::Status;
 
@@ -8,10 +7,19 @@ use crate::pb::sepp::raft::v1 as pb;
 use crate::storage::OpOutcome;
 
 mod log;
+mod sm;
+pub mod snapshot;
 #[cfg(test)]
 mod suite_tests;
+mod trigger;
 
 pub use log::RaftLogStore;
+pub use sm::StateMachine;
+pub use snapshot::SnapshotFile;
+pub use trigger::{
+    LogProgress, SNAPSHOT_ENTRY_THRESHOLD, SNAPSHOT_TIME_FLOOR, SnapshotCadence,
+    run_snapshot_trigger,
+};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ClusterNode {
@@ -24,6 +32,7 @@ openraft::declare_raft_types!(
         D = Op,
         R = OpOutcome,
         Node = ClusterNode,
+        SnapshotData = SnapshotFile,
 );
 
 pub type NodeId = u64;
@@ -32,6 +41,7 @@ pub type LogId = openraft::LogId<NodeId>;
 pub type Vote = openraft::Vote<NodeId>;
 pub type Membership = openraft::Membership<NodeId, ClusterNode>;
 pub type StoredMembership = openraft::StoredMembership<NodeId, ClusterNode>;
+pub type SnapshotMeta = openraft::SnapshotMeta<NodeId, ClusterNode>;
 pub type StorageError = openraft::StorageError<NodeId>;
 
 use openraft::{EntryPayload, LeaderId};
@@ -89,6 +99,36 @@ pub fn membership_to_proto(m: &Membership) -> pb::Membership {
                 client_addr: node.client_addr.clone(),
             })
             .collect(),
+    }
+}
+
+pub fn stored_membership_to_proto(m: &StoredMembership) -> pb::StoredMembership {
+    pb::StoredMembership {
+        log_id: m.log_id().as_ref().map(log_id_to_proto),
+        membership: Some(membership_to_proto(m.membership())),
+    }
+}
+
+pub fn stored_membership_from_proto(msg: pb::StoredMembership) -> StoredMembership {
+    StoredMembership::new(
+        msg.log_id.as_ref().map(log_id_from_proto),
+        membership_from_proto(msg.membership.unwrap_or_default()),
+    )
+}
+
+pub fn snapshot_meta_to_proto(meta: &SnapshotMeta) -> pb::SnapshotMeta {
+    pb::SnapshotMeta {
+        last_log_id: meta.last_log_id.as_ref().map(log_id_to_proto),
+        last_membership: Some(stored_membership_to_proto(&meta.last_membership)),
+        snapshot_id: meta.snapshot_id.clone(),
+    }
+}
+
+pub fn snapshot_meta_from_proto(msg: pb::SnapshotMeta) -> SnapshotMeta {
+    SnapshotMeta {
+        last_log_id: msg.last_log_id.as_ref().map(log_id_from_proto),
+        last_membership: stored_membership_from_proto(msg.last_membership.unwrap_or_default()),
+        snapshot_id: msg.snapshot_id,
     }
 }
 

@@ -1,3 +1,5 @@
+use fjall::KeyspaceCreateOptions;
+
 use super::*;
 use crate::config::RetryBackoff;
 use crate::keys::{
@@ -468,6 +470,41 @@ fn open_refuses_unknown_format_version() {
     let _ = std::fs::remove_dir_all(&path);
 }
 
+// Disabling [cluster] must not bypass the install fence: the state machine
+// keyspaces may be half-destroyed under a durable marker, and recreating
+// them empty would present a wrecked store as a healthy new one.
+#[test]
+fn open_refuses_pending_install_when_cluster_disabled() {
+    let path = std::env::temp_dir().join(format!("sepp-storage-test-{}", Uuid::new_v4()));
+    {
+        let db = TxDatabase::builder(&path).open().expect("open db");
+        let raft = db
+            .keyspace("raft", KeyspaceCreateOptions::default)
+            .expect("create raft keyspace");
+        crate::raft::snapshot::write_install_marker(
+            &db,
+            &raft,
+            &crate::raft::SnapshotMeta::default(),
+            "unfinished.snap",
+        )
+        .expect("write marker");
+    }
+
+    let mut config = Config::default();
+    config.server.db_path = path.to_str().expect("utf-8 temp path").to_string();
+    let registry = crate::queues::QueueRegistry::from_config(&config).into_shared();
+    let err = Storage::open(&config, registry, Metrics::new(false))
+        .err()
+        .expect("open must refuse the unfinished install");
+    assert!(
+        err.to_string()
+            .contains("unfinished cluster snapshot install"),
+        "unexpected error: {err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&path);
+}
+
 // Stamps a cluster identity the way a first cluster-enabled boot would.
 fn stamp_identity(path: &std::path::Path, node_id: u64) {
     let db = TxDatabase::builder(path).open().expect("open db");
@@ -554,29 +591,19 @@ fn open_test_store() -> Store {
         .temporary(true)
         .open()
         .expect("open temporary db");
-    let opts = KeyspaceCreateOptions::default;
+    let ks = Keyspaces::open(&db).expect("open keyspaces");
 
-    Store {
-        jobs: db.keyspace("jobs", opts).unwrap(),
-        payloads: db.keyspace("payloads", opts).unwrap(),
-        inflight: db.keyspace("inflight", opts).unwrap(),
-        ready: db.keyspace("ready", opts).unwrap(),
-        dedup: db.keyspace("dedup", opts).unwrap(),
-        dedup_timers: db.keyspace("dedup_timers", opts).unwrap(),
-        scheduled: db.keyspace("scheduled", opts).unwrap(),
-        leases: db.keyspace("leases", opts).unwrap(),
-        dead_letter: db.keyspace("dead_letter", opts).unwrap(),
-        meta: db.keyspace("meta", opts).unwrap(),
-        audit: db.keyspace("audit", opts).unwrap(),
+    Store::new(
         db,
-        params: StorageParams {
+        ks,
+        StorageParams {
             persist_mode: PersistMode::Buffer,
             sweep_limit: 1000,
             dead_letter_retention_ms: 0,
             admin_enabled: true,
         },
-        metrics: Metrics::new(false),
-    }
+        Metrics::new(false),
+    )
 }
 
 #[test]
@@ -585,7 +612,7 @@ fn purge_refuses_while_jobs_are_inflight() {
     let mut indexes = Indexes::default();
     indexes.leases.insert(timer_key(500, "j1"), "q");
 
-    let mut tx = store.db.write_tx();
+    let mut tx = ApplyTx::new(store.db.write_tx());
     let mut cycle = Cycle::new(false);
     let err = apply_purge_queue_chunk(&store, &mut indexes, &mut tx, &mut cycle, "q", 100)
         .expect_err("in-flight jobs must block a purge");
@@ -618,7 +645,7 @@ fn enqueue_rejects_jobs_for_a_closing_queue() {
     let mut indexes = Indexes::default();
     indexes.closing.insert("q".into(), now_ms() + 60_000);
 
-    let mut tx = store.db.write_tx();
+    let mut tx = ApplyTx::new(store.db.write_tx());
     let mut cycle = Cycle::new(false);
     let results = apply_enqueue(
         &store,
@@ -658,7 +685,7 @@ fn atomic_enqueue_rejects_the_whole_batch_for_a_closing_queue() {
     let mut indexes = Indexes::default();
     indexes.closing.insert("q".into(), now_ms() + 60_000);
 
-    let mut tx = store.db.write_tx();
+    let mut tx = ApplyTx::new(store.db.write_tx());
     let mut cycle = Cycle::new(false);
     let outcome = apply_enqueue_atomic(
         &store,
@@ -692,7 +719,7 @@ fn atomic_enqueue_rejects_the_whole_batch_for_a_closing_queue() {
 fn sweep_drops_only_expired_close_tombstones() {
     let store = open_test_store();
     let mut indexes = Indexes::default();
-    let mut tx = store.db.write_tx();
+    let mut tx = ApplyTx::new(store.db.write_tx());
     let mut cycle = Cycle::new(false);
     apply_close_queue(
         &store,
@@ -740,7 +767,7 @@ fn sweep_reads_the_retention_cutoff_from_the_op() {
     let key = dead_letter_key(100, "q", b"j1");
     indexes.dead_letter.insert(key.clone(), "q");
 
-    let mut tx = store.db.write_tx();
+    let mut tx = ApplyTx::new(store.db.write_tx());
     tx.insert(&store.dead_letter, key.clone(), Vec::new());
     let mut cycle = Cycle::new(false);
     let processed = apply_sweep(
@@ -767,7 +794,7 @@ fn sweep_reads_the_retention_cutoff_from_the_op() {
 fn close_tombstone_survives_a_rebuild() {
     let store = open_test_store();
     let mut indexes = Indexes::default();
-    let mut tx = store.db.write_tx();
+    let mut tx = ApplyTx::new(store.db.write_tx());
     let mut cycle = Cycle::new(false);
     apply_close_queue(
         &store,
@@ -785,7 +812,7 @@ fn close_tombstone_survives_a_rebuild() {
     let rebuilt = rebuild_indexes(&store).expect("rebuild");
     assert_eq!(rebuilt.closing.get("q"), indexes.closing.get("q"));
 
-    let mut tx = store.db.write_tx();
+    let mut tx = ApplyTx::new(store.db.write_tx());
     let mut cycle = Cycle::new(false);
     apply_open_queue(&store, &mut indexes, &mut tx, &mut cycle, "q");
     assert!(cycle.dirty);
@@ -794,7 +821,7 @@ fn close_tombstone_survives_a_rebuild() {
     let rebuilt = rebuild_indexes(&store).expect("rebuild");
     assert!(rebuilt.closing.is_empty(), "open deletes the tombstone row");
 
-    let mut tx = store.db.write_tx();
+    let mut tx = ApplyTx::new(store.db.write_tx());
     let mut cycle = Cycle::new(false);
     apply_open_queue(&store, &mut indexes, &mut tx, &mut cycle, "q");
     assert!(
@@ -829,7 +856,7 @@ fn audit_read_handle(store: &Store) -> ReadHandle {
 fn audit_appends_read_back_newest_first_with_cursor() {
     let store = open_test_store();
 
-    let mut tx = store.db.write_tx();
+    let mut tx = ApplyTx::new(store.db.write_tx());
     let mut cycle = Cycle::new(false);
     apply_audit_append(
         &store,
@@ -851,7 +878,7 @@ fn audit_appends_read_back_newest_first_with_cursor() {
     tx.commit().expect("commit");
 
     // A later cycle continues from the persisted counter.
-    let mut tx = store.db.write_tx();
+    let mut tx = ApplyTx::new(store.db.write_tx());
     let mut cycle = Cycle::new(false);
     apply_audit_append(
         &store,
@@ -905,7 +932,7 @@ fn audit_appends_read_back_newest_first_with_cursor() {
 fn audit_listing_filters_by_actor_and_action_prefix() {
     let store = open_test_store();
 
-    let mut tx = store.db.write_tx();
+    let mut tx = ApplyTx::new(store.db.write_tx());
     let mut cycle = Cycle::new(false);
     for (actor, action) in [
         ("root", "job.enqueue"),
@@ -948,7 +975,7 @@ fn audit_listing_filters_by_actor_and_action_prefix() {
 fn audit_listing_bounds_scan_work_under_a_selective_filter() {
     let store = open_test_store();
 
-    let mut tx = store.db.write_tx();
+    let mut tx = ApplyTx::new(store.db.write_tx());
     let mut cycle = Cycle::new(false);
     for _ in 0..AUDIT_SCAN_CAP + 2 {
         apply_audit_append(
@@ -1004,7 +1031,7 @@ fn dedup_window_is_pinned_at_boot() {
     let live = QueueRegistry::from_config(&live_cfg);
 
     let mut indexes = Indexes::default();
-    let mut tx = store.db.write_tx();
+    let mut tx = ApplyTx::new(store.db.write_tx());
     let mut cycle = Cycle::new(false);
     let req = EnqueueRequest {
         idempotency_key: Some("k".to_string()),
@@ -1053,7 +1080,8 @@ fn apply_core_publishes_next_deadline_on_change() {
         indexes,
         QueueNotifiers::default(),
         StampClamp::new(0),
-    );
+    )
+    .expect("apply core");
     let mut rx = core.subscribe_deadline();
     assert_eq!(*rx.borrow_and_update(), None, "empty store has no deadline");
 
@@ -1091,8 +1119,12 @@ fn committer_applies_queued_ops_after_disconnect() {
         indexes,
         QueueNotifiers::default(),
         StampClamp::new(0),
+    )
+    .expect("apply core");
+    let admin = AdminFold::new(
+        false,
+        Arc::new(ArcSwap::from_pointee(AdminSnapshot::default())),
     );
-    let admin = AdminFold::new(false, Arc::new(ArcSwap::from_pointee(AdminSnapshot::default())));
     let (ops_tx, ops_rx) = flume::bounded(16);
     let (reads_tx, reads_rx) = flume::bounded::<ReadCommand>(16);
 
@@ -1132,7 +1164,8 @@ fn saturated_channel_shortens_leases_by_at_most_the_wait() {
     let store = open_test_store();
     let indexes = rebuild_indexes(&store).expect("rebuild");
     let clamp = StampClamp::new(0);
-    let mut core = ApplyCore::new(store, indexes, QueueNotifiers::default(), clamp.clone());
+    let mut core = ApplyCore::new(store, indexes, QueueNotifiers::default(), clamp.clone())
+        .expect("apply core");
 
     let (resp, _enqueue_rx) = oneshot::channel();
     let mut op = Op::Enqueue {

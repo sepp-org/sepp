@@ -105,6 +105,28 @@ impl Op {
             | Op::PurgeQueueChunk { .. } => {}
         }
     }
+
+    // The stamp `stamp` would set, None for the five stampless variants. The
+    // raft apply path folds this into the replicated stamp high-water mark.
+    pub fn stamp_ms(&self) -> Option<i64> {
+        match self {
+            Op::Enqueue { now_ms, .. }
+            | Op::EnqueueAtomic { now_ms, .. }
+            | Op::Reserve { now_ms, .. }
+            | Op::Nack { now_ms, .. }
+            | Op::Extend { now_ms, .. }
+            | Op::CloseQueue { now_ms, .. }
+            | Op::RequeueDeadLetters { now_ms, .. }
+            | Op::DeadLetterJobs { now_ms, .. }
+            | Op::Sweep { now_ms, .. }
+            | Op::AuditAppend { now_ms, .. } => Some(*now_ms),
+            Op::Ack { .. }
+            | Op::DrainDeadLetters { .. }
+            | Op::OpenQueue { .. }
+            | Op::DeleteDeadLetters { .. }
+            | Op::PurgeQueueChunk { .. } => None,
+        }
+    }
 }
 
 // An EnqueueRequest plus its pre-assigned job ID and resolved limits,

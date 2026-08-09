@@ -1,18 +1,23 @@
 use std::{
     collections::{HashMap, HashSet},
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use arc_swap::ArcSwap;
-use fjall::SingleWriterWriteTx as WriteTransaction;
+use fjall::Readable;
+use openraft::EntryPayload;
+use prost::Message;
 use tokio::sync::{oneshot, watch};
 use tonic::Status;
 use tracing::{debug, error, info, warn};
 
+use crate::keys::{APPLY_DIGEST_KEY, LAST_APPLIED_KEY, MEMBERSHIP_KEY, STAMP_HIGH_WATER_KEY};
 use crate::metrics::CycleMetrics;
 use crate::op::Op;
 use crate::pb::sepp::v1::{DeadLetterRecord, Job};
+use crate::raft::{Entry, StoredMembership, entry_to_proto, log_id_to_proto};
 
 use super::*;
 
@@ -54,6 +59,11 @@ pub enum OpOutcome {
     PurgeQueueChunk(PurgeOutcome),
     Sweep(usize),
     AuditAppend { seq: u64, ts_ms: i64 },
+    // Raft-path only: the filler for blank and membership entries (openraft
+    // zips one response per entry) and a business rejection computed at
+    // apply, which under raft is a replicated result, not an error.
+    NonOp,
+    Rejected(Status),
 }
 
 // An applied op's outcome parked until the cycle's commit decides whether the
@@ -285,6 +295,24 @@ impl AdminFold {
     }
 }
 
+// A command from the raft state machine adapter to the committer thread.
+// Dead-code allowance: reachable only through the raft path, which nothing
+// in the server constructs until PR 8 wires the engine into boot.
+#[allow(dead_code)]
+pub(crate) enum SmCommand {
+    Apply {
+        entries: Vec<Entry>,
+        resp: oneshot::Sender<Vec<OpOutcome>>,
+    },
+    // The install steps that need exclusive Store ownership: delete +
+    // recreate + ingest, handle swap, index rebuild. The durable marker
+    // protocol around them belongs to the adapter.
+    Install {
+        path: PathBuf,
+        resp: oneshot::Sender<Result<(), Status>>,
+    },
+}
+
 // The apply-a-batch unit: exclusive owner of the Store, the in-memory
 // Indexes and the post-commit notifier wakes.
 pub(crate) struct ApplyCore {
@@ -293,6 +321,15 @@ pub(crate) struct ApplyCore {
     notifiers: QueueNotifiers,
     deadline: watch::Sender<Option<i64>>,
     stamp: StampClamp,
+    // Raft bookkeeping mirrored from `meta`: the divergence digest chain
+    // head, the replicated stamp high-water mark and the applied log index.
+    // Idle on the direct path (dead-code allowance as on SmCommand).
+    #[allow(dead_code)]
+    digest: [u8; 32],
+    #[allow(dead_code)]
+    stamp_high_water: i64,
+    #[allow(dead_code)]
+    last_applied_index: Option<u64>,
 }
 
 impl ApplyCore {
@@ -301,19 +338,23 @@ impl ApplyCore {
         indexes: Indexes,
         notifiers: QueueNotifiers,
         stamp: StampClamp,
-    ) -> Self {
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let (deadline, _) = watch::channel(next_deadline(
             &indexes,
             store.params.dead_letter_retention_ms,
         ));
+        let raft_state = load_raft_apply_state(&store)?;
 
-        Self {
+        Ok(Self {
             store,
             indexes,
             notifiers,
             deadline,
             stamp,
-        }
+            digest: raft_state.digest,
+            stamp_high_water: raft_state.stamp_high_water,
+            last_applied_index: raft_state.last_applied_index,
+        })
     }
 
     pub(crate) fn subscribe_deadline(&self) -> watch::Receiver<Option<i64>> {
@@ -420,7 +461,244 @@ impl ApplyCore {
         self.publish_deadline();
         metrics
     }
+}
 
+// The raft apply path (dead-code allowance as on SmCommand).
+#[allow(dead_code)]
+impl ApplyCore {
+    // The cluster-mode committer loop: committed entries and snapshot
+    // installs arrive from the raft engine through the state machine adapter.
+    // Sweeps are proposed by the leader's trigger task and arrive as ordinary
+    // entries, so no local sweep evaluation runs here; the timeout arm keeps
+    // the admin publish alive.
+    pub(crate) fn run_raft(
+        mut self,
+        sm_rx: flume::Receiver<SmCommand>,
+        reads_rx: flume::Receiver<ReadCommand>,
+        mut admin: AdminFold,
+    ) {
+        enum Input {
+            Sm(SmCommand),
+            Read(ReadCommand),
+            Timeout,
+            SmDisconnected,
+            ReadsDisconnected,
+        }
+
+        let mut reads_open = true;
+        loop {
+            let mut selector = flume::Selector::new().recv(&sm_rx, |r| {
+                r.map(Input::Sm).unwrap_or(Input::SmDisconnected)
+            });
+            if reads_open {
+                selector = selector.recv(&reads_rx, |r| {
+                    r.map(Input::Read).unwrap_or(Input::ReadsDisconnected)
+                });
+            }
+
+            match selector
+                .wait_timeout(ADMIN_PUBLISH_INTERVAL)
+                .unwrap_or(Input::Timeout)
+            {
+                Input::Sm(cmd) => self.handle_sm(cmd, &mut admin),
+                Input::Read(read) => self.answer(read),
+                Input::Timeout => {}
+                // The engine dropped the adapter: shutdown. The read channel
+                // closing first (Storage dropped) only removes its arm.
+                Input::SmDisconnected => break,
+                Input::ReadsDisconnected => reads_open = false,
+            }
+
+            while let Ok(read) = reads_rx.try_recv() {
+                self.answer(read);
+            }
+
+            if self.store.metrics.is_enabled() {
+                self.store.metrics.set_queue_depths(self.indexes.snapshot());
+            }
+
+            admin.maybe_publish(&self.indexes);
+        }
+
+        info!("committer thread stopped; the raft state machine input closed");
+    }
+
+    fn handle_sm(&mut self, cmd: SmCommand, admin: &mut AdminFold) {
+        match cmd {
+            SmCommand::Apply { entries, resp } => {
+                let swept = entries
+                    .iter()
+                    .any(|e| matches!(&e.payload, EntryPayload::Normal(Op::Sweep { .. })));
+                let (outcomes, metrics) = self.apply_entries(entries);
+                if let Some(m) = metrics {
+                    admin.fold(&m);
+                }
+                if swept {
+                    admin.evict(&self.indexes);
+                }
+                let _ = resp.send(outcomes);
+            }
+            SmCommand::Install { path, resp } => {
+                let _ = resp.send(self.install_snapshot(&path));
+            }
+        }
+    }
+
+    // The raft apply path: one committed batch = one write tx, exactly one
+    // outcome per entry. Business rejections become outcomes; Internal errors
+    // are fatal because a quorum-committed entry cannot be un-happened, so a
+    // state machine that cannot apply it must not keep running.
+    pub(crate) fn apply_entries(
+        &mut self,
+        entries: Vec<Entry>,
+    ) -> (Vec<OpOutcome>, Option<CycleMetrics>) {
+        if entries.is_empty() {
+            return (Vec::new(), None);
+        }
+
+        let result = self.entries_cycle(entries);
+        self.publish_deadline();
+        result
+    }
+
+    fn entries_cycle(&mut self, entries: Vec<Entry>) -> (Vec<OpOutcome>, Option<CycleMetrics>) {
+        let Self {
+            store,
+            indexes,
+            notifiers,
+            digest,
+            stamp_high_water,
+            last_applied_index,
+            ..
+        } = self;
+        let mut tx = ApplyTx::new(store.db.write_tx());
+        let mut cycle = Cycle::new(store.metrics.is_enabled() || store.params.admin_enabled);
+        let mut outcomes = Vec::with_capacity(entries.len());
+        let high_water_before = *stamp_high_water;
+        let last = entries.last().expect("non-empty batch").log_id;
+
+        for entry in &entries {
+            // Re-apply is not idempotent, so an already-applied index must
+            // fail-stop, never silently diverge. Forward gaps are the
+            // engine's contract to prevent (and openraft's own test suite
+            // legitimately skips indexes), so only the backward direction is
+            // enforced here.
+            if last_applied_index.is_some_and(|applied| entry.log_id.index <= applied) {
+                error!(log_id = %entry.log_id, ?last_applied_index, "raft apply went backward");
+                panic!(
+                    "entry {} is at or below last_applied {:?}; re-apply is not idempotent",
+                    entry.log_id, last_applied_index,
+                );
+            }
+            *last_applied_index = Some(entry.log_id.index);
+
+            let entry_bytes = entry_to_proto(entry).encode_to_vec();
+            tx.begin_entry(digest, &entry_bytes);
+            let outcome = match &entry.payload {
+                EntryPayload::Blank | EntryPayload::Membership(_) => OpOutcome::NonOp,
+                EntryPayload::Normal(op) => {
+                    if let Some(stamp) = op.stamp_ms() {
+                        *stamp_high_water = (*stamp_high_water).max(stamp);
+                    }
+                    match apply_op(store, indexes, &mut tx, &mut cycle, op.clone()) {
+                        Ok(outcome) => outcome,
+                        // A rejected op never touched the tx, so its recorded
+                        // write-set is empty; the digest still advances over
+                        // the entry bytes.
+                        Err(e) if e.code() != tonic::Code::Internal => OpOutcome::Rejected(e),
+                        Err(e) => {
+                            error!(error = %e, log_id = %entry.log_id, "raft apply failed");
+                            panic!("raft apply failed on a committed entry: {e}");
+                        }
+                    }
+                }
+            };
+            *digest = tx.finish_entry();
+
+            // Adapter bookkeeping stays outside the recorded scope so the
+            // digest is batch-split-invariant; see ApplyTx.
+            if let EntryPayload::Membership(m) = &entry.payload {
+                let stored = StoredMembership::new(Some(entry.log_id), m.clone());
+                tx.insert(
+                    &store.meta,
+                    MEMBERSHIP_KEY.to_vec(),
+                    crate::raft::stored_membership_to_proto(&stored).encode_to_vec(),
+                );
+            }
+            outcomes.push(outcome);
+        }
+
+        tx.insert(
+            &store.meta,
+            LAST_APPLIED_KEY.to_vec(),
+            log_id_to_proto(&last).encode_to_vec(),
+        );
+        tx.insert(&store.meta, APPLY_DIGEST_KEY.to_vec(), digest.to_vec());
+        if *stamp_high_water != high_water_before {
+            tx.insert(
+                &store.meta,
+                STAMP_HIGH_WATER_KEY.to_vec(),
+                stamp_high_water.to_be_bytes().to_vec(),
+            );
+        }
+
+        // Unconditional commit: every entry advances last_applied, overriding
+        // the direct path's cycle.dirty gate. No persist here: an apply tx
+        // rides the next append-carrying IO cycle's persist and is re-derived
+        // from the durable log after a crash.
+        if let Err(e) = tx.commit() {
+            error!(error = %e, "raft apply commit failed");
+            panic!("raft apply commit failed: {e}");
+        }
+
+        if let Some(m) = &cycle.metrics {
+            store.metrics.flush_cycle(m);
+        }
+
+        // Post-commit, on every node: harmless on followers, essential on a
+        // deposed leader whose parked reserves must re-propose and redirect.
+        for queue in &cycle.new_ready {
+            notifiers.wake(queue);
+        }
+
+        (outcomes, cycle.metrics)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn store(&self) -> &Store {
+        &self.store
+    }
+
+    #[cfg(test)]
+    pub(crate) fn digest(&self) -> [u8; 32] {
+        self.digest
+    }
+
+    #[cfg(test)]
+    pub(crate) fn indexes(&self) -> &Indexes {
+        &self.indexes
+    }
+
+    fn install_snapshot(&mut self, path: &Path) -> Result<(), Status> {
+        let keyspaces = crate::raft::snapshot::ingest_snapshot_file(&self.store.db, path)
+            .map_err(|e| Status::internal(format!("snapshot install failed: {e}")))?;
+        self.store.swap_keyspaces(keyspaces);
+        self.indexes = rebuild_indexes(&self.store).map_err(stg_err)?;
+
+        // The installed meta carries the snapshot's digest, high-water and
+        // applied index.
+        let raft_state = load_raft_apply_state(&self.store)
+            .map_err(|e| Status::internal(format!("installed meta is unreadable: {e}")))?;
+        self.digest = raft_state.digest;
+        self.stamp_high_water = raft_state.stamp_high_water;
+        self.last_applied_index = raft_state.last_applied_index;
+        self.publish_deadline();
+
+        Ok(())
+    }
+}
+
+impl ApplyCore {
     fn sweep(&mut self) -> Option<CycleMetrics> {
         let metrics = self.sweep_cycle();
         self.publish_deadline();
@@ -434,7 +712,7 @@ impl ApplyCore {
             notifiers,
             ..
         } = self;
-        let mut tx = store.db.write_tx();
+        let mut tx = ApplyTx::new(store.db.write_tx());
         let mut cycle = Cycle::new(store.metrics.is_enabled() || store.params.admin_enabled);
         let mut responders: Vec<PendingReply> = Vec::with_capacity(batch.len());
         let mut batch = batch.into_iter();
@@ -508,7 +786,7 @@ impl ApplyCore {
             ..
         } = self;
         let started = Instant::now();
-        let mut tx = store.db.write_tx();
+        let mut tx = ApplyTx::new(store.db.write_tx());
         let mut cycle = Cycle::new(store.metrics.is_enabled() || store.params.admin_enabled);
 
         let now = stamp.now_ms();
@@ -587,6 +865,44 @@ impl ApplyCore {
     }
 }
 
+struct RaftApplyState {
+    digest: [u8; 32],
+    stamp_high_water: i64,
+    last_applied_index: Option<u64>,
+}
+
+// Absent rows are a legal fresh state; malformed rows are corruption and
+// refuse loudly at boot rather than seeding a digest that fail-stops the
+// node much later.
+fn load_raft_apply_state(
+    store: &Store,
+) -> Result<RaftApplyState, Box<dyn std::error::Error + Send + Sync>> {
+    let snap = store.db.read_tx();
+    let digest = match snap.get(&store.meta, APPLY_DIGEST_KEY)? {
+        None => [0u8; 32],
+        Some(v) => <[u8; 32]>::try_from(v.as_ref())
+            .map_err(|_| format!("corrupt meta apply_digest row of {} bytes", v.len()))?,
+    };
+    let stamp_high_water = match snap.get(&store.meta, STAMP_HIGH_WATER_KEY)? {
+        None => 0,
+        Some(v) => <[u8; 8]>::try_from(v.as_ref())
+            .map(i64::from_be_bytes)
+            .map_err(|_| format!("corrupt meta stamp_high_water row of {} bytes", v.len()))?,
+    };
+    let last_applied_index = snap
+        .get(&store.meta, LAST_APPLIED_KEY)?
+        .map(|v| crate::pb::sepp::raft::v1::LogId::decode(v.as_ref()))
+        .transpose()
+        .map_err(|e| format!("corrupt meta last_applied row: {e}"))?
+        .map(|msg| msg.index);
+
+    Ok(RaftApplyState {
+        digest,
+        stamp_high_water,
+        last_applied_index,
+    })
+}
+
 // Storage failures are always Status::internal; business rejections (NotFound,
 // FailedPrecondition) never are and never mutate the transaction before
 // returning.
@@ -599,7 +915,7 @@ pub(crate) fn reject<T>(resp: oneshot::Sender<Result<T, Status>>, e: Status) -> 
     }
 }
 
-pub(crate) fn commit_and_persist(store: &Store, tx: WriteTransaction<'_>) -> Result<(), Status> {
+pub(crate) fn commit_and_persist(store: &Store, tx: ApplyTx<'_>) -> Result<(), Status> {
     let started = Instant::now();
     let outcome = match tx.commit() {
         Ok(()) => match store.db.persist(store.params.persist_mode) {

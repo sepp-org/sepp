@@ -1,16 +1,20 @@
 use std::collections::BTreeMap;
 
+use openraft::{EntryPayload, LeaderId};
 use prost::Message;
 
 use super::*;
 use crate::config::QueueConfig;
-use crate::keys::{DeadLetterKey, ReadyKey, TimerKey};
+use crate::keys::{
+    APPLY_DIGEST_KEY, DeadLetterKey, LAST_APPLIED_KEY, MEMBERSHIP_KEY, ReadyKey,
+    STAMP_HIGH_WATER_KEY, TimerKey,
+};
 use crate::op::{JobLimits, Op, PreparedJob};
 use crate::pb::millis_to_timestamp;
 use crate::pb::sepp::storage::v1 as op_proto;
 use crate::pb::sepp::v1::{NackRetry, Payload, nack_retry};
 use crate::pb::{duration_to_millis, millis_to_duration};
-use fjall::SingleWriterTxKeyspace as TxKeyspace;
+use crate::raft::{Entry, LogId, log_id_to_proto};
 use uuid::Uuid;
 
 const QUEUES: &[&str] = &["alpha", "beta", "gamma"];
@@ -66,31 +70,15 @@ impl Harness {
             .temporary(true)
             .open()
             .expect("open temporary db");
-        let opts = KeyspaceCreateOptions::default;
-
-        let store = Store {
-            jobs: db.keyspace("jobs", opts).unwrap(),
-            payloads: db.keyspace("payloads", opts).unwrap(),
-            inflight: db.keyspace("inflight", opts).unwrap(),
-            ready: db.keyspace("ready", opts).unwrap(),
-            dedup: db.keyspace("dedup", opts).unwrap(),
-            dedup_timers: db.keyspace("dedup_timers", opts).unwrap(),
-            scheduled: db.keyspace("scheduled", opts).unwrap(),
-            leases: db.keyspace("leases", opts).unwrap(),
-            dead_letter: db.keyspace("dead_letter", opts).unwrap(),
-            meta: db.keyspace("meta", opts).unwrap(),
-            audit: db.keyspace("audit", opts).unwrap(),
-            db,
-            params,
-            metrics: Metrics::new(false),
-        };
+        let ks = Keyspaces::open(&db).expect("open keyspaces");
+        let store = Store::new(db, ks, params, Metrics::new(false));
         let indexes = rebuild_indexes(&store).expect("rebuild");
 
         Self { store, indexes }
     }
 
     fn apply(&mut self, op: &Op) -> Result<OpOutcome, Status> {
-        let mut tx = self.store.db.write_tx();
+        let mut tx = ApplyTx::new(self.store.db.write_tx());
         let mut cycle = Cycle::new(false);
         let result = apply_op(
             &self.store,
@@ -130,34 +118,6 @@ fn dbg_outcome(outcome: Result<OpOutcome, Status>) -> String {
     format!("{outcome:?}")
 }
 
-fn logical_contents(store: &Store) -> BTreeMap<&'static str, BTreeMap<Vec<u8>, Vec<u8>>> {
-    let keyspaces: [(&'static str, &TxKeyspace); 11] = [
-        ("jobs", &store.jobs),
-        ("payloads", &store.payloads),
-        ("inflight", &store.inflight),
-        ("ready", &store.ready),
-        ("dedup", &store.dedup),
-        ("dedup_timers", &store.dedup_timers),
-        ("scheduled", &store.scheduled),
-        ("leases", &store.leases),
-        ("dead_letter", &store.dead_letter),
-        ("meta", &store.meta),
-        ("audit", &store.audit),
-    ];
-
-    let snap = store.db.read_tx();
-    let mut all = BTreeMap::new();
-    for (name, ks) in keyspaces {
-        let mut kv = BTreeMap::new();
-        for guard in snap.iter(ks) {
-            let (key, value) = guard.into_inner().expect("iterate keyspace");
-            kv.insert(key.to_vec(), value.to_vec());
-        }
-        all.insert(name, kv);
-    }
-    all
-}
-
 fn assert_identical_state(a: &Harness, b: &Harness, label: &str) {
     let (a, b) = (logical_contents(&a.store), logical_contents(&b.store));
     for name in a.keys() {
@@ -168,9 +128,8 @@ fn assert_identical_state(a: &Harness, b: &Harness, label: &str) {
     }
 }
 
-fn assert_indexes_match_rebuild(harness: &Harness, label: &str) {
-    let fresh = rebuild_indexes(&harness.store).expect("rebuild");
-    let live = &harness.indexes;
+fn assert_indexes_match_rebuild(store: &Store, live: &Indexes, label: &str) {
+    let fresh = rebuild_indexes(store).expect("rebuild");
     assert_eq!(live.ready.keys, fresh.ready.keys, "{label}: ready keys");
     assert_eq!(
         live.ready.by_queue, fresh.ready.by_queue,
@@ -217,8 +176,8 @@ fn assert_stream_replays(source: &Harness, ops: &[Op], outcomes: &[String]) {
 
     assert_identical_state(source, &replay_a, "source vs replay");
     assert_identical_state(&replay_a, &replay_b, "replay vs replay");
-    assert_indexes_match_rebuild(source, "source");
-    assert_indexes_match_rebuild(&replay_a, "replay");
+    assert_indexes_match_rebuild(&source.store, &source.indexes, "source");
+    assert_indexes_match_rebuild(&replay_a.store, &replay_a.indexes, "replay");
 }
 
 fn job(id: &str, req: EnqueueRequest) -> PreparedJob {
@@ -845,4 +804,216 @@ fn dead_letter_disabled_stream_drops_jobs_and_replays() {
     );
 
     assert_stream_replays(&source, &ops, &outcomes);
+}
+
+// --- Raft-path equivalence -------------------------------------------------
+
+fn log_id(index: u64) -> LogId {
+    LogId {
+        leader_id: LeaderId::new(1, 1),
+        index,
+    }
+}
+
+fn op_entries(ops: &[Op]) -> Vec<Entry> {
+    ops.iter()
+        .enumerate()
+        .map(|(i, op)| Entry {
+            log_id: log_id(i as u64 + 1),
+            payload: EntryPayload::Normal(op.clone()),
+        })
+        .collect()
+}
+
+// Applies the stream through the real raft apply path in `batch`-sized
+// batches and returns the core plus direct-path-comparable outcome strings.
+fn raft_replay(params: StorageParams, ops: &[Op], batch: usize) -> (ApplyCore, Vec<String>) {
+    let harness = Harness::open(params);
+    let mut core = ApplyCore::new(
+        harness.store,
+        harness.indexes,
+        QueueNotifiers::default(),
+        StampClamp::new(0),
+    )
+    .expect("apply core");
+
+    let mut outcomes = Vec::new();
+    for chunk in op_entries(ops).chunks(batch.max(1)) {
+        let (chunk_outcomes, _) = core.apply_entries(chunk.to_vec());
+        outcomes.extend(chunk_outcomes.into_iter().map(|outcome| match outcome {
+            OpOutcome::Rejected(status) => dbg_outcome(Err(status)),
+            other => dbg_outcome(Ok(other)),
+        }));
+    }
+
+    (core, outcomes)
+}
+
+// The adapter's bookkeeping rows are raft-path-only; everything else must
+// match the direct path byte for byte.
+fn strip_adapter_rows(
+    mut all: BTreeMap<&'static str, BTreeMap<Vec<u8>, Vec<u8>>>,
+) -> BTreeMap<&'static str, BTreeMap<Vec<u8>, Vec<u8>>> {
+    let meta = all.get_mut("meta").expect("meta keyspace");
+    for key in [
+        LAST_APPLIED_KEY,
+        MEMBERSHIP_KEY,
+        STAMP_HIGH_WATER_KEY,
+        APPLY_DIGEST_KEY,
+    ] {
+        meta.remove(key);
+    }
+    all
+}
+
+// PR 6's replay gate: the raft apply path is the same state machine. The
+// same stream through ApplyCore::apply_entries yields identical outcomes
+// and identical keyspace bytes however entries are batched, and the digest
+// is a function of the entry sequence, never of batch boundaries.
+#[test]
+fn raft_apply_matches_direct_apply() {
+    let mut rng = Rng(7);
+    let (direct, ops, direct_outcomes) =
+        generate_stream(&mut rng, 300, true, |rng| rng.range(1, 500));
+    assert!(
+        direct_outcomes.iter().any(|o| o.starts_with("Err")),
+        "stream never exercised a rejection; change the seed"
+    );
+
+    let (raft_single, single_outcomes) = raft_replay(base_params(), &ops, 1);
+
+    // The batched replay applies ops that took a wire round-trip, so the
+    // digest equality below also proves a follower's re-encoded entry bytes
+    // hash identically to the leader's originals.
+    let roundtripped: Vec<Op> = ops
+        .iter()
+        .map(|op| {
+            let bytes = op.to_proto().encode_to_vec();
+            Op::from_proto(op_proto::Op::decode(bytes.as_slice()).expect("op decodes"))
+                .expect("op converts")
+        })
+        .collect();
+    let (raft_batched, batched_outcomes) = raft_replay(base_params(), &roundtripped, 64);
+
+    assert_eq!(
+        direct_outcomes, single_outcomes,
+        "raft outcomes diverge from direct apply"
+    );
+    assert_eq!(single_outcomes, batched_outcomes);
+
+    assert_eq!(
+        strip_adapter_rows(logical_contents(&direct.store)),
+        strip_adapter_rows(logical_contents(raft_single.store())),
+        "raft-applied state diverges from direct apply"
+    );
+    // Between the raft replays nothing is stripped: last_applied,
+    // membership, stamp high-water and digest must all be
+    // batch-split-invariant.
+    assert_eq!(
+        logical_contents(raft_single.store()),
+        logical_contents(raft_batched.store())
+    );
+    assert_eq!(raft_single.digest(), raft_batched.digest());
+    assert_ne!(raft_single.digest(), [0u8; 32]);
+
+    assert_indexes_match_rebuild(raft_single.store(), raft_single.indexes(), "raft");
+
+    let meta = &logical_contents(raft_single.store())["meta"];
+    assert_eq!(
+        meta.get(LAST_APPLIED_KEY),
+        Some(&log_id_to_proto(&log_id(ops.len() as u64)).encode_to_vec()),
+        "last_applied must name the final entry"
+    );
+    let max_stamp = ops
+        .iter()
+        .filter_map(|op| op.stamp_ms())
+        .max()
+        .expect("the stream carries stamped ops");
+    assert_eq!(
+        meta.get(STAMP_HIGH_WATER_KEY),
+        Some(&max_stamp.to_be_bytes().to_vec()),
+        "the high-water mark is the max stamp applied"
+    );
+}
+
+#[test]
+fn raft_apply_answers_blank_and_membership_entries() {
+    let harness = Harness::open(base_params());
+    let mut core = ApplyCore::new(
+        harness.store,
+        harness.indexes,
+        QueueNotifiers::default(),
+        StampClamp::new(0),
+    )
+    .expect("apply core");
+
+    let node = |n: u64| crate::raft::ClusterNode {
+        peer_addr: format!("sepp-{n}.internal:50052"),
+        client_addr: format!("sepp-{n}.example.com:50051"),
+    };
+    let membership = crate::raft::Membership::new(
+        vec![std::collections::BTreeSet::from([1u64, 2])],
+        std::collections::BTreeMap::from([(1u64, node(1)), (2, node(2))]),
+    );
+
+    let entries = vec![
+        Entry {
+            log_id: log_id(1),
+            payload: EntryPayload::Blank,
+        },
+        Entry {
+            log_id: log_id(2),
+            payload: EntryPayload::Membership(membership.clone()),
+        },
+        Entry {
+            log_id: log_id(3),
+            payload: EntryPayload::Normal(Op::Enqueue {
+                jobs: vec![job("j1", req("alpha"))],
+                now_ms: 1_000_000,
+            }),
+        },
+    ];
+    let (outcomes, _) = core.apply_entries(entries);
+
+    // One response per entry, blank and membership included: openraft zips
+    // responses with entries by index.
+    assert_eq!(outcomes.len(), 3);
+    assert!(matches!(outcomes[0], OpOutcome::NonOp));
+    assert!(matches!(outcomes[1], OpOutcome::NonOp));
+    assert!(matches!(&outcomes[2], OpOutcome::Enqueue(results) if results[0].is_ok()));
+
+    let meta = &logical_contents(core.store())["meta"];
+    assert_eq!(
+        meta.get(LAST_APPLIED_KEY),
+        Some(&log_id_to_proto(&log_id(3)).encode_to_vec()),
+        "blank and membership entries advance last_applied too"
+    );
+    let stored = crate::raft::StoredMembership::new(Some(log_id(2)), membership);
+    assert_eq!(
+        meta.get(MEMBERSHIP_KEY),
+        Some(&crate::raft::stored_membership_to_proto(&stored).encode_to_vec()),
+        "the applied membership rides in meta"
+    );
+}
+
+// Re-apply is not idempotent, so an already-applied index must fail-stop
+// (the committer's abort wrapper turns this panic into a process abort).
+#[test]
+#[should_panic(expected = "re-apply is not idempotent")]
+fn raft_apply_panics_on_a_reapplied_index() {
+    let harness = Harness::open(base_params());
+    let mut core = ApplyCore::new(
+        harness.store,
+        harness.indexes,
+        QueueNotifiers::default(),
+        StampClamp::new(0),
+    )
+    .expect("apply core");
+
+    let blank = |index| Entry {
+        log_id: log_id(index),
+        payload: EntryPayload::Blank,
+    };
+    core.apply_entries(vec![blank(1), blank(2)]);
+    core.apply_entries(vec![blank(2)]);
 }
