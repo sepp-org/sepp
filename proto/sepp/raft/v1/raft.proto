@@ -175,3 +175,67 @@ message SnapshotFrame {
     SnapshotTrailer trailer = 4;
   }
 }
+
+// The identity a node presents in the peer handshake, both directions.
+message PeerHello {
+  // 16 bytes, minted at cluster init; empty until this node is initialized.
+  bytes cluster_id = 1;
+
+  uint64 node_id = 2;
+
+  // 16 bytes, minted on the directory's first cluster-enabled boot.
+  bytes instance_uuid = 3;
+
+  string sepp_version = 4;
+
+  // 1-based; 0 on the wire always means a sender predating the field.
+  uint32 op_format_version = 5;
+
+  // SHA-256 over the cluster-uniform config subset, for drift detection.
+  bytes uniform_config_hash = 6;
+}
+
+message HandshakeRequest {
+  PeerHello hello = 1;
+}
+
+message HandshakeResponse {
+  PeerHello hello = 1;
+}
+
+message InstallSnapshotStart {
+  // The sending leader's vote; the receiver hands it to the engine, which
+  // rejects the install if it has seen a higher one.
+  Vote vote = 1;
+
+  SnapshotMeta meta = 2;
+}
+
+// Client-streamed snapshot transfer: one Start, then the snapshot file as
+// fixed-size data chunks. The file's own trailer checksum authenticates the
+// reassembled bytes, so a torn stream fails verification on the receiver.
+message InstallSnapshotRequest {
+  oneof chunk {
+    InstallSnapshotStart start = 1;
+    bytes data = 2;
+  }
+}
+
+message InstallSnapshotResponse {
+  Vote vote = 1;
+}
+
+// Asks the receiver to start an election now: the leadership-transfer
+// mechanism (openraft 0.9 has no transfer API). No-op if already leader.
+message TriggerElectRequest {}
+
+message TriggerElectResponse {}
+
+// The peer transport between cluster members.
+service RaftPeerService {
+  rpc Handshake(HandshakeRequest) returns (HandshakeResponse);
+  rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+  rpc Vote(VoteRequest) returns (VoteResponse);
+  rpc InstallSnapshot(stream InstallSnapshotRequest) returns (InstallSnapshotResponse);
+  rpc TriggerElect(TriggerElectRequest) returns (TriggerElectResponse);
+}

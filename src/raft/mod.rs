@@ -7,10 +7,13 @@ use crate::pb::sepp::raft::v1 as pb;
 use crate::storage::OpOutcome;
 
 mod log;
+pub mod net;
 mod sm;
 pub mod snapshot;
 #[cfg(test)]
 mod suite_tests;
+#[doc(hidden)]
+pub mod testing;
 mod trigger;
 
 pub use log::RaftLogStore;
@@ -43,6 +46,11 @@ pub type Membership = openraft::Membership<NodeId, ClusterNode>;
 pub type StoredMembership = openraft::StoredMembership<NodeId, ClusterNode>;
 pub type SnapshotMeta = openraft::SnapshotMeta<NodeId, ClusterNode>;
 pub type StorageError = openraft::StorageError<NodeId>;
+pub type Raft = openraft::Raft<TypeConfig>;
+pub type AppendEntriesRequest = openraft::raft::AppendEntriesRequest<TypeConfig>;
+pub type AppendEntriesResponse = openraft::raft::AppendEntriesResponse<NodeId>;
+pub type VoteRequest = openraft::raft::VoteRequest<NodeId>;
+pub type VoteResponse = openraft::raft::VoteResponse<NodeId>;
 
 use openraft::{EntryPayload, LeaderId};
 
@@ -177,6 +185,101 @@ pub fn entry_from_proto(msg: pb::Entry) -> Result<Entry, Status> {
         pb::entry::Payload::Membership(m) => EntryPayload::Membership(membership_from_proto(m)),
     };
     Ok(Entry { log_id, payload })
+}
+
+pub fn append_request_to_proto(req: &AppendEntriesRequest) -> pb::AppendEntriesRequest {
+    pb::AppendEntriesRequest {
+        vote: Some(vote_to_proto(&req.vote)),
+        prev_log_id: req.prev_log_id.as_ref().map(log_id_to_proto),
+        entries: req.entries.iter().map(entry_to_proto).collect(),
+        leader_commit: req.leader_commit.as_ref().map(log_id_to_proto),
+        op_format_version: crate::op::OP_FORMAT_VERSION,
+    }
+}
+
+pub fn append_request_from_proto(
+    msg: pb::AppendEntriesRequest,
+) -> Result<AppendEntriesRequest, Status> {
+    Ok(AppendEntriesRequest {
+        vote: vote_from_proto(&msg.vote.ok_or_else(|| corrupt("append without vote"))?),
+        prev_log_id: msg.prev_log_id.as_ref().map(log_id_from_proto),
+        entries: msg
+            .entries
+            .into_iter()
+            .map(entry_from_proto)
+            .collect::<Result<_, _>>()?,
+        leader_commit: msg.leader_commit.as_ref().map(log_id_from_proto),
+    })
+}
+
+pub fn append_response_to_proto(resp: &AppendEntriesResponse) -> pb::AppendEntriesResponse {
+    use pb::append_entries_response::Result as R;
+    let result = match resp {
+        AppendEntriesResponse::Success => R::Success(pb::Blank {}),
+        AppendEntriesResponse::PartialSuccess(matched) => R::PartialSuccess(pb::PartialSuccess {
+            matched: matched.as_ref().map(log_id_to_proto),
+        }),
+        AppendEntriesResponse::Conflict => R::Conflict(pb::Blank {}),
+        AppendEntriesResponse::HigherVote(vote) => R::HigherVote(vote_to_proto(vote)),
+    };
+    pb::AppendEntriesResponse {
+        result: Some(result),
+    }
+}
+
+pub fn append_response_from_proto(
+    msg: pb::AppendEntriesResponse,
+) -> Result<AppendEntriesResponse, Status> {
+    use pb::append_entries_response::Result as R;
+    Ok(
+        match msg
+            .result
+            .ok_or_else(|| corrupt("append response without result"))?
+        {
+            R::Success(_) => AppendEntriesResponse::Success,
+            R::PartialSuccess(p) => {
+                AppendEntriesResponse::PartialSuccess(p.matched.as_ref().map(log_id_from_proto))
+            }
+            R::Conflict(_) => AppendEntriesResponse::Conflict,
+            R::HigherVote(v) => AppendEntriesResponse::HigherVote(vote_from_proto(&v)),
+        },
+    )
+}
+
+pub fn vote_request_to_proto(req: &VoteRequest) -> pb::VoteRequest {
+    pb::VoteRequest {
+        vote: Some(vote_to_proto(&req.vote)),
+        last_log_id: req.last_log_id.as_ref().map(log_id_to_proto),
+    }
+}
+
+pub fn vote_request_from_proto(msg: pb::VoteRequest) -> Result<VoteRequest, Status> {
+    Ok(VoteRequest {
+        vote: vote_from_proto(
+            &msg.vote
+                .ok_or_else(|| corrupt("vote request without vote"))?,
+        ),
+        last_log_id: msg.last_log_id.as_ref().map(log_id_from_proto),
+    })
+}
+
+pub fn vote_response_to_proto(resp: &VoteResponse) -> pb::VoteResponse {
+    pb::VoteResponse {
+        vote: Some(vote_to_proto(&resp.vote)),
+        vote_granted: resp.vote_granted,
+        last_log_id: resp.last_log_id.as_ref().map(log_id_to_proto),
+    }
+}
+
+pub fn vote_response_from_proto(msg: pb::VoteResponse) -> Result<VoteResponse, Status> {
+    Ok(VoteResponse {
+        vote: vote_from_proto(
+            &msg.vote
+                .ok_or_else(|| corrupt("vote response without vote"))?,
+        ),
+        vote_granted: msg.vote_granted,
+        last_log_id: msg.last_log_id.as_ref().map(log_id_from_proto),
+    })
 }
 
 #[cfg(test)]

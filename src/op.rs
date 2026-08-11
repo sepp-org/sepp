@@ -6,6 +6,11 @@ use crate::pb::sepp::v1::{EnqueueRequest, ExtendRequest, NackRequest};
 use crate::queues::QueueRegistry;
 use crate::storage::PeekState;
 
+// The op encoding generation, exchanged in the peer handshake and stamped on
+// AppendEntries. 1-based: a 0 on the wire always means a sender predating the
+// field.
+pub const OP_FORMAT_VERSION: u32 = 1;
+
 // A mutating committer operation.
 // The serialized form is proto/sepp/storage/v1/op.proto, pinned by the golden test below.
 #[derive(Debug, Clone, PartialEq)]

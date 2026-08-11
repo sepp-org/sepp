@@ -12,6 +12,7 @@ compile_error!("sepp cluster mode requires a 64-bit target");
 
 const NODE_ID_KEY: &[u8] = b"node_id";
 const INSTANCE_UUID_KEY: &[u8] = b"instance_uuid";
+const CLUSTER_ID_KEY: &[u8] = b"cluster_id";
 
 pub struct NodeIdentity {
     pub node_id: u64,
@@ -82,6 +83,45 @@ pub fn verify_or_stamp_identity(
         .into()),
         Some(identity) => Ok(identity),
     }
+}
+
+pub fn read_cluster_id(db: &TxDatabase) -> Result<Option<Uuid>, Box<dyn Error>> {
+    let raft = db.keyspace("raft", KeyspaceCreateOptions::default)?;
+    let Some(bytes) = db.read_tx().get(&raft, CLUSTER_ID_KEY)? else {
+        return Ok(None);
+    };
+
+    let id = <[u8; 16]>::try_from(bytes.as_ref())
+        .map(Uuid::from_bytes)
+        .map_err(|_| "the raft keyspace cluster_id row is corrupt")?;
+    Ok(Some(id))
+}
+
+// Idempotent for the same id; refuses to overwrite a different one.
+pub fn stamp_cluster_id(db: &TxDatabase, cluster_id: Uuid) -> Result<(), Box<dyn Error>> {
+    match read_cluster_id(db)? {
+        Some(existing) if existing == cluster_id => return Ok(()),
+        Some(existing) => {
+            return Err(format!(
+                "this node already belongs to cluster {existing}; refusing to join {cluster_id}",
+            )
+            .into());
+        }
+        None => {}
+    }
+
+    let raft = db.keyspace("raft", KeyspaceCreateOptions::default)?;
+    let mut tx = db.write_tx();
+    tx.insert(
+        &raft,
+        CLUSTER_ID_KEY.to_vec(),
+        cluster_id.as_bytes().to_vec(),
+    );
+    tx.commit()?;
+    db.persist(PersistMode::SyncAll)?;
+
+    info!(cluster_id = %cluster_id, "stamped cluster id");
+    Ok(())
 }
 
 fn decode_identity(
@@ -250,6 +290,17 @@ mod raft_proto_tests {
         pb::SnapshotFrame { frame: Some(frame) }.encode_to_vec()
     }
 
+    fn peer_hello() -> pb::PeerHello {
+        pb::PeerHello {
+            cluster_id: vec![0xcc; 16],
+            node_id: 2,
+            instance_uuid: vec![0xee; 16],
+            sepp_version: "0.1.1".into(),
+            op_format_version: 1,
+            uniform_config_hash: vec![0xab; 32],
+        }
+    }
+
     fn sample_messages() -> Vec<(&'static str, Vec<u8>)> {
         let ack_op = op_pb::Op {
             op: Some(op_pb::op::Op::Ack(op_pb::AckOp {
@@ -388,6 +439,40 @@ mod raft_proto_tests {
                     sha256: vec![0xab; 32],
                 })),
             ),
+            ("peer_hello", peer_hello().encode_to_vec()),
+            (
+                "handshake_request",
+                pb::HandshakeRequest {
+                    hello: Some(peer_hello()),
+                }
+                .encode_to_vec(),
+            ),
+            (
+                "install_snapshot_request_start",
+                pb::InstallSnapshotRequest {
+                    chunk: Some(pb::install_snapshot_request::Chunk::Start(
+                        pb::InstallSnapshotStart {
+                            vote: Some(leader_vote()),
+                            meta: Some(snapshot_meta()),
+                        },
+                    )),
+                }
+                .encode_to_vec(),
+            ),
+            (
+                "install_snapshot_request_data",
+                pb::InstallSnapshotRequest {
+                    chunk: Some(pb::install_snapshot_request::Chunk::Data(b"chunk".to_vec())),
+                }
+                .encode_to_vec(),
+            ),
+            (
+                "install_snapshot_response",
+                pb::InstallSnapshotResponse {
+                    vote: Some(leader_vote()),
+                }
+                .encode_to_vec(),
+            ),
         ]
     }
 
@@ -434,6 +519,20 @@ mod raft_proto_tests {
                 "snapshot_frame_trailer",
                 "22220a20abababababababababababababababababababababababababababababababab",
             ),
+            (
+                "peer_hello",
+                "0a10cccccccccccccccccccccccccccccccc10021a10eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee2205302e312e3128013220abababababababababababababababababababababababababababababababab",
+            ),
+            (
+                "handshake_request",
+                "0a510a10cccccccccccccccccccccccccccccccc10021a10eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee2205302e312e3128013220abababababababababababababababababababababababababababababababab",
+            ),
+            (
+                "install_snapshot_request_start",
+                "0a8c020a060803100218011281020a0608031002180912ed010a0608031002180912e2010a050a030102030a050a03020304123308011215736570702d312e696e7465726e616c3a35303035321a18736570702d312e6578616d706c652e636f6d3a3530303531123308021215736570702d322e696e7465726e616c3a35303035321a18736570702d322e6578616d706c652e636f6d3a3530303531123308031215736570702d332e696e7465726e616c3a35303035321a18736570702d332e6578616d706c652e636f6d3a3530303531123308041215736570702d342e696e7465726e616c3a35303035321a18736570702d342e6578616d706c652e636f6d3a35303035311a07332d322d392d31",
+            ),
+            ("install_snapshot_request_data", "12056368756e6b"),
+            ("install_snapshot_response", "0a06080310021801"),
         ];
 
         let samples = sample_messages();
@@ -485,6 +584,14 @@ mod raft_proto_tests {
                 "snapshot_install_marker" => assert_reencodes::<pb::SnapshotInstallMarker>(&bytes),
                 name if name.starts_with("snapshot_frame") => {
                     assert_reencodes::<pb::SnapshotFrame>(&bytes)
+                }
+                "peer_hello" => assert_reencodes::<pb::PeerHello>(&bytes),
+                "handshake_request" => assert_reencodes::<pb::HandshakeRequest>(&bytes),
+                name if name.starts_with("install_snapshot_request") => {
+                    assert_reencodes::<pb::InstallSnapshotRequest>(&bytes)
+                }
+                "install_snapshot_response" => {
+                    assert_reencodes::<pb::InstallSnapshotResponse>(&bytes)
                 }
                 other => panic!("sample {other} has no round-trip arm"),
             }

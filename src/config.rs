@@ -554,6 +554,25 @@ impl Config {
         Arc::new(ArcSwap::from_pointee(self))
     }
 
+    // SHA-256 over the cluster-uniform key subset, exchanged in the peer
+    // handshake so drift is detectable (never enforced).
+    pub fn uniform_config_hash(&self) -> [u8; 32] {
+        use sha2::Digest as _;
+
+        let subset = serde_json::json!([
+            self.server.strict_queues,
+            self.limits,
+            self.auth.api_keys,
+            self.storage.dedup_window_ms,
+            self.storage.dead_letter_retention_ms,
+            self.queues,
+            self.cluster.peer_auth_keys,
+        ]);
+
+        let bytes = serde_json::to_vec(&subset).expect("config subset serializes");
+        sha2::Sha256::digest(&bytes).into()
+    }
+
     pub fn load(explicit_path: Option<&str>) -> Result<Self, Box<dyn Error>> {
         let path = explicit_path.unwrap_or(DEFAULT_CONFIG_PATH);
         if explicit_path.is_some() && !Path::new(path).exists() {
